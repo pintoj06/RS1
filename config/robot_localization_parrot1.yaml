@@ -1,0 +1,44 @@
+/**:
+  ros__parameters:
+    frequency: 30.0
+    two_d_mode: false
+    publish_acceleration: false
+    publish_tf: true
+    map_frame: map
+    odom_frame: parrot1_odom
+    base_link_frame: parrot1_base_link
+    world_frame: parrot1_odom
+    odom0: odometry
+    odom0_config:
+    - false
+    - false
+    - false
+    - false
+    - false
+    - false
+    - true
+    - true
+    - false
+    - false
+    - false
+    - true
+    - false
+    - false
+    - false
+    imu0: imu
+    imu0_config:
+    - false
+    - false
+    - false
+    - false
+    - false
+    - false
+    - false
+    - false
+    - false
+    - false
+    - false
+    - true
+    - false
+    - false
+    - false

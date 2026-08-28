@@ -1,0 +1,15 @@
+# Python bytecode caches (regenerated automatically on launch)
+__pycache__/
+*.pyc
+*.pyo
+
+# Editor/OS junk
+.DS_Store
+*.swp
+*.swo
+
+# VSCode config contains machine-specific absolute paths
+# (e.g. /home/student/ros2_ws/... in c_cpp_properties.json) that won't
+# resolve on another machine. Ignore it rather than committing paths
+# that only work on this computer.
+.vscode/
