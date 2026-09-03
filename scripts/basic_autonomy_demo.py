@@ -39,6 +39,9 @@ from rclpy.node import Node
 from sensor_msgs.msg import Image
 import tf2_ros
 
+#added
+from cv_bridge import CvBridge
+import cv2
 
 class BasicAutonomyDemo(Node):
     """A tiny map-aware random-walk autonomy example."""
@@ -55,6 +58,7 @@ class BasicAutonomyDemo(Node):
         self.declare_parameter('robot_name', '')
         self.declare_parameter('map_topic', 'map')
         self.declare_parameter('image_topic', 'camera/image')
+        self.declare_parameter('thermal_topic', 'camera/thermal')
         self.declare_parameter('navigate_action', 'navigate_to_pose')
 
         # Bright images make the demo choose goals farther away; darker images
@@ -101,6 +105,8 @@ class BasicAutonomyDemo(Node):
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
 
+        self.bridge = CvBridge()
+
         self.map_sub = self.create_subscription(
             OccupancyGrid,
             self.get_parameter('map_topic').value,
@@ -111,6 +117,12 @@ class BasicAutonomyDemo(Node):
             Image,
             self.get_parameter('image_topic').value,
             self._image_callback,
+            1,
+        )
+        self.thermal_sub = self.create_subscription(
+            Image,
+            self.get_parameter('thermal_topic').value,
+            self._thermal_callback,
             1,
         )
         self.nav_client = ActionClient(
@@ -157,12 +169,18 @@ class BasicAutonomyDemo(Node):
         )
 
     def _image_callback(self, msg: Image) -> None:
+        # CV DETECTION OF HUMAN HERE
         """Compute a tiny image feature from the latest camera image.
 
         The node receives camera images at the simulator's camera rate, but this
         demo only processes at 1 Hz. That keeps the example lightweight and
         avoids image processing slowing down navigation.
         """
+        cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+        cv2.imshow('camera', cv_image)
+        cv2.waitKey(1)
+
+        
         now = time.monotonic()
         if now - self.last_image_process_time < 1.0:
             return
@@ -171,6 +189,18 @@ class BasicAutonomyDemo(Node):
         brightness = self._estimate_image_brightness(msg)
         if brightness is not None:
             self.latest_brightness = brightness
+
+    def _thermal_callback(self, msg: Image) -> None:
+        """Show the raw thermal image next to the RGB feed for visual debugging.
+
+        Thermal images arrive as 16-bit temperature-encoded pixels, so they need
+        to be normalised to 8-bit and false-coloured before they're viewable.
+        """
+        thermal_raw = self.bridge.imgmsg_to_cv2(msg, desired_encoding='passthrough')
+        normalised = cv2.normalize(thermal_raw, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+        thermal_display = cv2.applyColorMap(normalised, cv2.COLORMAP_INFERNO)
+        cv2.imshow('thermal', thermal_display)
+        cv2.waitKey(1)
 
     def _estimate_image_brightness(self, msg: Image) -> Optional[float]:
         """Return a fast approximate image brightness between 0.0 and 1.0.

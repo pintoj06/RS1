@@ -262,6 +262,9 @@
       </uri>
       <name>rock1</name>
       <pose>-6.30926 -8.38159 0 0 0 0</pose>
+      <plugin filename="ignition-gazebo-thermal-system" name="ignition::gazebo::systems::Thermal">
+        <temperature>320.0</temperature>
+      </plugin>
     </include>
     <include>
       <uri>
@@ -298,6 +301,32 @@
       <name>rock6</name>
       <pose>-14 -12 0 0 0 0</pose>
     </include>
+
+    <!-- Thermal test target: sits directly under the Parrot's spawn point (x=2.0, y=0.0)
+         so it's guaranteed to be in frame for thermal camera testing. -->
+    <model name="hot_box">
+      <pose>2.0 0.0 0.15 0 0 0</pose>
+      <static>true</static>
+      <link name="link">
+        <visual name="visual">
+          <geometry>
+            <box><size>2 2 0.5</size></box>
+          </geometry>
+          <material>
+            <ambient>1 0 0 1</ambient>
+            <diffuse>1 0 0 1</diffuse>
+          </material>
+          <plugin filename="ignition-gazebo-thermal-system" name="ignition::gazebo::systems::Thermal">
+            <temperature>800.0</temperature>
+          </plugin>
+        </visual>
+        <collision name="collision">
+          <geometry>
+            <box><size>2 2 0.5</size></box>
+          </geometry>
+        </collision>
+      </link>
+    </model>
 
 
     <!-- Dynamic world demo models -->
