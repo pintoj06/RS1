@@ -93,6 +93,12 @@ class BasicAutonomyDemo(Node):
         self.latest_brightness: Optional[float] = None
         self.last_image_process_time = 0.0
 
+        # Set once the RGB detector finds a candidate. While True, _tick stops
+        # sending new Nav2 goals and _image_callback stops doing further work -
+        # this is the "halt and wait for operator confirmation" half of the
+        # eventual mission behaviour.
+        self.person_detected = False
+
         # Nav2 action state. goal_active is True while Nav2 is executing a goal.
         self.goal_active = False
         self.goal_handle = None
@@ -169,18 +175,45 @@ class BasicAutonomyDemo(Node):
         )
 
     def _image_callback(self, msg: Image) -> None:
-        # CV DETECTION OF HUMAN HERE
-        """Compute a tiny image feature from the latest camera image.
+        """Check the RGB image for a detection; halt and hold it if found.
 
-        The node receives camera images at the simulator's camera rate, but this
-        demo only processes at 1 Hz. That keeps the example lightweight and
-        avoids image processing slowing down navigation.
+        This is a stand-in for the eventual real detector: a colour threshold
+        for the red heat-marker box used for thermal testing, then the same
+        contour/bounding-box check used on the thermal image. Ordinary frames
+        are processed silently and nothing is shown; only once something is
+        actually found does the node stop driving (see the guard in _tick)
+        and hold the frame on screen. That is the "detect, then pause for
+        operator confirmation" half of the eventual mission behaviour - the
+        actual confirm/deny UI is a later piece.
         """
-        cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
-        cv2.imshow('camera', cv_image)
-        cv2.waitKey(1)
+        if self.person_detected:
+            return
 
-        
+        cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+
+        hsv = cv2.cvtColor(cv_image, cv2.COLOR_BGR2HSV)
+        red_mask = (
+            cv2.inRange(hsv, (0, 120, 70), (10, 255, 255))
+            | cv2.inRange(hsv, (170, 120, 70), (180, 255, 255))
+        )
+        contours, _ = cv2.findContours(red_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        best = max(contours, key=cv2.contourArea, default=None)
+
+        min_area = 200  # pixels; filters out small false positives
+        if best is not None and cv2.contourArea(best) >= min_area:
+            x, y, w, h = cv2.boundingRect(best)
+            cv2.rectangle(cv_image, (x, y), (x + w, y + h), (0, 255, 0), 2)
+
+            self.person_detected = True
+            self.get_logger().info(
+                'RGB detection found - halting autonomy and holding the frame '
+                'for operator confirmation. Press any key in the image window '
+                'to release it.'
+            )
+            cv2.imshow('camera', cv_image)
+            cv2.waitKey(0)
+            return
+
         now = time.monotonic()
         if now - self.last_image_process_time < 1.0:
             return
@@ -191,14 +224,41 @@ class BasicAutonomyDemo(Node):
             self.latest_brightness = brightness
 
     def _thermal_callback(self, msg: Image) -> None:
-        """Show the raw thermal image next to the RGB feed for visual debugging.
+        """Show the thermal image with the hottest region(s) boxed.
 
         Thermal images arrive as 16-bit temperature-encoded pixels, so they need
         to be normalised to 8-bit and false-coloured before they're viewable.
+        Hot regions are found by Otsu-thresholding the normalised image and
+        drawing a box around every resulting contour above a minimum size, to
+        filter out single-pixel noise.
         """
         thermal_raw = self.bridge.imgmsg_to_cv2(msg, desired_encoding='passthrough')
         normalised = cv2.normalize(thermal_raw, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
         thermal_display = cv2.applyColorMap(normalised, cv2.COLORMAP_INFERNO)
+
+        # Tree canopy renders as near-zero raw temperature (a rendering
+        # artefact of the leaf-cutout textures, not a real cold reading).
+        # It covers a large share of the frame, so an Otsu threshold over
+        # the whole image ends up splitting "trees vs everything else"
+        # instead of "hot target vs background". Computing the cutoff only
+        # from non-artefact pixels fixes that, then it's applied to the
+        # full image as normal.
+        valid = normalised[thermal_raw > 1.0]
+        if valid.size == 0:
+            cv2.imshow('thermal', thermal_display)
+            cv2.waitKey(1)
+            return
+        cutoff, _ = cv2.threshold(valid, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        _, thresholded = cv2.threshold(normalised, cutoff, 255, cv2.THRESH_BINARY)
+        contours, _ = cv2.findContours(thresholded, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        min_area = 20  # pixels; filters out single-pixel noise
+        for contour in contours:
+            if cv2.contourArea(contour) < min_area:
+                continue
+            x, y, w, h = cv2.boundingRect(contour)
+            cv2.rectangle(thermal_display, (x, y), (x + w, y + h), (0, 255, 0), 2)
+
         cv2.imshow('thermal', thermal_display)
         cv2.waitKey(1)
 
@@ -260,6 +320,9 @@ class BasicAutonomyDemo(Node):
 
     def _tick(self) -> None:
         """One step of the autonomy state machine."""
+        if self.person_detected:
+            return
+
         if self.goal_active:
             return
 
