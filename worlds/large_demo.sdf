@@ -336,7 +336,7 @@
             <diffuse>1 0 0 1</diffuse>
           </material>
           <plugin filename="ignition-gazebo-thermal-system" name="ignition::gazebo::systems::Thermal">
-            <temperature>800.0</temperature>
+            <temperature>310.0</temperature>
           </plugin>
         </visual>
       </link>
