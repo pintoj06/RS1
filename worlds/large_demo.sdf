@@ -302,29 +302,43 @@
       <pose>-14 -12 0 0 0 0</pose>
     </include>
 
-    <!-- Thermal test target: sits directly under the Parrot's spawn point (x=2.0, y=0.0)
-         so it's guaranteed to be in frame for thermal camera testing. -->
-    <model name="hot_box">
-      <pose>2.0 0.0 0.15 0 0 0</pose>
+    <include>
+      <uri>
+        https://fuel.gazebosim.org/1.0/OpenRobotics/models/Standing%20person
+      </uri>
+      <name>person1</name>
+      <pose> -0.0912 0.9265 0.505 0 0 0 </pose>
+    </include>
+
+    <!-- Thermal signature for person1. The ignition-gazebo-thermal-system
+         plugin only takes effect when attached to a <visual> inside a
+         <link>; it is silently ignored when attached at the <include>/model
+         level (confirmed against the official example shipped with this
+         Ignition Fortress install at
+         /usr/share/ignition/ignition-gazebo6/worlds/thermal_camera.sdf,
+         which attaches it the same way and does NOT attach it to its own
+         included Fuel person model, "Rescue Randy", for the same reason).
+         Since a Fuel-included model's internal visuals aren't reachable
+         from here, this is a separate human-sized, collision-free heat
+         volume co-located with person1 so it appears on the thermal camera.
+         It is visible as a plain box in the RGB feed too, since Ignition
+         has no way to show a visual to the thermal camera only. -->
+    <model name="person1_heat">
+      <pose>-0.0912 0.9265 1.355 0 0 0</pose>
       <static>true</static>
       <link name="link">
         <visual name="visual">
           <geometry>
-            <box><size>2 2 0.5</size></box>
+            <box><size>0.5 0.3 1.7</size></box>
           </geometry>
           <material>
             <ambient>1 0 0 1</ambient>
             <diffuse>1 0 0 1</diffuse>
           </material>
           <plugin filename="ignition-gazebo-thermal-system" name="ignition::gazebo::systems::Thermal">
-            <temperature>800.0</temperature>
+            <temperature>310.0</temperature>
           </plugin>
         </visual>
-        <collision name="collision">
-          <geometry>
-            <box><size>2 2 0.5</size></box>
-          </geometry>
-        </collision>
       </link>
     </model>
 
