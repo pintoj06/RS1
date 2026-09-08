@@ -52,7 +52,10 @@ class SearchNode(Node):
         self.declare_parameter('spacing', 0.8)
 
         robot_name= self.get_parameter('robot_name').value
-        self.map_frame= f'{robot_name}_map' # e.g. "parrot1_map", NOT "map"
+        # Goals are stamped in the frame Nav2 plans in. That is now the odom
+        # frame, not the SLAM map frame - see global_frame in the nav2 params.
+        # Must stay in step with those, or Nav2 will not understand our goals.
+        self.map_frame= f'{robot_name}_odom' # e.g. "parrot1_odom", NOT "odom"
 
         self.points= make_sweep(
             self.get_parameter('min_x').value,

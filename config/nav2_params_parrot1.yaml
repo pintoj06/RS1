@@ -41,7 +41,9 @@ amcl:
 bt_navigator:
   ros__parameters:
     use_sim_time: true
-    global_frame: parrot1_map
+    # Must match the global_costmap's global_frame, and the frame_id that
+    # search_node.py stamps its goals with.
+    global_frame: parrot1_odom
     robot_base_frame: parrot1_base_link
     odom_topic: odom
     bt_loop_duration: 10
@@ -214,14 +216,28 @@ global_costmap:
     ros__parameters:
       update_frequency: 5.0
       publish_frequency: 5.0
-      global_frame: parrot1_map
+      # Plan in the odom frame instead of the SLAM map frame. Above the tree
+      # canopy the 2D lidar gets no returns, so SLAM cannot build a map and
+      # the map frame carries no useful correction.
+      global_frame: parrot1_odom
       robot_base_frame: parrot1_base_link
       use_sim_time: true
+      # A costmap that travels with the drone rather than being sized from a
+      # stored map. This is Nav2's standard outdoor/GPS configuration and it
+      # works at any altitude, with or without lidar returns.
+      rolling_window: true
+      width: 50
+      height: 50
       footprint: '[ [0.25, 0.25], [0.25, -0.25], [-0.25, -0.25], [-0.25, 0.25] ]'
       resolution: 0.1
-      track_unknown_space: true
+      # Treat never-observed cells as free. At survey altitude the lidar sees
+      # nothing, so everything is unobserved; leaving this true stops the
+      # planner from routing anywhere.
+      track_unknown_space: false
       plugins:
-      - static_layer
+      # static_layer removed - it is the layer that requires a SLAM map.
+      # obstacle_layer still reads the live lidar, so anything actually
+      # detected is still avoided; it just is not remembered once out of range.
       - obstacle_layer
       - inflation_layer
       obstacle_layer:

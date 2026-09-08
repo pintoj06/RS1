@@ -55,84 +55,84 @@
         model://forest_wall
       </uri>
       <name>forest_wall1</name>
-      <pose>12.5 0 10 1.570796 0 -1.570796</pose>
+      <pose>12.5 0 2 1.570796 0 -1.570796</pose>
     </include>
     <include>
       <uri>
         model://forest_wall
       </uri>
       <name>forest_wall2</name>
-      <pose>12.5 -9.32 10 1.570796 0 -1.570796</pose>
+      <pose>12.5 -9.32 2 1.570796 0 -1.570796</pose>
     </include>
     <include>
       <uri>
         model://forest_wall
       </uri>
       <name>forest_wall3</name>
-      <pose>12.5 +9.32 10 1.570796 0 -1.570796</pose>
+      <pose>12.5 +9.32 2 1.570796 0 -1.570796</pose>
     </include>
     <include>
       <uri>
         model://forest_wall
       </uri>
       <name>forest_wall4</name>
-      <pose>-12.5 0 10 1.570796 0 1.570796</pose>
+      <pose>-12.5 0 2 1.570796 0 1.570796</pose>
     </include>
     <include>
       <uri>
         model://forest_wall
       </uri>
       <name>forest_wall5</name>
-      <pose>-12.5 -9.32 10 1.570796 0 1.570796</pose>
+      <pose>-12.5 -9.32 2 1.570796 0 1.570796</pose>
     </include>
     <include>
       <uri>
         model://forest_wall
       </uri>
       <name>forest_wall6</name>
-      <pose>-12.5 +9.32 10 1.570796 0 1.570796</pose>
+      <pose>-12.5 +9.32 2 1.570796 0 1.570796</pose>
     </include>
     <include>
       <uri>
         model://forest_wall
       </uri>
       <name>forest_wall7</name>
-      <pose>0 -12.5 10 1.570796 0 0</pose>
+      <pose>0 -12.5 2 1.570796 0 0</pose>
     </include>
     <include>
       <uri>
         model://forest_wall
       </uri>
       <name>forest_wall8</name>
-      <pose>-9.32 -12.5 10 1.570796 0 0</pose>
+      <pose>-9.32 -12.5 2 1.570796 0 0</pose>
     </include>
     <include>
       <uri>
         model://forest_wall
       </uri>
       <name>forest_wall9</name>
-      <pose>+9.32 -12.5 10 1.570796 0 0</pose>
+      <pose>+9.32 -12.5 2 1.570796 0 0</pose>
     </include>
     <include>
       <uri>
         model://forest_wall
       </uri>
       <name>forest_wall10</name>
-      <pose>0 12.5 10 1.570796 0 0</pose>
+      <pose>0 12.5 2 1.570796 0 0</pose>
     </include>
     <include>
       <uri>
         model://forest_wall
       </uri>
       <name>forest_wall11</name>
-      <pose>-9.32 12.5 10 1.570796 0 0</pose>
+      <pose>-9.32 12.5 2 1.570796 0 0</pose>
     </include>
     <include>
       <uri>
         model://forest_wall
       </uri>
       <name>forest_wall12</name>
-      <pose>+9.32 12.5 10 1.570796 0 0</pose>
+      <pose>+9.32 12.5 2 1.570796 0 0</pose>
     </include>
 
     <!-- Oak trees -->
