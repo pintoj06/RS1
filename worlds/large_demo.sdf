@@ -43,6 +43,11 @@
       <name>person1</name>
       <pose> -0.0912 0.9265 0.505 0 0 0 </pose>
     </include>
+    <!-- Thermal signature for person1, disabled for now: it also shows up as
+         a plain red box in the RGB feed (Ignition has no way to show a
+         visual to the thermal camera only), which was interfering with
+         RGB-based CV data collection. Re-enable once that's done. -->
+    <!--
     <model name="person1_heat">
       <pose>-0.0912 0.9265 1.355 0 0 0</pose>
       <static>true</static>
@@ -63,6 +68,7 @@
         </visual>
       </link>
     </model>
+    -->
     <model name="demo_animal">
       <pose>-4 4 0 0 0 0</pose>
       <static>true</static>
