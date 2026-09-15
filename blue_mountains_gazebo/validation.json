@@ -1,13 +1,11 @@
 {
-  "xml_and_collada_valid": true,
-  "mesh_files": 153,
+  "xml_well_formed": true,
+  "collada_arrays_indices_valid": true,
+  "mesh_files": 71,
   "references_resolve": true,
-  "retained_entities_match": true,
-  "launch_ground_heights": {
-    "(0, 0)": 4.014328e-08,
-    "(-0.0912, 0.9265)": 4.014328e-08,
-    "(-4, 4)": 4.014328e-08,
-    "(4, -4)": -0.0005771651114946398
-  },
-  "gazebo_runtime_tested": false
+  "counts_match_manifest": true,
+  "river_normals_upward": true,
+  "river_sdf_colour_present": true,
+  "gazebo_runtime_tested": false,
+  "note": "XML checks are not a substitute for ign sdf -k or a Gazebo runtime test."
 }

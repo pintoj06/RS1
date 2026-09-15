@@ -1,48 +1,12 @@
 {
-  "source_blend": "/Users/harrymentis/Documents/Codex/2026-09-08/can-x20/outputs/three-sisters-smaller-ground.blend",
+  "source_blend": "three-sisters-river-side.blend",
   "world_name": "large_demo",
-  "visual_triangles": 347608,
-  "static_links": 135,
-  "forest_tiles": 96,
-  "trees": 1604,
-  "collision_shapes": 5719,
-  "removed_old_scenery": [
-    "forest_plane",
-    "forest_wall1",
-    "forest_wall2",
-    "forest_wall3",
-    "forest_wall4",
-    "forest_wall5",
-    "forest_wall6",
-    "forest_wall7",
-    "forest_wall8",
-    "forest_wall9",
-    "forest_wall10",
-    "forest_wall11",
-    "forest_wall12",
-    "oak1",
-    "oak2",
-    "oak3",
-    "oak4",
-    "oak5",
-    "oak6",
-    "oak7",
-    "oak8",
-    "pine1",
-    "pine2",
-    "pine3",
-    "pine4",
-    "pine5",
-    "pine6",
-    "platypus1",
-    "gazebo1",
-    "rock1",
-    "rock2",
-    "rock3",
-    "rock4",
-    "rock5",
-    "rock6"
-  ],
+  "visual_triangles": 148598,
+  "static_links": 53,
+  "forest_tiles": 39,
+  "trees": 465,
+  "collision_shapes": 2092,
+  "removed_old_scenery": [],
   "preserved_entities": [
     "person1",
     "person1_heat",
@@ -51,5 +15,23 @@
     "demo_tree_fire",
     "demo_tree_burnt"
   ],
-  "runtime_tested": false
+  "runtime_tested": false,
+  "terrain_bounds_m": {
+    "x": [
+      -18.77,
+      51.2333
+    ],
+    "y": [
+      -8.7667,
+      36.5
+    ]
+  },
+  "world_adjustments": {
+    "demo_animal": "Z raised from 0 to 3.82 m to sit on the moved outcrop; XY unchanged"
+  },
+  "river": "Upward normals, terrain clearance and explicit SDF blue-green ambient/diffuse material",
+  "comparison_previous": {
+    "visual_triangles": 347608,
+    "collision_shapes": 5719
+  }
 }
