@@ -33,5 +33,8 @@
   "comparison_previous": {
     "visual_triangles": 347608,
     "collision_shapes": 5719
-  }
+  },
+  "tree_height_multiplier": 1.5,
+  "foliage_original_proportions": true,
+  "tree_bases_preserved": true
 }

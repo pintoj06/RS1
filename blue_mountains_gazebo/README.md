@@ -6,7 +6,7 @@ Updated environment package for **Gazebo Fortress 6.x**, using SDF 1.8 and COLLA
 
 - `models/blue_mountains/model.sdf`: static scenery, visual meshes and collision shapes.
 - `models/blue_mountains/model.config`: Gazebo model metadata.
-- `models/blue_mountains/meshes/`: 71 COLLADA files, including reusable canopy collision meshes.
+- `models/blue_mountains/meshes/`: 89 COLLADA files, including reusable canopy collision meshes.
 - `models/blue_mountains/materials/textures/`: portable sandstone and forest-floor textures.
 - `worlds/large_demo.sdf`: previous demo world with the new scenery included.
 - `setup_env.sh`: resource-path setup for your existing launch.
@@ -26,6 +26,8 @@ For the existing drone simulation, source the setup script in its launch termina
 The Standing person still uses the previous OpenRobotics Fuel URL and must be cached or downloadable. All landscape resources are local and use portable model-relative paths.
 
 ## Changes
+
+- All 465 landscape trees retain the requested 50% extra height. Foliage keeps its original shape and size; taller trunks support raised crowns. Collision cylinders and canopy proxies match. Shrubs are unchanged.
 
 - Ground reduced to approximately **70 × 45.27 m**: X −18.77 to 51.2333; Y −8.7667 to 36.5.
 - Rear landscape and equal strips from both sides removed; Three Sisters centered across the width.

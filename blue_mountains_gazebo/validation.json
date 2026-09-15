@@ -1,7 +1,7 @@
 {
   "xml_well_formed": true,
   "collada_arrays_indices_valid": true,
-  "mesh_files": 71,
+  "mesh_files": 89,
   "references_resolve": true,
   "counts_match_manifest": true,
   "river_normals_upward": true,
