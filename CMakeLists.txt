@@ -15,8 +15,14 @@ install(
   DESTINATION share/${PROJECT_NAME}
 )
 
+
 install(
-  PROGRAMS scripts/dynamic_world_demo.py scripts/basic_autonomy_demo.py scripts/circle_dataset_capture.py
+  PROGRAMS
+    scripts/dynamic_world_demo.py
+    scripts/basic_autonomy_demo.py
+    scripts/circle_dataset_capture.py
+    scripts/search_node.py
+    UI/ground_station.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
