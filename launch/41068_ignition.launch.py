@@ -301,7 +301,6 @@ def generate_launch_description():
         name='GZ_SIM_SERVER_CONFIG_PATH',
         value=server_config_file,
     ))
-
     # Make world-local models (e.g. model://blue_mountains, used by large_demo)
     # resolvable without requiring each user to export a resource path manually.
     models_path = PathJoinSubstitution([pkg_path, 'models'])
@@ -397,7 +396,9 @@ def generate_launch_description():
         # confirmed contact position between the two drones' odom frames.
         x='2.0',
         y='-2.0',
-        z='10',
+        # 1m below the scout. The drone has gravity off and Nav2 only drives
+        # it in x/y, so it holds this spawn height for the whole flight.
+        z='8',
         spawn_delay=9.0,
     )
 
@@ -425,7 +426,7 @@ def generate_launch_description():
         use_sim_time=use_sim_time,
         robot_arg='courier',
         robot_namespace='parrot2',
-        start_delay=13.0,
+        start_delay=26.0,
     )
 
     add_rviz_instance(
@@ -435,7 +436,7 @@ def generate_launch_description():
         robot_arg='husky',
         robot_namespace='husky1',
         rviz_config='41068_husky1.rviz',
-        start_delay=11.0,
+        start_delay=22.0,
     )
 
     add_rviz_instance(
@@ -445,7 +446,7 @@ def generate_launch_description():
         robot_arg='parrot',
         robot_namespace='parrot1',
         rviz_config='41068_parrot1.rviz',
-        start_delay=13.0,
+        start_delay=26.0,
     )
 
     add_rviz_instance(
@@ -455,7 +456,7 @@ def generate_launch_description():
         robot_arg='courier',
         robot_namespace='parrot2',
         rviz_config='41068_parrot2.rviz',
-        start_delay=16.0,
+        start_delay=32.0,
     )
 
     return ld

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 
-"Wait for the operator to confirm a contact on the ground station, then fly to it, using NAV2"
+"Wait for the operator to confirm a contact on the ground station, then fly to a fixed delivery point above the person, using NAV2"
 
 import rclpy
 from action_msgs.msg import GoalStatus
@@ -31,16 +31,14 @@ class CourierNode(Node):
         # Absolute (leading "/") because the ground station runs on the
         # scout's namespace, a different robot to this node.
         self.declare_parameter('confirmed_point_topic', '/parrot1/operator/confirmed_point')
-        # The ground station reports a confirmed contact's (x, y) in the
-        # scout's own map frame. This robot has no TF connection to that
-        # frame (separate, non-overlapping TF trees per robot), so the only
-        # way to convert is a fixed offset: both drones' odom frames start at
-        # their own spawn pose in world coordinates (see 41068_ignition.launch.py),
-        # so world = scout_spawn + point_in_scout_frame, then
-        # point_in_my_frame = world - my_spawn. These four parameters must be
-        # kept in step with the spawn x/y used there.
-        self.declare_parameter('scout_spawn_x', 2.0)
-        self.declare_parameter('scout_spawn_y', 0.0)
+        # Fixed delivery point in Gazebo world coordinates: directly above
+        # person1 in worlds/large_demo.sdf. Keep in step with that pose.
+        self.declare_parameter('target_world_x', -6.36)
+        self.declare_parameter('target_world_y', -3.07)
+        # This robot's odom frame starts at its spawn pose in world
+        # coordinates (see 41068_ignition.launch.py), so
+        # point_in_my_frame = world - my_spawn. Keep these in step with the
+        # spawn x/y used there.
         self.declare_parameter('own_spawn_x', 2.0)
         self.declare_parameter('own_spawn_y', -2.0)
 
@@ -50,11 +48,10 @@ class CourierNode(Node):
         # Must stay in step with those, or Nav2 will not understand our goals.
         self.map_frame = f'{robot_name}_odom'  # e.g. "parrot2_odom", NOT "odom"
 
-        self.spawn_offset_x = (
-            self.get_parameter('scout_spawn_x').value - self.get_parameter('own_spawn_x').value
-        )
-        self.spawn_offset_y = (
-            self.get_parameter('scout_spawn_y').value - self.get_parameter('own_spawn_y').value
+        # The delivery point in this robot's own odom frame.
+        self.delivery_point = (
+            self.get_parameter('target_world_x').value - self.get_parameter('own_spawn_x').value,
+            self.get_parameter('target_world_y').value - self.get_parameter('own_spawn_y').value,
         )
 
         self.target = None  # (x, y) in this robot's own odom frame, once confirmed
@@ -120,17 +117,17 @@ class CourierNode(Node):
         self.target_timer = self.create_timer(1.0, self.publish_target_marker)
 
     def on_confirmed_point(self, msg):
-        """Called once, when the operator confirms a contact on the ground station."""
-        # Convert from the scout's map frame into this robot's own odom
-        # frame using the fixed spawn offset (see the parameter comments
-        # in __init__).
-        target_x = msg.point.x + self.spawn_offset_x
-        target_y = msg.point.y + self.spawn_offset_y
-        if self.target is None:
-            self.get_logger().info(
-                f'Contact confirmed. Delivery target: ({target_x:.1f}, {target_y:.1f})'
-            )
-        self.target = (target_x, target_y)
+        """Called when the operator confirms a contact on the ground station.
+
+        The confirm is only the go signal; the contact's own position is not
+        used. The courier always flies to the fixed delivery point.
+        """
+        if self.target is not None:  # already set - ignore repeat confirms
+            return
+        self.target = self.delivery_point
+        self.get_logger().info(
+            f'Contact confirmed. Delivery target: ({self.target[0]:.2f}, {self.target[1]:.2f})'
+        )
 
     def tick(self):
         """Called every second; sends the delivery goal once, once a contact is confirmed."""

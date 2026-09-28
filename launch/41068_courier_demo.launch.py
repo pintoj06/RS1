@@ -10,8 +10,8 @@ def generate_launch_description():
     robot = LaunchConfiguration('robot')
     use_sim_time = LaunchConfiguration('use_sim_time')
     confirmed_point_topic = LaunchConfiguration('confirmed_point_topic')
-    scout_spawn_x = LaunchConfiguration('scout_spawn_x')
-    scout_spawn_y = LaunchConfiguration('scout_spawn_y')
+    target_world_x = LaunchConfiguration('target_world_x')
+    target_world_y = LaunchConfiguration('target_world_y')
     own_spawn_x = LaunchConfiguration('own_spawn_x')
     own_spawn_y = LaunchConfiguration('own_spawn_y')
 
@@ -30,17 +30,19 @@ def generate_launch_description():
         default_value='/parrot1/operator/confirmed_point',
         description='Absolute topic the ground station publishes a confirmed contact to.',
     ))
-    # These four must stay in step with the x/y spawn args used for parrot1
-    # and parrot2 in 41068_ignition.launch.py - they are how courier_node.py
-    # converts a confirmed point from the scout's frame into its own.
+    # Fixed delivery point in world coordinates: above person1 in
+    # worlds/large_demo.sdf.
     ld.add_action(DeclareLaunchArgument(
-        'scout_spawn_x', default_value='2.0',
-        description="Scout drone's spawn x in 41068_ignition.launch.py.",
+        'target_world_x', default_value='-6.36',
+        description='Delivery point x in Gazebo world coordinates.',
     ))
     ld.add_action(DeclareLaunchArgument(
-        'scout_spawn_y', default_value='0.0',
-        description="Scout drone's spawn y in 41068_ignition.launch.py.",
+        'target_world_y', default_value='-3.07',
+        description='Delivery point y in Gazebo world coordinates.',
     ))
+    # These two must stay in step with parrot2's spawn x/y in
+    # 41068_ignition.launch.py - they are how courier_node.py converts the
+    # world point into its own odom frame.
     ld.add_action(DeclareLaunchArgument(
         'own_spawn_x', default_value='2.0',
         description="Courier drone's own spawn x in 41068_ignition.launch.py.",
@@ -64,8 +66,8 @@ def generate_launch_description():
             'use_sim_time': use_sim_time,
             'robot_name': robot,
             'confirmed_point_topic': confirmed_point_topic,
-            'scout_spawn_x': scout_spawn_x,
-            'scout_spawn_y': scout_spawn_y,
+            'target_world_x': target_world_x,
+            'target_world_y': target_world_y,
             'own_spawn_x': own_spawn_x,
             'own_spawn_y': own_spawn_y,
         }],
