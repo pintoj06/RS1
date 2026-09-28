@@ -5,12 +5,20 @@
 
 import math
 
+import numpy as np
+
 import rclpy
 from action_msgs.msg import GoalStatus
 # Point is a plain (x, y, z) location. Markers are built out of lists of these.
 from geometry_msgs.msg import Point, PoseStamped
 from nav2_msgs.action import NavigateToPose
+# OccupancyGrid is the standard ROS "2D grid of values" message. RViz draws it
+# as a coloured overlay, so we use it to show which ground has been searched.
+from nav_msgs.msg import OccupancyGrid
 from rclpy.action import ActionClient
+# CameraInfo carries the camera's focal length and image size, from which the
+# real field of view can be worked out - no need to copy numbers from the xacro.
+from sensor_msgs.msg import CameraInfo
 # Duration is used to put a time limit on TF lookups so they can't block.
 from rclpy.duration import Duration
 from rclpy.node import Node
@@ -23,22 +31,149 @@ import tf2_ros
 # Marker = one drawing in RViz. MarkerArray = several sent together.
 from visualization_msgs.msg import Marker, MarkerArray
 
-def make_sweep(min_x, max_x, min_y, max_y, spacing):
-    """Return a list fo (x,y) points that snake back and forther over the search area"""
+def rotate_points(points, angle):
+    """Rotate a list of (x, y) points about the origin by angle radians."""
+    c, s = math.cos(angle), math.sin(angle)
+    return [(x * c - y * s, x * s + y * c) for x, y in points]
 
-    points= []
-    y = min_y
-    flip= False
-    while y<=max_y + 0.001:
-        if flip:
-            points.append((max_x,y))
-            points.append((min_x,y))
+
+def best_sweep_angle(polygon):
+    """Pick the sweep direction that needs the fewest rows.
+
+    Turning is the expensive part of a coverage pattern, so we want long legs
+    and few of them. That means sweeping along the shape's LONG axis.
+
+    For a polygon, the direction that minimises the number of rows is always
+    parallel to one of its edges, so we simply try each edge in turn and keep
+    whichever gives the smallest extent measured across the sweep direction.
+    A tall narrow area therefore sweeps lengthways instead of making dozens of
+    short hops across its width.
+    """
+    best_angle, best_extent = 0.0, float('inf')
+    n = len(polygon)
+    for i in range(n):
+        x1, y1 = polygon[i]
+        x2, y2 = polygon[(i + 1) % n]
+        edge_angle = math.atan2(y2 - y1, x2 - x1)
+        # Rotate so this edge is horizontal, then measure the height needed.
+        rotated = rotate_points(polygon, -edge_angle)
+        extent = max(p[1] for p in rotated) - min(p[1] for p in rotated)
+        if extent < best_extent:
+            best_extent, best_angle = extent, edge_angle
+    return best_angle
+
+
+def make_sweep_polygon(polygon, spacing, sweep_angle=None):
+    """Lawnmower pattern covering ANY simple polygon.
+
+    This is boustrophedon ("as the ox ploughs") coverage. The method:
+
+      1. Choose a sweep direction - by default the one needing fewest rows.
+      2. Rotate the polygon so those sweep lines become horizontal, which
+         makes the geometry a simple scanline problem.
+      3. For each row, find where the horizontal line crosses the polygon's
+         edges, sort those crossings, and pair them up. Because a line
+         entering a shape must also leave it, consecutive pairs are exactly
+         the parts INSIDE the polygon. This is why concave shapes work too:
+         an L-shape simply produces more than one pair on some rows.
+      4. Alternate the direction of travel each row, so the drone ends each
+         leg next to the start of the next one instead of flying back.
+      5. Rotate the resulting waypoints back into world coordinates.
+
+    Rows are spread evenly across the shape with a half-step margin at each
+    edge, so the real step is always <= the requested spacing. Coverage is
+    complete when the camera's footprint radius is at least half that step.
+
+    polygon: list of (x, y) vertices, in order around the shape.
+    Returns a flat list of (x, y) waypoints to visit in order.
+    """
+    if len(polygon) < 3 or spacing <= 0:
+        return []
+
+    if sweep_angle is None:
+        sweep_angle = best_sweep_angle(polygon)
+
+    rotated = rotate_points(polygon, -sweep_angle)
+    min_y = min(p[1] for p in rotated)
+    max_y = max(p[1] for p in rotated)
+    extent = max_y - min_y
+
+    # Spread the rows evenly rather than stepping from one edge, so the far
+    # edge is always reached instead of being left short.
+    n_rows = max(1, math.ceil(extent / spacing))
+    step = extent / n_rows
+
+    def row_intervals(y):
+        """The spans of this horizontal line that lie inside the polygon."""
+        crossings = []
+        for i in range(len(rotated)):
+            x1, y1 = rotated[i]
+            x2, y2 = rotated[(i + 1) % len(rotated)]
+            # Half-open test: counts a vertex once, not twice. Note this
+            # deliberately ignores an edge that FINISHES at exactly y, which is
+            # what makes the nudge below necessary.
+            if (y1 <= y < y2) or (y2 <= y < y1):
+                t = (y - y1) / (y2 - y1)
+                crossings.append(x1 + t * (x2 - x1))
+        crossings.sort()
+        # Pair them: crossing 0->1 is inside, 1->2 is outside, 2->3 inside...
+        spans = []
+        for j in range(0, len(crossings) - 1, 2):
+            left, right = crossings[j], crossings[j + 1]
+            if right - left >= 1e-6:           # skip slivers at a vertex
+                spans.append((left, right))
+        return spans
+
+    waypoints = []
+    flip = False
+    for row in range(n_rows):
+        y = min_y + (row + 0.5) * step
+
+        # A scanline landing exactly on a corner height is a degenerate case.
+        # The crossing test above counts an edge's lower end but not its upper
+        # one (otherwise a corner counts twice and the inside/outside pairing
+        # inverts), so an edge finishing exactly at this height is missed and
+        # the row comes out short.
+        #
+        # This bit us on an L-shape: its middle row landed on y = 0, exactly
+        # where the L's inner edge sits, and the row was clipped to half width,
+        # leaving the corner of the lower arm unsearched.
+        #
+        # So shift the line a hair off the corner - but which way matters. At a
+        # junction between a wide part and a narrow part, one side gives a short
+        # leg and the other a full-width one, and the full-width leg is the one
+        # that covers both (the camera footprint reaches above AND below the
+        # line). Rather than guess, try both and keep whichever sweeps more.
+        nudge = step * 1e-6
+        below, above = row_intervals(y - nudge), row_intervals(y + nudge)
+        if sum(r - l for l, r in above) > sum(r - l for l, r in below):
+            y, spans = y + nudge, above
         else:
-            points.append((min_x, y))
-            points.append((max_x,y))
+            y, spans = y - nudge, below
+
+        for left, right in spans:
+            if flip:
+                waypoints.extend([(right, y), (left, y)])
+            else:
+                waypoints.extend([(left, y), (right, y)])
         flip = not flip
-        y += spacing
-    return points
+
+    return rotate_points(waypoints, sweep_angle)
+
+
+def make_sweep(min_x, max_x, min_y, max_y, spacing):
+    """Lawnmower pattern over a rectangle.
+
+    Kept so existing launch arguments and parameters still work. It just
+    expresses the rectangle as a polygon and hands it to the general version.
+    """
+    rectangle = [
+        (min_x, min_y),
+        (max_x, min_y),
+        (max_x, max_y),
+        (min_x, max_y),
+    ]
+    return make_sweep_polygon(rectangle, spacing)
 
 
 class SearchNode(Node):
@@ -51,8 +186,24 @@ class SearchNode(Node):
         self.declare_parameter('max_x', 4.0)
         self.declare_parameter('min_y', -4.0)
         self.declare_parameter('max_y', 4.0)
-        self.declare_parameter('spacing', 0.8)
         self.declare_parameter('return_to_spawn', True)
+
+        # Leg spacing is normally worked out from the live camera footprint, so
+        # it does not need setting by hand. Set this to a positive number only
+        # to FORCE a fixed spacing, which is useful for testing.
+        self.declare_parameter('spacing', 0.0)
+
+        # How much neighbouring camera passes overlap. 0.8 means each leg sits
+        # 80% of a footprint width from the last, so consecutive passes share a
+        # 20% strip. That margin is what stops small position errors from
+        # opening a gap of unseen ground between two legs.
+        self.declare_parameter('overlap', 0.8)
+
+        # An arbitrary search polygon, as a flat list: [x1, y1, x2, y2, ...].
+        # Leave it empty to use the min_x/max_x/min_y/max_y rectangle instead.
+        # The mission GUI will eventually publish a shape the operator draws;
+        # until then this is how you test non-rectangular areas by hand.
+        self.declare_parameter('polygon', [0.0])
 
         robot_name= self.get_parameter('robot_name').value
         # Goals are stamped in the frame Nav2 plans in. That is now the odom
@@ -60,21 +211,21 @@ class SearchNode(Node):
         # Must stay in step with those, or Nav2 will not understand our goals.
         self.map_frame= f'{robot_name}_odom' # e.g. "parrot1_odom", NOT "odom"
 
-        self.points= make_sweep(
-            self.get_parameter('min_x').value,
-            self.get_parameter('max_x').value,
-            self.get_parameter('min_y').value,
-            self.get_parameter('max_y').value,
-            self.get_parameter('spacing').value
-        )
+        # Build the search shape: an explicit polygon if one was given,
+        # otherwise the rectangle from the min/max parameters.
+        self.polygon = self._resolve_polygon()
 
-        # (0, 0) in the odom frame is the spawn point (see map_frame comment
-        # above), so "return to spawn" is just one more waypoint tacked onto
-        # the end of the sweep - no separate flight mode needed.
+        # The sweep is deliberately NOT built here. Leg spacing comes from how
+        # much ground the camera can see, which depends on the field of view -
+        # and that arrives over CameraInfo a moment after startup, not yet.
+        # plan_sweep() builds the path from tick() instead, on the first tick
+        # where the camera has reported itself. That is also where the
+        # return-to-spawn waypoint gets appended (see plan_sweep) - doing it
+        # here would just be overwritten once plan_sweep() replaces self.points.
+        self.points = []
+        self.planned = False
+        self.spacing = None
         self.home_index = None
-        if self.get_parameter('return_to_spawn').value:
-            self.points.append((0.0, 0.0))
-            self.home_index = len(self.points) - 1
 
         self.index = 0
         self.busy= False
@@ -147,11 +298,268 @@ class SearchNode(Node):
         self.trail_timer = self.create_timer(0.5, self.record_trail)
         self.area_timer = self.create_timer(1.0, self.publish_search_area)
 
+        # ------------------------------------------------------------------
+        # COVERAGE MAP - which ground the camera has actually looked at.
+        #
+        # The camera points straight down with a 60 degree horizontal field of
+        # view (1.0472 rad, set in parrot.gazebo.xacro) and a 720x480 image,
+        # which gives roughly a 42 degree vertical field of view. So at
+        # altitude h the ground patch in view is about:
+        #
+        #     width  = 2h * tan(30 deg) = 1.155 * h
+        #     height = 2h * tan(21 deg) = 0.770 * h
+        #
+        # Rather than track a rotating rectangle, we mark a CIRCLE whose radius
+        # is half the SHORTER side. That is independent of which way the drone
+        # is facing, and it under-claims coverage rather than over-claiming it,
+        # which is the honest direction to be wrong in.
+        # ------------------------------------------------------------------
+        # Nothing about the camera is hardcoded. The lens properties come from
+        # the camera itself over CameraInfo, and the altitude comes from TF.
+        # Change the drone's spawn height, move the camera, or swap the lens,
+        # and the coverage maths follows automatically.
+        #
+        # The parameters below are only FALLBACKS, used in the first moments
+        # before CameraInfo/TF have arrived. They match the current xacro.
+        self.declare_parameter('fallback_camera_hfov', 1.0472)   # radians
+        self.declare_parameter('fallback_image_width', 720)
+        self.declare_parameter('fallback_image_height', 480)
+        # Height the drone flies at, in metres above the ground. Together with
+        # the camera's field of view this is what sets how wide a strip of ground
+        # the camera covers, and therefore how far apart the sweep legs go.
+        #
+        # It is a parameter rather than a measurement because nothing in flight
+        # changes it: Nav2 is a 2D planner and never commands height, so the
+        # drone holds whatever altitude it was spawned at. Keep this in step with
+        # the Parrot's spawn z in 41068_ignition.launch.py.
+        self.declare_parameter('flight_altitude', 10.0)           # metres
+        self.declare_parameter('coverage_resolution', 0.5)       # metres per cell
+
+        self.camera_frame = f'{robot_name}_camera_link'
+
+        # Filled in by the CameraInfo callback. None until the first message.
+        self.cam_fx = None
+        self.cam_fy = None
+        self.cam_width = None
+        self.cam_height = None
+        self.logged_camera_info = False
+
+        self.create_subscription(
+            CameraInfo, 'camera/camera_info', self._camera_info_callback, 1
+        )
+
+        self.coverage_resolution = float(self.get_parameter('coverage_resolution').value)
+
+        # Pad the grid a little beyond the search box so edge passes still land
+        # inside it.
+        pad = 5.0
+        poly_min_x = min(p[0] for p in self.polygon)
+        poly_max_x = max(p[0] for p in self.polygon)
+        poly_min_y = min(p[1] for p in self.polygon)
+        poly_max_y = max(p[1] for p in self.polygon)
+        self.cov_origin_x = poly_min_x - pad
+        self.cov_origin_y = poly_min_y - pad
+        span_x = (poly_max_x - poly_min_x) + 2 * pad
+        span_y = (poly_max_y - poly_min_y) + 2 * pad
+        self.cov_cols = max(1, int(span_x / self.coverage_resolution))
+        self.cov_rows = max(1, int(span_y / self.coverage_resolution))
+
+        # 0 = not yet searched, 100 = searched. Same convention OccupancyGrid
+        # uses, so it can be published directly.
+        self.coverage = np.zeros((self.cov_rows, self.cov_cols), dtype=np.int8)
+
+        # Which grid cells are actually inside the search polygon. Computed
+        # once, and used so the coverage percentage is measured against the
+        # real shape - otherwise a non-rectangular area could never reach
+        # 100%, because cells in the bounding box but outside the shape would
+        # count as forever unsearched.
+        self.inside_mask = self._build_inside_mask()
+        self.cells_to_search = int(np.count_nonzero(self.inside_mask))
+
+        self.coverage_pub = self.create_publisher(OccupancyGrid, 'search_coverage', 10)
+        self.coverage_timer = self.create_timer(0.5, self.update_coverage)
+        self.last_coverage_log = 0.0
+
+        # Report the footprint periodically rather than once at startup: at
+        # startup neither CameraInfo nor TF has arrived, so the numbers would
+        # be the fallbacks rather than the real ones. This also means the log
+        # follows the drone if its altitude changes mid-flight.
+        self.footprint_timer = self.create_timer(10.0, self._log_footprint)
+
+    def _log_footprint(self):
+        """Log what the camera can currently see, and the spacing in use.
+
+        While the search is on hold this says so instead. Otherwise the only
+        sign the drone has parked itself is one HOLD line that scrolls away,
+        and this message keeps reporting spacing as though it were still
+        flying - which reads like nothing is wrong.
+        """
+        if not self.planned:
+            return
+        if self.holding:
+            self.get_logger().warn(
+                f'STILL ON HOLD at waypoint {self.index + 1}/{len(self.points)} '
+                f'- hovering, waiting for the operator to confirm or dismiss '
+                f'the contact.'
+            )
+            return
+        self.get_logger().info(
+            f'Camera sees {self._footprint_radius() * 2:.1f} m across at '
+            f'{self._camera_altitude():.1f} m above ground. '
+            f'Leg spacing in use: {self.spacing:.1f} m.'
+        )
+
+    def _predicted_coverage(self, points, radius, res=0.5):
+        """Fraction of the search polygon the camera would see flying `points`.
+
+        This is the planner marking its own homework, before the drone moves.
+        We lay a grid over the polygon, fly the proposed path in simulation, and
+        count which cells the camera footprint would pass over.
+
+        It exists because spacing alone cannot guarantee coverage. On shapes
+        whose width changes sharply along the sweep direction - a cross or a
+        plus, say - the outer arms may be reached by only a single sweep row,
+        and if that arm is taller than the footprint a strip goes unseen. The
+        textbook cure is cell decomposition (splitting the shape and sweeping
+        each part with its own rows), which is a much bigger change. Measuring
+        the result and tightening the spacing gets the same guarantee.
+        """
+        if len(points) < 2:
+            return 0.0
+
+        xs = [p[0] for p in self.polygon]
+        ys = [p[1] for p in self.polygon]
+        pad = radius + res
+        ox, oy = min(xs) - pad, min(ys) - pad
+        cols = max(1, int(((max(xs) - min(xs)) + 2 * pad) / res))
+        rows = max(1, int(((max(ys) - min(ys)) + 2 * pad) / res))
+
+        # Cell-centre coordinates as two 2D arrays, so the tests below can be
+        # done on the whole grid at once instead of cell by cell.
+        gx, gy = np.meshgrid(ox + (np.arange(cols) + 0.5) * res,
+                            oy + (np.arange(rows) + 0.5) * res)
+
+        # Which cells are inside the polygon - ray casting, vectorised. Each
+        # edge flips the cells whose rightward ray crosses it; an odd number of
+        # crossings means inside.
+        inside = np.zeros((rows, cols), dtype=bool)
+        n = len(self.polygon)
+        for i in range(n):
+            x1, y1 = self.polygon[i]
+            x2, y2 = self.polygon[(i + 1) % n]
+            if y1 == y2:
+                continue                      # horizontal edges never cross
+            inside ^= (((y1 > gy) != (y2 > gy))
+                       & (gx < x1 + (gy - y1) / (y2 - y1) * (x2 - x1)))
+
+        total = int(inside.sum())
+        if total == 0:
+            return 0.0
+
+        # Fly the path and mark everything the footprint circle passes over.
+        seen = np.zeros((rows, cols), dtype=bool)
+        sample = max(res * 0.5, 0.1)          # how finely to step along a leg
+        r2 = radius * radius
+        for (ax, ay), (bx, by) in zip(points[:-1], points[1:]):
+            legs = max(1, int(math.hypot(bx - ax, by - ay) / sample))
+            for k in range(legs + 1):
+                t = k / legs
+                px, py = ax + t * (bx - ax), ay + t * (by - ay)
+                seen |= (gx - px) ** 2 + (gy - py) ** 2 <= r2
+
+        return float((seen & inside).sum()) / total
+
+    def plan_sweep(self):
+        """Build the sweep path, with leg spacing set by the camera footprint.
+
+        This is the point of the whole search pattern: the drone should never
+        have to be told how far apart to fly its legs. It can see how wide a
+        strip of ground its own camera covers, so it works the spacing out from
+        that and gaps become impossible by construction rather than something
+        we check for afterwards.
+
+        Called from tick() rather than __init__ because it needs live sensor
+        data. Returns True once the path has been built.
+        """
+        if self.cam_fx is None:
+            self.get_logger().info('Waiting for camera info before planning the sweep...')
+            return False
+        footprint = self._footprint_radius() * 2.0      # metres across on the ground
+
+        # A positive 'spacing' parameter forces a fixed value. Otherwise the
+        # spacing is the footprint shrunk by the overlap factor, so neighbouring
+        # camera passes are guaranteed to touch instead of leaving a strip of
+        # ground nobody looked at.
+        forced = float(self.get_parameter('spacing').value)
+        overlap = float(self.get_parameter('overlap').value)
+        if forced > 0.0:
+            self.spacing = forced
+            source = 'forced by the spacing parameter'
+            self.points = make_sweep_polygon(self.polygon, self.spacing)
+            predicted = self._predicted_coverage(self.points, self._footprint_radius())
+        else:
+            source = f'{footprint:.1f} m camera footprint x {overlap:.2f} overlap'
+            # Start from the footprint-derived spacing, then CHECK it. Spacing
+            # on its own does not guarantee coverage on awkward shapes, so if
+            # the check predicts a gap we tighten and try again rather than
+            # taking off and finding out afterwards.
+            self.spacing = footprint * overlap
+            radius = self._footprint_radius()
+            for attempt in range(6):
+                self.points = make_sweep_polygon(self.polygon, self.spacing)
+                predicted = self._predicted_coverage(self.points, radius)
+                if predicted >= 0.999:
+                    break
+                self.get_logger().warn(
+                    f'Spacing {self.spacing:.2f} m would leave '
+                    f'{100 * (1 - predicted):.1f}% of the area unsearched - '
+                    f'tightening.'
+                )
+                self.spacing *= 0.85
+
+        # (0, 0) in the odom frame is the spawn point (see map_frame comment
+        # in __init__), so "return to spawn" is just one more waypoint tacked
+        # onto the end of the sweep - no separate flight mode needed. Done
+        # here, after self.points has its final value, rather than in
+        # __init__ - the retry loop above replaces self.points outright, so
+        # appending any earlier would just get overwritten.
+        if self.get_parameter('return_to_spawn').value:
+            self.points.append((0.0, 0.0))
+            self.home_index = len(self.points) - 1
+
+        self.planned = True
+
+        sweep_deg = math.degrees(best_sweep_angle(self.polygon))
+        self.get_logger().info(
+            f'Search area: {len(self.polygon)}-sided polygon, sweeping along '
+            f'{sweep_deg:.0f} degrees (chosen to minimise turns).'
+        )
+        self.get_logger().info(
+            f'Camera sees {footprint:.1f} m across at '
+            f'{self._camera_altitude():.1f} m above ground. '
+            f'Leg spacing {self.spacing:.1f} m ({source}): '
+            f'{len(self.points) // 2} legs, {len(self.points)} waypoints.'
+        )
+        if predicted >= 0.999:
+            self.get_logger().info(
+                f'Checked before take-off: this path covers '
+                f'{100 * predicted:.1f}% of the search area.'
+            )
+        else:
+            self.get_logger().warn(
+                f'Best achievable with this shape is {100 * predicted:.1f}% '
+                f'coverage - {100 * (1 - predicted):.1f}% will NOT be searched.'
+            )
+        return True
+
     def tick(self):
         """Called every second; sends the next waypoint to Nav2 once it's ready and we're not already flying to one."""
         if self.holding:
             return
         if self.busy: #goal is already in flight
+            return
+        # Plan on the first tick that has camera data, not in __init__.
+        if not self.planned and not self.plan_sweep():
             return
         if self.index>= len(self.points):
             return
@@ -226,11 +634,18 @@ class SearchNode(Node):
             return
         self.holding = msg.data
         if self.holding:
-            self.get_logger().warn('HOLD: contact reported, stopping search.')
+            self.get_logger().warn(
+                f'HOLD: contact reported, stopping search at waypoint '
+                f'{self.index + 1}/{len(self.points)}. Hovering until the '
+                f'operator rules on it.'
+            )
             if self.goal_handle is not None:
                 self.goal_handle.cancel_goal_async()
         else:
-            self.get_logger().info('Hold released, resuming search.')
+            self.get_logger().info(
+                f'Hold released, resuming search - re-flying waypoint '
+                f'{self.index + 1}/{len(self.points)}.'
+            )
             # Don't wait up to a second for the timer; the ground station only
             # gives the drone a short window to move before it checks again.
             self.tick()
@@ -294,11 +709,6 @@ class SearchNode(Node):
         stamp = self.get_clock().now().to_msg()
         markers = MarkerArray()
 
-        min_x = self.get_parameter('min_x').value
-        max_x = self.get_parameter('max_x').value
-        min_y = self.get_parameter('min_y').value
-        max_y = self.get_parameter('max_y').value
-
         def new_marker(marker_id, name, marker_type, size):
             """Small helper - fills in the fields every marker needs."""
             m = Marker()
@@ -320,12 +730,12 @@ class SearchNode(Node):
             p.x, p.y, p.z = float(x), float(y), float(z)
             return p
 
-        # 1. GREEN OUTLINE of the search area. A LINE_STRIP joins its points
-        #    in order, so we repeat the first corner at the end to close it.
+        # 1. GREEN OUTLINE of the search area - the actual polygon, whatever
+        #    its shape. A LINE_STRIP joins its points in order, so we repeat
+        #    the first vertex at the end to close the loop.
         box = new_marker(0, 'search_area', Marker.LINE_STRIP, 0.15)
         box.color = ColorRGBA(r=0.0, g=1.0, b=0.0, a=1.0)
-        for x, y in [(min_x, min_y), (max_x, min_y), (max_x, max_y),
-                     (min_x, max_y), (min_x, min_y)]:
+        for x, y in list(self.polygon) + [self.polygon[0]]:
             box.points.append(point(x, y))
         markers.markers.append(box)
 
@@ -352,6 +762,221 @@ class SearchNode(Node):
         markers.markers.append(dots)
 
         self.area_pub.publish(markers)
+
+    # ----------------------------------------------------------------------
+    # COVERAGE TRACKING
+    # ----------------------------------------------------------------------
+
+    @staticmethod
+    def point_in_polygon(x, y, polygon):
+        """True if (x, y) lies inside the polygon.
+
+        Ray casting: fire a ray to the right and count how many edges it
+        crosses. Odd means inside, even means outside. Works for concave
+        shapes as well as convex ones.
+        """
+        inside = False
+        n = len(polygon)
+        for i in range(n):
+            x1, y1 = polygon[i]
+            x2, y2 = polygon[(i + 1) % n]
+            if (y1 > y) != (y2 > y):
+                x_cross = x1 + (y - y1) / (y2 - y1) * (x2 - x1)
+                if x < x_cross:
+                    inside = not inside
+        return inside
+
+    def _build_inside_mask(self):
+        """Boolean grid marking which coverage cells fall inside the polygon."""
+        mask = np.zeros((self.cov_rows, self.cov_cols), dtype=bool)
+        for row in range(self.cov_rows):
+            cell_y = self.cov_origin_y + (row + 0.5) * self.coverage_resolution
+            for col in range(self.cov_cols):
+                cell_x = self.cov_origin_x + (col + 0.5) * self.coverage_resolution
+                mask[row, col] = self.point_in_polygon(cell_x, cell_y, self.polygon)
+        return mask
+
+    def _resolve_polygon(self):
+        """Return the search shape as a list of (x, y) vertices.
+
+        Uses the 'polygon' parameter if it holds a sensible shape, otherwise
+        falls back to the min_x/max_x/min_y/max_y rectangle so existing launch
+        arguments keep working unchanged.
+        """
+        flat = list(self.get_parameter('polygon').value or [])
+
+        if len(flat) >= 6 and len(flat) % 2 == 0:
+            return [(float(flat[i]), float(flat[i + 1]))
+                    for i in range(0, len(flat), 2)]
+
+        if len(flat) > 1:
+            self.get_logger().warn(
+                f'polygon parameter has {len(flat)} values; it needs an even '
+                'count of at least 6 (three x,y pairs). Using the rectangle.'
+            )
+
+        min_x = self.get_parameter('min_x').value
+        max_x = self.get_parameter('max_x').value
+        min_y = self.get_parameter('min_y').value
+        max_y = self.get_parameter('max_y').value
+        return [(min_x, min_y), (max_x, min_y), (max_x, max_y), (min_x, max_y)]
+
+    def _lookup_robot_xy(self):
+        """Return the drone's current (x, y) in the map frame, or None.
+
+        Same TF lookup record_trail does, pulled out so the coverage map can
+        use it too. Returns None while TF is not ready yet, which is normal
+        for the first few seconds after startup.
+        """
+        try:
+            t = self.tf_buffer.lookup_transform(
+                self.map_frame,
+                self.base_frame,
+                rclpy.time.Time(),
+                timeout=Duration(seconds=0.1),
+            )
+        except Exception:
+            return None
+
+        return (t.transform.translation.x, t.transform.translation.y)
+
+    def _camera_info_callback(self, msg: CameraInfo):
+        """Store the camera's real lens properties as reported by the camera.
+
+        CameraInfo.k is the 3x3 intrinsic matrix, laid out as a flat list:
+
+            k = [fx,  0, cx,
+                  0, fy, cy,
+                  0,  0,  1]
+
+        fx and fy are the focal lengths in PIXELS. Combined with the image
+        size they give the field of view directly, so we never have to copy
+        numbers out of the xacro and keep them in step by hand.
+        """
+        self.cam_fx = msg.k[0]
+        self.cam_fy = msg.k[4]
+        self.cam_width = msg.width
+        self.cam_height = msg.height
+
+        if not self.logged_camera_info and self.cam_fx:
+            self.logged_camera_info = True
+            hfov, vfov = self._camera_fov()
+            self.get_logger().info(
+                f'Camera info received: {self.cam_width}x{self.cam_height}, '
+                f'FOV {math.degrees(hfov):.1f} x {math.degrees(vfov):.1f} degrees.'
+            )
+
+    def _camera_fov(self):
+        """Return (horizontal, vertical) field of view in radians.
+
+        Uses the live CameraInfo when it has arrived, otherwise the fallback
+        parameters so the node still works in the first second or two.
+        """
+        if self.cam_fx and self.cam_fy and self.cam_width and self.cam_height:
+            hfov = 2.0 * math.atan(self.cam_width / (2.0 * self.cam_fx))
+            vfov = 2.0 * math.atan(self.cam_height / (2.0 * self.cam_fy))
+            return hfov, vfov
+
+        hfov = float(self.get_parameter('fallback_camera_hfov').value)
+        width = float(self.get_parameter('fallback_image_width').value)
+        height = float(self.get_parameter('fallback_image_height').value)
+        vfov = 2.0 * math.atan(math.tan(hfov / 2.0) * (height / width))
+        return hfov, vfov
+
+    def _camera_altitude(self):
+        """Height of the camera above the ground, in metres.
+
+        Read from the flight_altitude parameter. It deliberately does NOT come
+        from TF: Ignition's odometry publisher is planar, so /parrot1/odometry
+        reports z = 0.0 however high the drone flies, and the only z in the
+        odom -> camera_link chain is the camera's own 0.2 m mounting offset.
+        Reading that gave a 0.2 m "altitude", a camera footprint smaller than
+        one grid cell, and a coverage map that never marked anything at all.
+
+        A parameter is the right answer rather than a stopgap: Nav2 is a 2D
+        planner and never commands height, so the drone holds its spawn
+        altitude for the whole flight. The figure is constant and known.
+        """
+        return float(self.get_parameter('flight_altitude').value)
+
+    def _footprint_radius(self):
+        """Radius on the ground the camera can see, in metres.
+
+        Everything here is derived live: the lens from CameraInfo, the height
+        from TF. Raise the drone, move the camera, or change the lens and this
+        updates on its own.
+
+        The camera looks straight down, so its footprint is a rectangle. We use
+        half the SHORTER side as a circle radius: that is independent of which
+        way the drone is facing, and it under-claims coverage rather than
+        over-claiming it, which is the honest direction to be wrong in.
+        """
+        hfov, vfov = self._camera_fov()
+        altitude = self._camera_altitude()
+
+        half_width = altitude * math.tan(hfov / 2.0)
+        half_height = altitude * math.tan(vfov / 2.0)
+        return min(half_width, half_height)
+
+    def update_coverage(self):
+        """Mark the ground currently under the camera as searched."""
+        pos = self._lookup_robot_xy()
+        if pos is None:
+            return                       # TF not ready yet
+
+        robot_x, robot_y = pos
+        radius = self._footprint_radius()
+
+        # Convert the circle's bounding box into grid cell indices.
+        min_col = int((robot_x - radius - self.cov_origin_x) / self.coverage_resolution)
+        max_col = int((robot_x + radius - self.cov_origin_x) / self.coverage_resolution)
+        min_row = int((robot_y - radius - self.cov_origin_y) / self.coverage_resolution)
+        max_row = int((robot_y + radius - self.cov_origin_y) / self.coverage_resolution)
+
+        # Clamp to the grid so we never index outside it.
+        min_col = max(0, min_col)
+        min_row = max(0, min_row)
+        max_col = min(self.cov_cols - 1, max_col)
+        max_row = min(self.cov_rows - 1, max_row)
+
+        # Mark every cell whose centre falls inside the circle.
+        for row in range(min_row, max_row + 1):
+            for col in range(min_col, max_col + 1):
+                cell_x = self.cov_origin_x + (col + 0.5) * self.coverage_resolution
+                cell_y = self.cov_origin_y + (row + 0.5) * self.coverage_resolution
+                if math.hypot(cell_x - robot_x, cell_y - robot_y) <= radius:
+                    self.coverage[row, col] = 100
+
+        self._publish_coverage()
+
+    def _publish_coverage(self):
+        """Publish the coverage grid, and log the percentage now and then."""
+        grid = OccupancyGrid()
+        grid.header.frame_id = self.map_frame
+        grid.header.stamp = self.get_clock().now().to_msg()
+        grid.info.resolution = self.coverage_resolution
+        grid.info.width = self.cov_cols
+        grid.info.height = self.cov_rows
+        grid.info.origin.position.x = self.cov_origin_x
+        grid.info.origin.position.y = self.cov_origin_y
+        grid.info.origin.orientation.w = 1.0
+        # OccupancyGrid data is a flat row-major list, same order as the array.
+        grid.data = self.coverage.flatten().tolist()
+        self.coverage_pub.publish(grid)
+
+        # Measure progress against cells INSIDE the polygon only. The grid is
+        # padded wider than the shape, and for a non-rectangular area many
+        # cells in the bounding box were never meant to be searched - counting
+        # those would mean the percentage could never reach 100%.
+        if self.cells_to_search:
+            searched = int(np.count_nonzero((self.coverage > 0) & self.inside_mask))
+            percent = 100.0 * searched / self.cells_to_search
+            if percent - self.last_coverage_log >= 5.0:
+                self.last_coverage_log = percent
+                self.get_logger().info(
+                    f'Search area coverage: {percent:.0f}% '
+                    f'({searched}/{self.cells_to_search} cells)'
+                )
 
 
 def main():
