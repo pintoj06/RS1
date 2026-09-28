@@ -22,6 +22,7 @@ inside one ROS node.
 """
 
 import math
+import os
 import random
 import time
 from typing import Optional, Tuple
@@ -125,12 +126,15 @@ class BasicAutonomyDemo(Node):
             self._image_callback,
             1,
         )
-        self.thermal_sub = self.create_subscription(
-            Image,
-            self.get_parameter('thermal_topic').value,
-            self._thermal_callback,
-            1,
-        )
+        # Disabled for now to gather plain RGB images via _image_callback
+        # without the thermal window/processing competing for attention.
+        # Re-enable by uncommenting once thermal testing resumes.
+        # self.thermal_sub = self.create_subscription(
+        #     Image,
+        #     self.get_parameter('thermal_topic').value,
+        #     self._thermal_callback,
+        #     1,
+        # )
         self.nav_client = ActionClient(
             self,
             NavigateToPose,
@@ -175,49 +179,26 @@ class BasicAutonomyDemo(Node):
         )
 
     def _image_callback(self, msg: Image) -> None:
-        """Check the RGB image for a detection; halt and hold it if found.
+        """Save the RGB image to disk for CV dataset collection.
 
-        This is a stand-in for the eventual real detector: a colour threshold
-        for the red heat-marker box used for thermal testing, then the same
-        contour/bounding-box check used on the thermal image. Ordinary frames
-        are processed silently and nothing is shown; only once something is
-        actually found does the node stop driving (see the guard in _tick)
-        and hold the frame on screen. That is the "detect, then pause for
-        operator confirmation" half of the eventual mission behaviour - the
-        actual confirm/deny UI is a later piece.
+        Box-detection/halt-on-person behaviour is disabled here for now so
+        this just captures plain frames. Throttled to roughly 1 image/sec so
+        a dataset run doesn't dump hundreds of near-duplicate frames.
         """
-        if self.person_detected:
-            return
-
-        cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
-
-        hsv = cv2.cvtColor(cv_image, cv2.COLOR_BGR2HSV)
-        red_mask = (
-            cv2.inRange(hsv, (0, 120, 70), (10, 255, 255))
-            | cv2.inRange(hsv, (170, 120, 70), (180, 255, 255))
-        )
-        contours, _ = cv2.findContours(red_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        best = max(contours, key=cv2.contourArea, default=None)
-
-        min_area = 200  # pixels; filters out small false positives
-        if best is not None and cv2.contourArea(best) >= min_area:
-            x, y, w, h = cv2.boundingRect(best)
-            cv2.rectangle(cv_image, (x, y), (x + w, y + h), (0, 255, 0), 2)
-
-            self.person_detected = True
-            self.get_logger().info(
-                'RGB detection found - halting autonomy and holding the frame '
-                'for operator confirmation. Press any key in the image window '
-                'to release it.'
-            )
-            cv2.imshow('camera', cv_image)
-            cv2.waitKey(0)
-            return
-
         now = time.monotonic()
         if now - self.last_image_process_time < 1.0:
             return
         self.last_image_process_time = now
+
+        cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+
+        downloads_dir = os.path.expanduser('~/Downloads')
+        os.makedirs(downloads_dir, exist_ok=True)
+        filename = os.path.join(
+            downloads_dir,
+            f'{self.robot_name}_camera_{time.time():.3f}.png',
+        )
+        cv2.imwrite(filename, cv_image)
 
         brightness = self._estimate_image_brightness(msg)
         if brightness is not None:
