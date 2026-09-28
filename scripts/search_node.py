@@ -101,28 +101,55 @@ def make_sweep_polygon(polygon, spacing, sweep_angle=None):
     n_rows = max(1, math.ceil(extent / spacing))
     step = extent / n_rows
 
-    waypoints = []
-    flip = False
-    n = len(rotated)
-    for row in range(n_rows):
-        y = min_y + (row + 0.5) * step
-
-        # Where does this horizontal line cross the polygon's edges?
+    def row_intervals(y):
+        """The spans of this horizontal line that lie inside the polygon."""
         crossings = []
-        for i in range(n):
+        for i in range(len(rotated)):
             x1, y1 = rotated[i]
-            x2, y2 = rotated[(i + 1) % n]
-            # Half-open test: counts a vertex once, not twice.
+            x2, y2 = rotated[(i + 1) % len(rotated)]
+            # Half-open test: counts a vertex once, not twice. Note this
+            # deliberately ignores an edge that FINISHES at exactly y, which is
+            # what makes the nudge below necessary.
             if (y1 <= y < y2) or (y2 <= y < y1):
                 t = (y - y1) / (y2 - y1)
                 crossings.append(x1 + t * (x2 - x1))
-
         crossings.sort()
         # Pair them: crossing 0->1 is inside, 1->2 is outside, 2->3 inside...
+        spans = []
         for j in range(0, len(crossings) - 1, 2):
             left, right = crossings[j], crossings[j + 1]
-            if right - left < 1e-6:
-                continue                       # skip slivers at a vertex
+            if right - left >= 1e-6:           # skip slivers at a vertex
+                spans.append((left, right))
+        return spans
+
+    waypoints = []
+    flip = False
+    for row in range(n_rows):
+        y = min_y + (row + 0.5) * step
+
+        # A scanline landing exactly on a corner height is a degenerate case.
+        # The crossing test above counts an edge's lower end but not its upper
+        # one (otherwise a corner counts twice and the inside/outside pairing
+        # inverts), so an edge finishing exactly at this height is missed and
+        # the row comes out short.
+        #
+        # This bit us on an L-shape: its middle row landed on y = 0, exactly
+        # where the L's inner edge sits, and the row was clipped to half width,
+        # leaving the corner of the lower arm unsearched.
+        #
+        # So shift the line a hair off the corner - but which way matters. At a
+        # junction between a wide part and a narrow part, one side gives a short
+        # leg and the other a full-width one, and the full-width leg is the one
+        # that covers both (the camera footprint reaches above AND below the
+        # line). Rather than guess, try both and keep whichever sweeps more.
+        nudge = step * 1e-6
+        below, above = row_intervals(y - nudge), row_intervals(y + nudge)
+        if sum(r - l for l, r in above) > sum(r - l for l, r in below):
+            y, spans = y + nudge, above
+        else:
+            y, spans = y - nudge, below
+
+        for left, right in spans:
             if flip:
                 waypoints.extend([(right, y), (left, y)])
             else:
@@ -157,7 +184,16 @@ class SearchNode(Node):
         self.declare_parameter('max_x', 4.0)
         self.declare_parameter('min_y', -4.0)
         self.declare_parameter('max_y', 4.0)
-        self.declare_parameter('spacing', 0.8)
+        # Leg spacing is normally worked out from the live camera footprint, so
+        # it does not need setting by hand. Set this to a positive number only
+        # to FORCE a fixed spacing, which is useful for testing.
+        self.declare_parameter('spacing', 0.0)
+
+        # How much neighbouring camera passes overlap. 0.8 means each leg sits
+        # 80% of a footprint width from the last, so consecutive passes share a
+        # 20% strip. That margin is what stops small position errors from
+        # opening a gap of unseen ground between two legs.
+        self.declare_parameter('overlap', 0.8)
 
         # An arbitrary search polygon, as a flat list: [x1, y1, x2, y2, ...].
         # Leave it empty to use the min_x/max_x/min_y/max_y rectangle instead.
@@ -174,16 +210,15 @@ class SearchNode(Node):
         # Build the search shape: an explicit polygon if one was given,
         # otherwise the rectangle from the min/max parameters.
         self.polygon = self._resolve_polygon()
-        self.points = make_sweep_polygon(
-            self.polygon,
-            self.get_parameter('spacing').value,
-        )
-        sweep_deg = math.degrees(best_sweep_angle(self.polygon))
-        self.get_logger().info(
-            f'Search area: {len(self.polygon)}-sided polygon. '
-            f'Sweeping along {sweep_deg:.0f} degrees (chosen to minimise turns), '
-            f'{len(self.points) // 2} legs, {len(self.points)} waypoints.'
-        )
+
+        # The sweep is deliberately NOT built here. Leg spacing comes from how
+        # much ground the camera can see, which depends on the field of view -
+        # and that arrives over CameraInfo a moment after startup, not yet.
+        # plan_sweep() builds the path from tick() instead, on the first tick
+        # where the camera has reported itself.
+        self.points = []
+        self.planned = False
+        self.spacing = None
 
         self.index = 0
         self.busy= False
@@ -263,7 +298,15 @@ class SearchNode(Node):
         self.declare_parameter('fallback_camera_hfov', 1.0472)   # radians
         self.declare_parameter('fallback_image_width', 720)
         self.declare_parameter('fallback_image_height', 480)
-        self.declare_parameter('fallback_altitude', 10.0)        # metres
+        # Height the drone flies at, in metres above the ground. Together with
+        # the camera's field of view this is what sets how wide a strip of ground
+        # the camera covers, and therefore how far apart the sweep legs go.
+        #
+        # It is a parameter rather than a measurement because nothing in flight
+        # changes it: Nav2 is a 2D planner and never commands height, so the
+        # drone holds whatever altitude it was spawned at. Keep this in step with
+        # the Parrot's spawn z in 41068_ignition.launch.py.
+        self.declare_parameter('flight_altitude', 10.0)           # metres
         self.declare_parameter('coverage_resolution', 0.5)       # metres per cell
 
         self.camera_frame = f'{robot_name}_camera_link'
@@ -318,18 +361,154 @@ class SearchNode(Node):
         self.footprint_timer = self.create_timer(10.0, self._log_footprint)
 
     def _log_footprint(self):
-        """Log the current camera footprint and the spacing it implies."""
-        radius = self._footprint_radius()
+        """Log what the camera can currently see, and the spacing in use."""
+        if not self.planned:
+            return
         self.get_logger().info(
-            f'Camera footprint: {radius * 2:.1f} m across at '
-            f'{self._camera_altitude():.1f} m altitude. '
-            f'Sweep spacing is {self.get_parameter("spacing").value:.1f} m '
-            f'({"OK" if self.get_parameter("spacing").value < radius * 2 else "TOO WIDE - gaps"}).'
+            f'Camera sees {self._footprint_radius() * 2:.1f} m across at '
+            f'{self._camera_altitude():.1f} m above ground. '
+            f'Leg spacing in use: {self.spacing:.1f} m.'
         )
+
+    def _predicted_coverage(self, points, radius, res=0.5):
+        """Fraction of the search polygon the camera would see flying `points`.
+
+        This is the planner marking its own homework, before the drone moves.
+        We lay a grid over the polygon, fly the proposed path in simulation, and
+        count which cells the camera footprint would pass over.
+
+        It exists because spacing alone cannot guarantee coverage. On shapes
+        whose width changes sharply along the sweep direction - a cross or a
+        plus, say - the outer arms may be reached by only a single sweep row,
+        and if that arm is taller than the footprint a strip goes unseen. The
+        textbook cure is cell decomposition (splitting the shape and sweeping
+        each part with its own rows), which is a much bigger change. Measuring
+        the result and tightening the spacing gets the same guarantee.
+        """
+        if len(points) < 2:
+            return 0.0
+
+        xs = [p[0] for p in self.polygon]
+        ys = [p[1] for p in self.polygon]
+        pad = radius + res
+        ox, oy = min(xs) - pad, min(ys) - pad
+        cols = max(1, int(((max(xs) - min(xs)) + 2 * pad) / res))
+        rows = max(1, int(((max(ys) - min(ys)) + 2 * pad) / res))
+
+        # Cell-centre coordinates as two 2D arrays, so the tests below can be
+        # done on the whole grid at once instead of cell by cell.
+        gx, gy = np.meshgrid(ox + (np.arange(cols) + 0.5) * res,
+                            oy + (np.arange(rows) + 0.5) * res)
+
+        # Which cells are inside the polygon - ray casting, vectorised. Each
+        # edge flips the cells whose rightward ray crosses it; an odd number of
+        # crossings means inside.
+        inside = np.zeros((rows, cols), dtype=bool)
+        n = len(self.polygon)
+        for i in range(n):
+            x1, y1 = self.polygon[i]
+            x2, y2 = self.polygon[(i + 1) % n]
+            if y1 == y2:
+                continue                      # horizontal edges never cross
+            inside ^= (((y1 > gy) != (y2 > gy))
+                       & (gx < x1 + (gy - y1) / (y2 - y1) * (x2 - x1)))
+
+        total = int(inside.sum())
+        if total == 0:
+            return 0.0
+
+        # Fly the path and mark everything the footprint circle passes over.
+        seen = np.zeros((rows, cols), dtype=bool)
+        sample = max(res * 0.5, 0.1)          # how finely to step along a leg
+        r2 = radius * radius
+        for (ax, ay), (bx, by) in zip(points[:-1], points[1:]):
+            legs = max(1, int(math.hypot(bx - ax, by - ay) / sample))
+            for k in range(legs + 1):
+                t = k / legs
+                px, py = ax + t * (bx - ax), ay + t * (by - ay)
+                seen |= (gx - px) ** 2 + (gy - py) ** 2 <= r2
+
+        return float((seen & inside).sum()) / total
+
+    def plan_sweep(self):
+        """Build the sweep path, with leg spacing set by the camera footprint.
+
+        This is the point of the whole search pattern: the drone should never
+        have to be told how far apart to fly its legs. It can see how wide a
+        strip of ground its own camera covers, so it works the spacing out from
+        that and gaps become impossible by construction rather than something
+        we check for afterwards.
+
+        Called from tick() rather than __init__ because it needs live sensor
+        data. Returns True once the path has been built.
+        """
+        if self.cam_fx is None:
+            self.get_logger().info('Waiting for camera info before planning the sweep...')
+            return False
+        footprint = self._footprint_radius() * 2.0      # metres across on the ground
+
+        # A positive 'spacing' parameter forces a fixed value. Otherwise the
+        # spacing is the footprint shrunk by the overlap factor, so neighbouring
+        # camera passes are guaranteed to touch instead of leaving a strip of
+        # ground nobody looked at.
+        forced = float(self.get_parameter('spacing').value)
+        overlap = float(self.get_parameter('overlap').value)
+        if forced > 0.0:
+            self.spacing = forced
+            source = 'forced by the spacing parameter'
+            self.points = make_sweep_polygon(self.polygon, self.spacing)
+            predicted = self._predicted_coverage(self.points, self._footprint_radius())
+        else:
+            source = f'{footprint:.1f} m camera footprint x {overlap:.2f} overlap'
+            # Start from the footprint-derived spacing, then CHECK it. Spacing
+            # on its own does not guarantee coverage on awkward shapes, so if
+            # the check predicts a gap we tighten and try again rather than
+            # taking off and finding out afterwards.
+            self.spacing = footprint * overlap
+            radius = self._footprint_radius()
+            for attempt in range(6):
+                self.points = make_sweep_polygon(self.polygon, self.spacing)
+                predicted = self._predicted_coverage(self.points, radius)
+                if predicted >= 0.999:
+                    break
+                self.get_logger().warn(
+                    f'Spacing {self.spacing:.2f} m would leave '
+                    f'{100 * (1 - predicted):.1f}% of the area unsearched - '
+                    f'tightening.'
+                )
+                self.spacing *= 0.85
+
+        self.planned = True
+
+        sweep_deg = math.degrees(best_sweep_angle(self.polygon))
+        self.get_logger().info(
+            f'Search area: {len(self.polygon)}-sided polygon, sweeping along '
+            f'{sweep_deg:.0f} degrees (chosen to minimise turns).'
+        )
+        self.get_logger().info(
+            f'Camera sees {footprint:.1f} m across at '
+            f'{self._camera_altitude():.1f} m above ground. '
+            f'Leg spacing {self.spacing:.1f} m ({source}): '
+            f'{len(self.points) // 2} legs, {len(self.points)} waypoints.'
+        )
+        if predicted >= 0.999:
+            self.get_logger().info(
+                f'Checked before take-off: this path covers '
+                f'{100 * predicted:.1f}% of the search area.'
+            )
+        else:
+            self.get_logger().warn(
+                f'Best achievable with this shape is {100 * predicted:.1f}% '
+                f'coverage - {100 * (1 - predicted):.1f}% will NOT be searched.'
+            )
+        return True
 
     def tick(self):
         """Called every second; sends the next waypoint to Nav2 once it's ready and we're not already flying to one."""
         if self.busy: #goal is already in flight
+            return
+        # Plan on the first tick that has camera data, not in __init__.
+        if not self.planned and not self.plan_sweep():
             return
         if self.index>= len(self.points):
             return
@@ -616,22 +795,20 @@ class SearchNode(Node):
         return hfov, vfov
 
     def _camera_altitude(self):
-        """Height of the CAMERA above the ground, in metres, from TF.
+        """Height of the camera above the ground, in metres.
 
-        Looks up the camera frame rather than base_link, so the camera's
-        mounting offset on the drone is accounted for automatically. Falls
-        back to a parameter only while TF is still starting up.
+        Read from the flight_altitude parameter. It deliberately does NOT come
+        from TF: Ignition's odometry publisher is planar, so /parrot1/odometry
+        reports z = 0.0 however high the drone flies, and the only z in the
+        odom -> camera_link chain is the camera's own 0.2 m mounting offset.
+        Reading that gave a 0.2 m "altitude", a camera footprint smaller than
+        one grid cell, and a coverage map that never marked anything at all.
+
+        A parameter is the right answer rather than a stopgap: Nav2 is a 2D
+        planner and never commands height, so the drone holds its spawn
+        altitude for the whole flight. The figure is constant and known.
         """
-        try:
-            t = self.tf_buffer.lookup_transform(
-                self.map_frame,
-                self.camera_frame,
-                rclpy.time.Time(),
-                timeout=Duration(seconds=0.1),
-            )
-            return abs(t.transform.translation.z)
-        except Exception:
-            return float(self.get_parameter('fallback_altitude').value)
+        return float(self.get_parameter('flight_altitude').value)
 
     def _footprint_radius(self):
         """Radius on the ground the camera can see, in metres.

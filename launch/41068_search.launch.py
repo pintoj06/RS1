@@ -6,9 +6,10 @@
 #
 #   ros2 launch 41068_ignition_bringup 41068_search.launch.py
 #
-# Override the search area on the command line, e.g. a 16 m box:
+# Leg spacing is worked out from the camera, so normally you only give the
+# area. For a 16 m box:
 #   ros2 launch 41068_ignition_bringup 41068_search.launch.py \
-#       min_x:=-8.0 max_x:=8.0 min_y:=-8.0 max_y:=8.0 spacing:=4.0
+#       min_x:=-8.0 max_x:=8.0 min_y:=-8.0 max_y:=8.0
 #
 # Or an arbitrary polygon as a flat [x1,y1,x2,y2,...] list (overrides the
 # min/max rectangle). Note the quoting - the list has to survive the shell:
@@ -61,14 +62,32 @@ def generate_launch_description():
     ))
 
     # --- Sweep spacing ----------------------------------------------------
-    # Distance between the parallel legs of the lawnmower pattern. Smaller =
-    # more overlap and no gaps, but a longer flight. The node logs whether
-    # this is narrow enough for the camera footprint at the current altitude.
+    # Normally leave both of these alone. The node works out how wide a strip of
+    # ground its camera covers (field of view from CameraInfo, height from
+    # flight_altitude) and spaces the legs to suit, then checks the result
+    # covers the whole area before taking off. Fly higher and the legs spread
+    # out on their own.
     ld.add_action(DeclareLaunchArgument(
         'spacing',
+        default_value='0.0',
+        description='Spacing between sweep legs (m). Leave at 0.0 to derive it '
+                    'from the live camera footprint. Set a positive value only '
+                    'to force a fixed spacing for testing.',
+    ))
+    # Height the drone flies at. The camera footprint - and so the leg spacing -
+    # is worked out from this and the field of view, so it MUST match the Parrot's
+    # spawn z in 41068_ignition.launch.py or the coverage maths will be wrong.
+    ld.add_action(DeclareLaunchArgument(
+        'flight_altitude',
+        default_value='10.0',
+        description='Height the drone flies at (m). Must match the Parrot spawn '
+                    'height in 41068_ignition.launch.py.',
+    ))
+    ld.add_action(DeclareLaunchArgument(
+        'overlap',
         default_value='0.8',
-        description='Spacing between sweep legs (m). Must be smaller than the '
-                    'camera ground footprint or coverage will have gaps.',
+        description='Fraction of the camera footprint between legs. 0.8 leaves '
+                    'a 20 percent overlap so position errors cannot open a gap.',
     ))
 
     ld.add_action(Node(
@@ -85,6 +104,8 @@ def generate_launch_description():
             'min_y': LaunchConfiguration('min_y'),
             'max_y': LaunchConfiguration('max_y'),
             'spacing': LaunchConfiguration('spacing'),
+            'overlap': LaunchConfiguration('overlap'),
+            'flight_altitude': LaunchConfiguration('flight_altitude'),
             'polygon': LaunchConfiguration('polygon'),
         }],
         # This package publishes TF inside the robot namespace (/parrot1/tf).
