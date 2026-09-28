@@ -16,7 +16,10 @@ install(
 )
 
 install(
-  PROGRAMS scripts/dynamic_world_demo.py scripts/basic_autonomy_demo.py
+  PROGRAMS
+    scripts/dynamic_world_demo.py
+    scripts/basic_autonomy_demo.py
+    scripts/search_node.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
