@@ -14,8 +14,10 @@ from rclpy.action import ActionClient
 # Duration is used to put a time limit on TF lookups so they can't block.
 from rclpy.duration import Duration
 from rclpy.node import Node
+from rclpy.qos import QoSDurabilityPolicy, QoSProfile
 # ColorRGBA lets us colour each waypoint individually (done vs still to do).
-from std_msgs.msg import ColorRGBA
+# Empty carries no data - it is just a "this happened" signal for the courier.
+from std_msgs.msg import ColorRGBA, Empty
 # tf2_ros answers "where is the drone right now?" by reading the transform tree.
 import tf2_ros
 # Marker = one drawing in RViz. MarkerArray = several sent together.
@@ -50,6 +52,7 @@ class SearchNode(Node):
         self.declare_parameter('min_y', -4.0)
         self.declare_parameter('max_y', 4.0)
         self.declare_parameter('spacing', 0.8)
+        self.declare_parameter('return_to_spawn', True)
 
         robot_name= self.get_parameter('robot_name').value
         # Goals are stamped in the frame Nav2 plans in. That is now the odom
@@ -62,13 +65,28 @@ class SearchNode(Node):
             self.get_parameter('max_x').value,
             self.get_parameter('min_y').value,
             self.get_parameter('max_y').value,
-            self.get_parameter('spacing').value           
+            self.get_parameter('spacing').value
         )
+
+        # (0, 0) in the odom frame is the spawn point (see map_frame comment
+        # above), so "return to spawn" is just one more waypoint tacked onto
+        # the end of the sweep - no separate flight mode needed.
+        self.home_index = None
+        if self.get_parameter('return_to_spawn').value:
+            self.points.append((0.0, 0.0))
+            self.home_index = len(self.points) - 1
 
         self.index = 0
         self.busy= False
 
         self.nav_client= ActionClient(self, NavigateToPose, 'navigate_to_pose')
+
+        # Tells other robots (e.g. the courier drone) that the sweep is done.
+        # Transient-local + depth 1 means a subscriber that starts up late
+        # still gets this message, instead of needing to be listening at the
+        # exact moment it is published.
+        latched_qos = QoSProfile(depth=1, durability=QoSDurabilityPolicy.TRANSIENT_LOCAL)
+        self.sweep_complete_pub = self.create_publisher(Empty, 'search_node/sweep_complete', latched_qos)
 
         self.timer = self.create_timer(1.0, self.tick) # runs once a seocnd
 
@@ -178,10 +196,15 @@ class SearchNode(Node):
         self.next_waypoint()
 
     def next_waypoint(self):
+        completed_index = self.index
         self.index +=1
         self.busy = False
         if self.index >=len(self.points):
-            self.get_logger().info('Sweep complete. ')
+            if self.home_index is not None and completed_index == self.home_index:
+                self.get_logger().info('Sweep complete and returned to spawn.')
+            else:
+                self.get_logger().info('Sweep complete. ')
+            self.sweep_complete_pub.publish(Empty())
 
     # ----------------------------------------------------------------------
     # VISUALISATION METHODS

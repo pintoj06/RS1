@@ -5,9 +5,9 @@
     publish_acceleration: false
     publish_tf: true
     map_frame: map
-    odom_frame: parrot1_odom
-    base_link_frame: parrot1_base_link
-    world_frame: parrot1_odom
+    odom_frame: parrot2_odom
+    base_link_frame: parrot2_base_link
+    world_frame: parrot2_odom
     odom0: odometry
     odom0_config:
     - true
