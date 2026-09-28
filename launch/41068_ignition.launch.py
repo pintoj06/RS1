@@ -392,8 +392,11 @@ def generate_launch_description():
         xacro_parts=['urdf_parrot', 'parrot.urdf.xacro'],
         bridge_config='gazebo_bridge_parrot2.yaml',
         localization_config='robot_localization_parrot2.yaml',
-        x='-2.0',
-        y='0.0',
+        # Same x as parrot1, 2m south in y - see courier_node.py's spawn-offset
+        # parameters, which rely on this exact relationship to translate a
+        # confirmed contact position between the two drones' odom frames.
+        x='2.0',
+        y='-2.0',
         z='10',
         spawn_delay=9.0,
     )

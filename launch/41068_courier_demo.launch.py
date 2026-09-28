@@ -9,9 +9,11 @@ def generate_launch_description():
 
     robot = LaunchConfiguration('robot')
     use_sim_time = LaunchConfiguration('use_sim_time')
-    target_x = LaunchConfiguration('target_x')
-    target_y = LaunchConfiguration('target_y')
-    scout_complete_topic = LaunchConfiguration('scout_complete_topic')
+    confirmed_point_topic = LaunchConfiguration('confirmed_point_topic')
+    scout_spawn_x = LaunchConfiguration('scout_spawn_x')
+    scout_spawn_y = LaunchConfiguration('scout_spawn_y')
+    own_spawn_x = LaunchConfiguration('own_spawn_x')
+    own_spawn_y = LaunchConfiguration('own_spawn_y')
 
     ld.add_action(DeclareLaunchArgument(
         'robot',
@@ -24,25 +26,34 @@ def generate_launch_description():
         description='Flag to enable use_sim_time',
     ))
     ld.add_action(DeclareLaunchArgument(
-        'target_x',
-        default_value='0.0',
-        description='X coordinate of the delivery point, in the courier odom frame.',
+        'confirmed_point_topic',
+        default_value='/parrot1/operator/confirmed_point',
+        description='Absolute topic the ground station publishes a confirmed contact to.',
+    ))
+    # These four must stay in step with the x/y spawn args used for parrot1
+    # and parrot2 in 41068_ignition.launch.py - they are how courier_node.py
+    # converts a confirmed point from the scout's frame into its own.
+    ld.add_action(DeclareLaunchArgument(
+        'scout_spawn_x', default_value='2.0',
+        description="Scout drone's spawn x in 41068_ignition.launch.py.",
     ))
     ld.add_action(DeclareLaunchArgument(
-        'target_y',
-        default_value='-6.0',
-        description='Y coordinate of the delivery point, in the courier odom frame.',
+        'scout_spawn_y', default_value='0.0',
+        description="Scout drone's spawn y in 41068_ignition.launch.py.",
     ))
     ld.add_action(DeclareLaunchArgument(
-        'scout_complete_topic',
-        default_value='/parrot1/search_node/sweep_complete',
-        description='Absolute topic the scout drone publishes to once its sweep is done.',
+        'own_spawn_x', default_value='2.0',
+        description="Courier drone's own spawn x in 41068_ignition.launch.py.",
+    ))
+    ld.add_action(DeclareLaunchArgument(
+        'own_spawn_y', default_value='-2.0',
+        description="Courier drone's own spawn y in 41068_ignition.launch.py.",
     ))
 
     # This launch file intentionally does not start Gazebo, robots, SLAM,
     # Nav2, or RViz. Start the main simulation (with courier:=True so the
-    # parrot2 robot is spawned) and the scout's search_node.py first, then
-    # run this launch file from a separate terminal.
+    # parrot2 robot is spawned), the scout's search_node.py, and the ground
+    # station first, then run this launch file from a separate terminal.
     ld.add_action(Node(
         package='41068_ignition_bringup',
         executable='courier_node.py',
@@ -52,9 +63,11 @@ def generate_launch_description():
         parameters=[{
             'use_sim_time': use_sim_time,
             'robot_name': robot,
-            'target_x': target_x,
-            'target_y': target_y,
-            'scout_complete_topic': scout_complete_topic,
+            'confirmed_point_topic': confirmed_point_topic,
+            'scout_spawn_x': scout_spawn_x,
+            'scout_spawn_y': scout_spawn_y,
+            'own_spawn_x': own_spawn_x,
+            'own_spawn_y': own_spawn_y,
         }],
         remappings=[
             ('/tf', 'tf'),

@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 
 
-"Wait for the scout drone to finish searching, then fly to one delivery point, using NAV2"
+"Wait for the operator to confirm a contact on the ground station, then fly to it, using NAV2"
 
 import rclpy
 from action_msgs.msg import GoalStatus
 # Point is a plain (x, y, z) location. Markers are built out of lists of these.
-from geometry_msgs.msg import Point, PoseStamped
+# PointStamped is what the ground station publishes for a confirmed contact.
+from geometry_msgs.msg import Point, PointStamped, PoseStamped
 from nav2_msgs.action import NavigateToPose
 from rclpy.action import ActionClient
 # Duration is used to put a time limit on TF lookups so they can't block.
@@ -14,8 +15,7 @@ from rclpy.duration import Duration
 from rclpy.node import Node
 from rclpy.qos import QoSDurabilityPolicy, QoSProfile
 # ColorRGBA lets us colour the target marker.
-# Empty carries no data - it is just a "this happened" signal from the scout.
-from std_msgs.msg import ColorRGBA, Empty
+from std_msgs.msg import ColorRGBA
 # tf2_ros answers "where is the drone right now?" by reading the transform tree.
 import tf2_ros
 # Marker = one drawing in RViz. MarkerArray = several sent together.
@@ -28,11 +28,21 @@ class CourierNode(Node):
 
         # Things that can be changed without editing the code
         self.declare_parameter('robot_name', 'parrot2')
-        self.declare_parameter('target_x', 0.0)
-        self.declare_parameter('target_y', -6.0)
-        # Absolute (leading "/") because the scout is a different robot, in a
-        # different namespace, to this node.
-        self.declare_parameter('scout_complete_topic', '/parrot1/search_node/sweep_complete')
+        # Absolute (leading "/") because the ground station runs on the
+        # scout's namespace, a different robot to this node.
+        self.declare_parameter('confirmed_point_topic', '/parrot1/operator/confirmed_point')
+        # The ground station reports a confirmed contact's (x, y) in the
+        # scout's own map frame. This robot has no TF connection to that
+        # frame (separate, non-overlapping TF trees per robot), so the only
+        # way to convert is a fixed offset: both drones' odom frames start at
+        # their own spawn pose in world coordinates (see 41068_ignition.launch.py),
+        # so world = scout_spawn + point_in_scout_frame, then
+        # point_in_my_frame = world - my_spawn. These four parameters must be
+        # kept in step with the spawn x/y used there.
+        self.declare_parameter('scout_spawn_x', 2.0)
+        self.declare_parameter('scout_spawn_y', 0.0)
+        self.declare_parameter('own_spawn_x', 2.0)
+        self.declare_parameter('own_spawn_y', -2.0)
 
         robot_name = self.get_parameter('robot_name').value
         # Goals are stamped in the frame Nav2 plans in. That is now the odom
@@ -40,24 +50,26 @@ class CourierNode(Node):
         # Must stay in step with those, or Nav2 will not understand our goals.
         self.map_frame = f'{robot_name}_odom'  # e.g. "parrot2_odom", NOT "odom"
 
-        self.target = (
-            self.get_parameter('target_x').value,
-            self.get_parameter('target_y').value,
+        self.spawn_offset_x = (
+            self.get_parameter('scout_spawn_x').value - self.get_parameter('own_spawn_x').value
+        )
+        self.spawn_offset_y = (
+            self.get_parameter('scout_spawn_y').value - self.get_parameter('own_spawn_y').value
         )
 
-        self.scout_ready = False  # set True once the scout's signal arrives
-        self.sent = False         # set True once the delivery goal has been sent
+        self.target = None  # (x, y) in this robot's own odom frame, once confirmed
+        self.sent = False   # set True once the delivery goal has been sent
         self.busy = False
 
         self.nav_client = ActionClient(self, NavigateToPose, 'navigate_to_pose')
 
-        # Same latched QoS the scout publishes with, so this still gets the
-        # message even if it starts listening after the scout already sent it.
+        # Same latched QoS the ground station publishes with, so this still
+        # gets the message even if it starts listening after a confirm.
         latched_qos = QoSProfile(depth=1, durability=QoSDurabilityPolicy.TRANSIENT_LOCAL)
-        self.scout_sub = self.create_subscription(
-            Empty,
-            self.get_parameter('scout_complete_topic').value,
-            self.on_scout_complete,
+        self.confirmed_point_sub = self.create_subscription(
+            PointStamped,
+            self.get_parameter('confirmed_point_topic').value,
+            self.on_confirmed_point,
             latched_qos,
         )
 
@@ -107,18 +119,25 @@ class CourierNode(Node):
         self.trail_timer = self.create_timer(0.5, self.record_trail)
         self.target_timer = self.create_timer(1.0, self.publish_target_marker)
 
-    def on_scout_complete(self, _msg):
-        """Called once, when the scout's sweep-complete message arrives."""
-        if not self.scout_ready:
-            self.get_logger().info('Scout has finished searching. Ready to fly to the delivery point.')
-        self.scout_ready = True
+    def on_confirmed_point(self, msg):
+        """Called once, when the operator confirms a contact on the ground station."""
+        # Convert from the scout's map frame into this robot's own odom
+        # frame using the fixed spawn offset (see the parameter comments
+        # in __init__).
+        target_x = msg.point.x + self.spawn_offset_x
+        target_y = msg.point.y + self.spawn_offset_y
+        if self.target is None:
+            self.get_logger().info(
+                f'Contact confirmed. Delivery target: ({target_x:.1f}, {target_y:.1f})'
+            )
+        self.target = (target_x, target_y)
 
     def tick(self):
-        """Called every second; sends the delivery goal once, once the scout is done."""
+        """Called every second; sends the delivery goal once, once a contact is confirmed."""
         if self.sent:  # already sent (or in flight/finished) - nothing more to do
             return
-        if not self.scout_ready:
-            self.get_logger().info('Waiting for the scout drone to finish searching...')
+        if self.target is None:
+            self.get_logger().info('Waiting for the operator to confirm a contact...')
             return
         if self.busy:  # goal is already in flight
             return
@@ -210,6 +229,8 @@ class CourierNode(Node):
 
     def publish_target_marker(self):
         """Draw the single delivery point, coloured by whether it's been sent yet."""
+        if self.target is None:  # nothing confirmed yet - nothing to draw
+            return
         stamp = self.get_clock().now().to_msg()
         markers = MarkerArray()
         x, y = self.target

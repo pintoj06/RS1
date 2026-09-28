@@ -35,6 +35,7 @@ from rclpy.node import Node
 from rclpy.qos import (QoSDurabilityPolicy, QoSHistoryPolicy, QoSProfile,
                        QoSReliabilityPolicy, qos_profile_sensor_data)
 
+from geometry_msgs.msg import PointStamped
 from nav_msgs.msg import OccupancyGrid
 from sensor_msgs.msg import Image
 from std_msgs.msg import Bool, String
@@ -176,6 +177,11 @@ class GroundStationNode(Node):
         self.hold_pub = self.create_publisher(Bool, "search/hold", hold_qos)
         self.holding = False
         self.hold_pub.publish(Bool(data=False))
+
+        # Tells the courier drone where to fly. Transient local so a courier
+        # started after the confirm still gets the last confirmed position.
+        self.confirmed_point_pub = self.create_publisher(
+            PointStamped, "operator/confirmed_point", hold_qos)
         self.create_timer(0.1, self._poll_pose)
 
         self.get_logger().info(f"Ground station up for {self.robot_name}")
@@ -280,6 +286,22 @@ class GroundStationNode(Node):
     def send_decision(self, contact_id: int, decision: str):
         self.decision_pub.publish(String(data=f"{decision}:{contact_id}"))
         self.get_logger().info(f"Operator {decision} contact {contact_id}")
+
+    def publish_confirmed_point(self, x: float, y: float):
+        """Send the courier drone to a confirmed contact's position.
+
+        Stamped in this robot's own map frame (self.map_frame, e.g.
+        "parrot1_map") since that is where the contact's (x, y) were
+        recorded. The courier has no TF connection to this robot's frames -
+        it converts using a fixed spawn-point offset instead (see
+        courier_node.py).
+        """
+        msg = PointStamped()
+        msg.header.frame_id = self.map_frame
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.point.x = x
+        msg.point.y = y
+        self.confirmed_point_pub.publish(msg)
 
 
 # ---------------------------------------------------------------------------
@@ -773,6 +795,7 @@ class MainWindow(QMainWindow):
         c.status = decision
         self.node.send_decision(c.id, decision)
         if decision == "CONFIRMED":
+            self.node.publish_confirmed_point(c.x, c.y)
             self.hold_for_confirmed = True
         else:
             self._no_check_until = time.monotonic() + self.node.dismiss_cooldown_s
