@@ -14,10 +14,10 @@ from rclpy.action import ActionClient
 # Duration is used to put a time limit on TF lookups so they can't block.
 from rclpy.duration import Duration
 from rclpy.node import Node
-from rclpy.qos import QoSDurabilityPolicy, QoSProfile
+from rclpy.qos import QoSDurabilityPolicy, QoSProfile, QoSReliabilityPolicy
 # ColorRGBA lets us colour each waypoint individually (done vs still to do).
 # Empty carries no data - it is just a "this happened" signal for the courier.
-from std_msgs.msg import ColorRGBA, Empty
+from std_msgs.msg import Bool, ColorRGBA, Empty
 # tf2_ros answers "where is the drone right now?" by reading the transform tree.
 import tf2_ros
 # Marker = one drawing in RViz. MarkerArray = several sent together.
@@ -78,6 +78,11 @@ class SearchNode(Node):
 
         self.index = 0
         self.busy= False
+        # Hold = stop sweeping and hover where we are. The ground station sets
+        # it when the thermal camera picks up a person, and clears it once the
+        # operator has ruled on the contact.
+        self.holding = False
+        self.goal_handle = None
 
         self.nav_client= ActionClient(self, NavigateToPose, 'navigate_to_pose')
 
@@ -89,6 +94,13 @@ class SearchNode(Node):
         self.sweep_complete_pub = self.create_publisher(Empty, 'search_node/sweep_complete', latched_qos)
 
         self.timer = self.create_timer(1.0, self.tick) # runs once a seocnd
+
+        # Transient local so we still get the current hold state if the ground
+        # station published it before this node started.
+        hold_qos = QoSProfile(depth=1,
+                              reliability=QoSReliabilityPolicy.RELIABLE,
+                              durability=QoSDurabilityPolicy.TRANSIENT_LOCAL)
+        self.create_subscription(Bool, 'search/hold', self.on_hold, hold_qos)
 
         # ------------------------------------------------------------------
         # VISUALISATION - everything below is only for RViz. It does not
@@ -137,6 +149,8 @@ class SearchNode(Node):
 
     def tick(self):
         """Called every second; sends the next waypoint to Nav2 once it's ready and we're not already flying to one."""
+        if self.holding:
+            return
         if self.busy: #goal is already in flight
             return
         if self.index>= len(self.points):
@@ -183,17 +197,43 @@ class SearchNode(Node):
             self.next_waypoint()
             return
         
+        self.goal_handle = goal_handle
+        if self.holding:
+            # Hold arrived while this goal was still being accepted.
+            goal_handle.cancel_goal_async()
+
         #Stage 3: ask to be told when its finished flying.
         result_future= goal_handle.get_result_async()
         result_future.add_done_callback(self.goal_finished)
 
     def goal_finished(self,future):
         """Stage 3: Nav2 has arrived, failed or given up"""       
+        self.goal_handle = None
+        status = future.result().status
+        if self.holding or status == GoalStatus.STATUS_CANCELED:
+            # Cancelled by a hold. Don't advance, so resuming re-flies to the
+            # same waypoint instead of skipping it.
+            self.busy = False
+            return
         if future.result().status ==GoalStatus.STATUS_SUCCEEDED:
             self.get_logger().info('Arrived. ')
         else:
             self.get_logger().warn('Could not reach that one. Skipping it. ')
         self.next_waypoint()
+
+    def on_hold(self, msg):
+        if msg.data == self.holding:
+            return
+        self.holding = msg.data
+        if self.holding:
+            self.get_logger().warn('HOLD: contact reported, stopping search.')
+            if self.goal_handle is not None:
+                self.goal_handle.cancel_goal_async()
+        else:
+            self.get_logger().info('Hold released, resuming search.')
+            # Don't wait up to a second for the timer; the ground station only
+            # gives the drone a short window to move before it checks again.
+            self.tick()
 
     def next_waypoint(self):
         completed_index = self.index

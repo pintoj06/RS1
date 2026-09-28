@@ -22,6 +22,7 @@ block inside a callback or the window freezes.
 """
 
 import sys
+import time
 from collections import deque
 from dataclasses import dataclass
 from typing import Callable, List, Optional, Tuple
@@ -36,7 +37,7 @@ from rclpy.qos import (QoSDurabilityPolicy, QoSHistoryPolicy, QoSProfile,
 
 from nav_msgs.msg import OccupancyGrid
 from sensor_msgs.msg import Image
-from std_msgs.msg import String
+from std_msgs.msg import Bool, String
 import tf2_ros
 
 from cv_bridge import CvBridge
@@ -104,6 +105,35 @@ class GroundStationNode(Node):
         self.declare_parameter("robot_name", "parrot1")
         self.robot_name = str(self.get_parameter("robot_name").value)
 
+        # 16-bit pixels are temperature / resolution. The <resolution> in
+        # parrot.gazebo.xacro is not reaching the sensor, so it runs at the
+        # Gazebo default of 0.01 K (checked on the live topic: 28800 = 288 K).
+        # The display range is fixed to the sensor's min/max so the colours
+        # mean the same thing on every frame (per-frame min-max would stretch
+        # ambient noise to full scale).
+        self.declare_parameter("thermal_resolution", 0.01)
+        self.declare_parameter("thermal_min_k", 275.0)
+        self.declare_parameter("thermal_max_k", 320.0)
+        self.thermal_resolution = float(self.get_parameter("thermal_resolution").value)
+        self.thermal_min_k = float(self.get_parameter("thermal_min_k").value)
+        self.thermal_max_k = float(self.get_parameter("thermal_max_k").value)
+
+        # Thermal person detection. Scenery sits at ambient (~288 K) and the
+        # person at body heat (310 K), so a plain threshold is enough in sim.
+        # min_pixels is the hot area needed before a contact is raised. From
+        # the ~10 m survey altitude a whole person is roughly 1000 px, so 600
+        # needs most of the body in frame instead of a sliver at the edge.
+        self.declare_parameter("person_min_k", 305.0)
+        self.declare_parameter("person_min_pixels", 600)
+        # After a dismiss, let the drone fly on this long before checking
+        # again, so it can move off the heat source it was holding over.
+        self.declare_parameter("dismiss_cooldown_s", 2.0)
+        self.person_min_k = float(self.get_parameter("person_min_k").value)
+        self.person_min_pixels = int(self.get_parameter("person_min_pixels").value)
+        self.dismiss_cooldown_s = float(self.get_parameter("dismiss_cooldown_s").value)
+        # (peak kelvin, hot pixel count) for the latest frame, None if nothing.
+        self.thermal_hit: Optional[Tuple[float, int]] = None
+
         self.bridge = CvBridge()
         self.rgb_frame: Optional[np.ndarray] = None
         self.thermal_frame: Optional[np.ndarray] = None
@@ -137,6 +167,15 @@ class GroundStationNode(Node):
         self.create_subscription(OccupancyGrid, "map", self._on_map, map_qos)
 
         self.decision_pub = self.create_publisher(String, "operator/decision", 10)
+
+        # Tells search_node to stop and hover. Transient local so a search
+        # node started later still picks up the current state.
+        hold_qos = QoSProfile(depth=1,
+                              reliability=QoSReliabilityPolicy.RELIABLE,
+                              durability=QoSDurabilityPolicy.TRANSIENT_LOCAL)
+        self.hold_pub = self.create_publisher(Bool, "search/hold", hold_qos)
+        self.holding = False
+        self.hold_pub.publish(Bool(data=False))
         self.create_timer(0.1, self._poll_pose)
 
         self.get_logger().info(f"Ground station up for {self.robot_name}")
@@ -148,17 +187,40 @@ class GroundStationNode(Node):
             self.get_logger().warn(f"RGB decode failed: {exc}", once=True)
 
     def _on_thermal(self, msg: Image):
-        """Thermal may arrive mono or colour depending on the xacro. Handle
-        both, and false-colour mono so heat reads instantly rather than as
-        grey mush."""
+        """Thermal may arrive 16-bit, 8-bit or colour depending on the xacro.
+        Handle all three, and false-colour mono so heat reads instantly rather
+        than as grey mush."""
         try:
-            if msg.encoding in ("mono8", "8UC1"):
+            if msg.encoding in ("mono16", "16UC1"):
+                # Gazebo's default (L16). Letting cv_bridge convert to bgr8
+                # scales by 255/65535, which leaves the whole image near black.
+                raw = self.bridge.imgmsg_to_cv2(msg, "passthrough")
+                kelvin = raw.astype(np.float32) * self.thermal_resolution
+                span = self.thermal_max_k - self.thermal_min_k
+                scaled = (kelvin - self.thermal_min_k) * (255.0 / span)
+                mono = np.clip(scaled, 0, 255).astype(np.uint8)
+                frame = cv2.applyColorMap(mono, cv2.COLORMAP_INFERNO)
+                self.thermal_hit = self._detect_person(kelvin, frame)
+                self.thermal_frame = frame
+            elif msg.encoding in ("mono8", "8UC1"):
                 mono = self.bridge.imgmsg_to_cv2(msg, "mono8")
                 self.thermal_frame = cv2.applyColorMap(mono, cv2.COLORMAP_INFERNO)
             else:
                 self.thermal_frame = self.bridge.imgmsg_to_cv2(msg, "bgr8")
         except Exception as exc:
             self.get_logger().warn(f"Thermal decode failed: {exc}", once=True)
+
+    def _detect_person(self, kelvin: np.ndarray,
+                       frame: np.ndarray) -> Optional[Tuple[float, int]]:
+        """Threshold for body heat. Boxes the hot region on the frame so a
+        frozen frame shows what triggered the contact."""
+        hot = kelvin >= self.person_min_k
+        count = int(np.count_nonzero(hot))
+        if count < self.person_min_pixels:
+            return None
+        x, y, w, h = cv2.boundingRect(hot.astype(np.uint8))
+        cv2.rectangle(frame, (x, y), (x + w, y + h), (61, 163, 232), 2)  # AMBER
+        return float(kelvin[hot].max()), count
 
     def _on_map(self, msg: OccupancyGrid):
         w, h = msg.info.width, msg.info.height
@@ -207,6 +269,13 @@ class GroundStationNode(Node):
         if not self.trail or (abs(self.trail[-1][0] - x) > 0.05 or
                               abs(self.trail[-1][1] - y) > 0.05):
             self.trail.append((x, y))
+
+    def set_hold(self, hold: bool):
+        if hold == self.holding:
+            return
+        self.holding = hold
+        self.hold_pub.publish(Bool(data=hold))
+        self.get_logger().info("Search HOLD" if hold else "Search resumed")
 
     def send_decision(self, contact_id: int, decision: str):
         self.decision_pub.publish(String(data=f"{decision}:{contact_id}"))
@@ -491,13 +560,20 @@ class ContactsPage(QWidget):
 # Main window
 # ---------------------------------------------------------------------------
 class MainWindow(QMainWindow):
+    CONTACT_RADIUS = 5.0  # metres; closer than a confirmed contact = same person
+
     def __init__(self, node: GroundStationNode):
         super().__init__()
         self.node = node
         self.contacts: List[Contact] = []
         self._next_id = 1
         self._blink = False
+        self._select_newest = False
+        self._no_check_until = 0.0
         self.page = PAGE_MAP
+        # A confirmed person keeps the drone holding over them until the
+        # operator explicitly resumes the search.
+        self.hold_for_confirmed = False
 
         self.setWindowTitle("AeroAid  ground station")
         self.resize(1440, 900)
@@ -604,6 +680,11 @@ class MainWindow(QMainWindow):
         self.caution.setStyleSheet("border:none;")
         row.addWidget(self.caution)
 
+        self.hold_label = QLabel("")
+        self.hold_label.setFont(QFont("DejaVu Sans Mono", 10, QFont.Bold))
+        self.hold_label.setStyleSheet(f"color:{RED}; border:none; padding-left:24px;")
+        row.addWidget(self.hold_label)
+
         self.link_label = QLabel("LINK ---")
         self.link_label.setFont(QFont("DejaVu Sans Mono", 10))
         self.link_label.setStyleSheet(f"color:{MUTED}; border:none; padding-left:24px;")
@@ -648,6 +729,14 @@ class MainWindow(QMainWindow):
                 ("", lambda: None, False),
                 ("", lambda: None, False),
             ]
+        if self.page == PAGE_CONTACTS:
+            return [
+                ("RESUME", self._resume_search, False),
+                ("", lambda: None, False),
+                ("", lambda: None, False),
+                ("", lambda: None, False),
+                ("", lambda: None, False),
+            ]
         return [("", lambda: None, False)] * 5
 
     def _press_right(self, slot: int):
@@ -683,26 +772,82 @@ class MainWindow(QMainWindow):
             return
         c.status = decision
         self.node.send_decision(c.id, decision)
+        if decision == "CONFIRMED":
+            self.hold_for_confirmed = True
+        else:
+            self._no_check_until = time.monotonic() + self.node.dismiss_cooldown_s
+        self._update_hold()
+
+    def _update_hold(self):
+        """Hold while any contact is unruled, or after a confirm until the
+        operator presses RESUME. A dismiss on its own lets the search go on."""
+        pending = any(c.status == "UNCONFIRMED" for c in self.contacts)
+        self.node.set_hold(pending or self.hold_for_confirmed)
+
+    def _resume_search(self):
+        self.hold_for_confirmed = False
+        self._update_hold()
+
+    def _raise_contact(self, x: float, y: float, rgb_conf: float,
+                       thermal_conf: float):
+        self.contacts.insert(0, Contact(
+            id=self._next_id, x=x, y=y,
+            rgb_confidence=rgb_conf, thermal_confidence=thermal_conf))
+        self._next_id += 1
+        self._select_newest = True
+        self._update_hold()
+
+    def _check_thermal(self):
+        """Turn a thermal hit into a contact and stop the drone.
+
+        The contact goes at the drone's position; the camera looks down from
+        close above, so that is within a few metres. No checks while a
+        contact is waiting for a ruling (the drone is already holding), or for
+        dismiss_cooldown_s after a dismiss. A hit near a confirmed contact is
+        the same person and is ignored, so RESUME doesn't re-trigger on them.
+        """
+        hit = self.node.thermal_hit
+        if hit is None:
+            return
+        if any(c.status == "UNCONFIRMED" for c in self.contacts):
+            return
+        if time.monotonic() < self._no_check_until:
+            return
+        x, y = self.node.drone_xy or (0.0, 0.0)
+        if any(c.status == "CONFIRMED" and
+               np.hypot(c.x - x, c.y - y) < self.CONTACT_RADIUS
+               for c in self.contacts):
+            return
+        peak_k, count = hit
+        self.node.get_logger().warn(
+            f"Thermal contact: {count} px, peak {peak_k:.1f} K")
+        # Keep the triggering frame on the IR page as evidence.
+        self.ir_page.frozen = self.node.thermal_frame
+        self._raise_contact(
+            x, y, rgb_conf=0.0,
+            thermal_conf=min(1.0, count / (4.0 * self.node.person_min_pixels)))
 
     def _simulate_contact(self):
         """Lets you build and test the whole interface before the detector
         exists. Delete once real detections arrive."""
         bx, by = self.node.drone_xy or (0.0, 0.0)
-        self.contacts.insert(0, Contact(
-            id=self._next_id,
-            x=bx + np.random.uniform(-3, 3),
-            y=by + np.random.uniform(-3, 3),
-            rgb_confidence=float(np.random.uniform(0.4, 0.95)),
-            thermal_confidence=float(np.random.uniform(0.3, 0.98)),
-        ))
-        self._next_id += 1
+        self._raise_contact(
+            bx + np.random.uniform(-3, 3),
+            by + np.random.uniform(-3, 3),
+            rgb_conf=float(np.random.uniform(0.4, 0.95)),
+            thermal_conf=float(np.random.uniform(0.3, 0.98)))
 
     def _toggle_blink(self):
         self._blink = not self._blink
 
     def refresh(self):
+        self._check_thermal()
         self.map_page.contacts = self.contacts
         self.contacts_page.refresh(self.contacts)
+        if self._select_newest:
+            # New contact is at row 0; select it so CONFIRM/DISMISS act on it.
+            self.contacts_page.list.setCurrentRow(0)
+            self._select_newest = False
         self.stack.currentWidget().update()
 
         self.page_label.setText(
@@ -715,6 +860,8 @@ class MainWindow(QMainWindow):
                 f"color:{AMBER if self._blink else PANEL}; border:none;")
         else:
             self.caution.setText("")
+
+        self.hold_label.setText("SEARCH HOLD" if self.node.holding else "")
 
         live = self.node.drone_xy is not None
         self.link_label.setText("LINK OK" if live else "LINK ---")
@@ -748,4 +895,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main() 
+    main()

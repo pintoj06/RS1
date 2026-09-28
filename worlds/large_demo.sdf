@@ -17,7 +17,14 @@
     </light>
     <gravity>0 0 -9.81</gravity>
     <magnetic_field>6e-06 2.3e-05 -4.2e-05</magnetic_field>
-    <atmosphere type="adiabatic" />
+    <!-- Ambient temperature for the thermal camera. Any visual without its
+         own Thermal plugin (terrain, rocks, trees, water) renders at this
+         temperature, adjusted by the gradient for height. 288.15 K = 15 C.
+         Must stay inside the camera's min/max_temp (275-320 K). -->
+    <!-- <atmosphere type="adiabatic">
+      <temperature>288.15</temperature>
+      <temperature_gradient>-0.0065</temperature_gradient>
+    </atmosphere> -->
     <physics name="default_physics" type="ignored">
       <max_step_size>0.01</max_step_size>
       <real_time_factor>1</real_time_factor>
@@ -36,39 +43,46 @@
       <heading_deg>0</heading_deg>
       <surface_model>EARTH_WGS84</surface_model>
     </spherical_coordinates>
-    <include>
-      <uri>
-        https://fuel.gazebosim.org/1.0/OpenRobotics/models/Standing%20person
-      </uri>
-      <name>person1</name>
-      <pose> -0.0912 0.9265 0.505 0 0 0 </pose>
-    </include>
-    <!-- Thermal signature for person1, disabled for now: it also shows up as
-         a plain red box in the RGB feed (Ignition has no way to show a
-         visual to the thermal camera only), which was interfering with
-         RGB-based CV data collection. Re-enable once that's done. -->
-    <!--
-    <model name="person1_heat">
-      <pose>-0.0912 0.9265 1.355 0 0 0</pose>
+    <!-- Standing person from Fuel, defined inline, not with <include>, so the
+         Thermal plugin can go on its visual. Ignition ignores the plugin at
+         <include> level, and an included model's visuals can't be reached
+         from here. This gives the mesh itself body heat, so nothing extra
+         shows up in the RGB feed (unlike the old person1_heat box). The mesh
+         still loads from the Fuel URL and uses the local cache. -->
+    <model name="person1">
+      <pose>-0.0912 0.9265 0.505 0 0 0</pose>
       <static>true</static>
       <link name="link">
-        <visual name="visual">
+        <collision name="bottom">
+          <pose>0 -0.1 0.01 0 0 0</pose>
           <geometry>
             <box>
-              <size>0.5 0.3 1.7</size>
+              <size>0.5 0.35 0.02</size>
             </box>
           </geometry>
-          <material>
-            <ambient>1 0 0 1</ambient>
-            <diffuse>1 0 0 1</diffuse>
-          </material>
+        </collision>
+        <collision name="person">
+          <pose>0 0 0.02 0.04 0 0</pose>
+          <geometry>
+            <mesh>
+              <uri>https://fuel.gazebosim.org/1.0/openrobotics/models/standing%20person/3/files/meshes/standing.dae</uri>
+            </mesh>
+          </geometry>
+        </collision>
+        <visual name="visual">
+          <pose>0 0 0.02 0.04 0 0</pose>
+          <geometry>
+            <mesh>
+              <uri>https://fuel.gazebosim.org/1.0/openrobotics/models/standing%20person/3/files/meshes/standing.dae</uri>
+            </mesh>
+          </geometry>
+          <!-- Body surface temperature: 310 K = 37 C. -->
           <plugin filename="ignition-gazebo-thermal-system" name="ignition::gazebo::systems::Thermal">
             <temperature>310.0</temperature>
           </plugin>
         </visual>
       </link>
     </model>
-    -->
     <model name="demo_animal">
       <pose>-4 4 0 0 0 0</pose>
       <static>true</static>
