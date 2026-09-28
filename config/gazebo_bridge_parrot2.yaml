@@ -47,6 +47,15 @@
   gz_type_name: "ignition.msgs.Image"
   direction: GZ_TO_ROS
 
+# Camera: intrinsics (focal length, image size). Carries the real field of
+# view, so anything that needs it can read it from here rather than having the
+# numbers copied out of the xacro by hand.
+- ros_topic_name: "camera/camera_info"
+  gz_topic_name: "/model/parrot2/camera/camera_info"
+  ros_type_name: "sensor_msgs/msg/CameraInfo"
+  gz_type_name: "ignition.msgs.CameraInfo"
+  direction: GZ_TO_ROS
+
 # Camera: depth
 - ros_topic_name: "camera/depth/image"
   gz_topic_name: "/model/parrot2/camera/depth_image"
