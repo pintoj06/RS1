@@ -374,8 +374,21 @@ class SearchNode(Node):
         self.footprint_timer = self.create_timer(10.0, self._log_footprint)
 
     def _log_footprint(self):
-        """Log what the camera can currently see, and the spacing in use."""
+        """Log what the camera can currently see, and the spacing in use.
+
+        While the search is on hold this says so instead. Otherwise the only
+        sign the drone has parked itself is one HOLD line that scrolls away,
+        and this message keeps reporting spacing as though it were still
+        flying - which reads like nothing is wrong.
+        """
         if not self.planned:
+            return
+        if self.holding:
+            self.get_logger().warn(
+                f'STILL ON HOLD at waypoint {self.index + 1}/{len(self.points)} '
+                f'- hovering, waiting for the operator to confirm or dismiss '
+                f'the contact.'
+            )
             return
         self.get_logger().info(
             f'Camera sees {self._footprint_radius() * 2:.1f} m across at '
@@ -598,11 +611,18 @@ class SearchNode(Node):
             return
         self.holding = msg.data
         if self.holding:
-            self.get_logger().warn('HOLD: contact reported, stopping search.')
+            self.get_logger().warn(
+                f'HOLD: contact reported, stopping search at waypoint '
+                f'{self.index + 1}/{len(self.points)}. Hovering until the '
+                f'operator rules on it.'
+            )
             if self.goal_handle is not None:
                 self.goal_handle.cancel_goal_async()
         else:
-            self.get_logger().info('Hold released, resuming search.')
+            self.get_logger().info(
+                f'Hold released, resuming search - re-flying waypoint '
+                f'{self.index + 1}/{len(self.points)}.'
+            )
             # Don't wait up to a second for the timer; the ground station only
             # gives the drone a short window to move before it checks again.
             self.tick()
