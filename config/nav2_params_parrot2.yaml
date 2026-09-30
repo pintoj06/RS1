@@ -6,12 +6,12 @@ amcl:
     alpha3: 0.2
     alpha4: 0.2
     alpha5: 0.2
-    base_frame_id: parrot1_base_link
+    base_frame_id: parrot2_base_link
     beam_skip_distance: 0.5
     beam_skip_error_threshold: 0.9
     beam_skip_threshold: 0.3
     do_beamskip: false
-    global_frame_id: parrot1_map
+    global_frame_id: parrot2_map
     lambda_short: 0.1
     laser_likelihood_max_dist: 2.0
     laser_max_range: 100.0
@@ -20,7 +20,7 @@ amcl:
     max_beams: 60
     max_particles: 2000
     min_particles: 500
-    odom_frame_id: parrot1_odom
+    odom_frame_id: parrot2_odom
     pf_err: 0.05
     pf_z: 0.99
     recovery_alpha_fast: 0.0
@@ -43,8 +43,8 @@ bt_navigator:
     use_sim_time: true
     # Must match the global_costmap's global_frame, and the frame_id that
     # search_node.py stamps its goals with.
-    global_frame: parrot1_odom
-    robot_base_frame: parrot1_base_link
+    global_frame: parrot2_odom
+    robot_base_frame: parrot2_base_link
     odom_topic: odom
     bt_loop_duration: 10
     default_server_timeout: 20
@@ -176,8 +176,8 @@ local_costmap:
     ros__parameters:
       update_frequency: 5.0
       publish_frequency: 5.0
-      global_frame: parrot1_odom
-      robot_base_frame: parrot1_base_link
+      global_frame: parrot2_odom
+      robot_base_frame: parrot2_base_link
       use_sim_time: true
       rolling_window: true
       width: 10
@@ -217,8 +217,8 @@ global_costmap:
       # Plan in the odom frame instead of the SLAM map frame. Above the tree
       # canopy the 2D lidar gets no returns, so SLAM cannot build a map and
       # the map frame carries no useful correction.
-      global_frame: parrot1_odom
-      robot_base_frame: parrot1_base_link
+      global_frame: parrot2_odom
+      robot_base_frame: parrot2_base_link
       use_sim_time: true
       # A costmap that travels with the drone rather than being sized from a
       # stored map. This is Nav2's standard outdoor/GPS configuration and it
@@ -313,8 +313,8 @@ behavior_server:
       plugin: nav2_behaviors/Wait
     assisted_teleop:
       plugin: nav2_behaviors/AssistedTeleop
-    global_frame: parrot1_odom
-    robot_base_frame: parrot1_base_link
+    global_frame: parrot2_odom
+    robot_base_frame: parrot2_base_link
     transform_tolerance: 0.1
     use_sim_time: true
     simulate_ahead_time: 2.0

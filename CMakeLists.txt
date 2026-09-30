@@ -22,6 +22,7 @@ install(
     scripts/basic_autonomy_demo.py
     scripts/circle_dataset_capture.py
     scripts/search_node.py
+    scripts/courier_node.py
     UI/ground_station.py
   DESTINATION lib/${PROJECT_NAME}
 )

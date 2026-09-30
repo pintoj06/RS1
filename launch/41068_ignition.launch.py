@@ -1,3 +1,5 @@
+import os
+
 from launch import LaunchDescription
 from launch.actions import (
     DeclareLaunchArgument,
@@ -269,6 +271,13 @@ def generate_launch_description():
     )
     ld.add_action(parrot_launch_arg)
 
+    courier_launch_arg = DeclareLaunchArgument(
+        'courier',
+        default_value='False',
+        description='Launch a second Parrot drone (the courier) in namespace /parrot2',
+    )
+    ld.add_action(courier_launch_arg)
+
     world_launch_arg = DeclareLaunchArgument(
         'world',
         default_value='simple_trees',
@@ -292,6 +301,14 @@ def generate_launch_description():
         name='GZ_SIM_SERVER_CONFIG_PATH',
         value=server_config_file,
     ))
+    # Make world-local models (e.g. model://blue_mountains, used by large_demo)
+    # resolvable without requiring each user to export a resource path manually.
+    models_path = PathJoinSubstitution([pkg_path, 'models'])
+    for resource_path_var in ('IGN_GAZEBO_RESOURCE_PATH', 'GZ_SIM_RESOURCE_PATH'):
+        ld.add_action(SetEnvironmentVariable(
+            name=resource_path_var,
+            value=[models_path, os.pathsep, os.environ.get(resource_path_var, '')],
+        ))
 
     # Start Gazebo once.
     ld.add_action(IncludeLaunchDescription(
@@ -362,6 +379,29 @@ def generate_launch_description():
         spawn_delay=6.0,
     )
 
+    add_robot(
+        ld,
+        pkg_path=pkg_path,
+        config_path=config_path,
+        use_sim_time=use_sim_time,
+        enabled_arg='courier',
+        namespace='parrot2',
+        frame_prefix='parrot2_',
+        gz_model_name='parrot2',
+        xacro_parts=['urdf_parrot', 'parrot.urdf.xacro'],
+        bridge_config='gazebo_bridge_parrot2.yaml',
+        localization_config='robot_localization_parrot2.yaml',
+        # Same x as parrot1, 2m south in y - see courier_node.py's spawn-offset
+        # parameters, which rely on this exact relationship to translate a
+        # confirmed contact position between the two drones' odom frames.
+        x='2.0',
+        y='-2.0',
+        # 1m below the scout. The drone has gravity off and Nav2 only drives
+        # it in x/y, so it holds this spawn height for the whole flight.
+        z='8',
+        spawn_delay=9.0,
+    )
+
     add_navigation_instance(
         ld,
         pkg_path=pkg_path,
@@ -380,6 +420,15 @@ def generate_launch_description():
         start_delay=10.0,
     )
 
+    add_navigation_instance(
+        ld,
+        pkg_path=pkg_path,
+        use_sim_time=use_sim_time,
+        robot_arg='courier',
+        robot_namespace='parrot2',
+        start_delay=26.0,
+    )
+
     add_rviz_instance(
         ld,
         config_path=config_path,
@@ -387,7 +436,7 @@ def generate_launch_description():
         robot_arg='husky',
         robot_namespace='husky1',
         rviz_config='41068_husky1.rviz',
-        start_delay=11.0,
+        start_delay=22.0,
     )
 
     add_rviz_instance(
@@ -397,7 +446,17 @@ def generate_launch_description():
         robot_arg='parrot',
         robot_namespace='parrot1',
         rviz_config='41068_parrot1.rviz',
-        start_delay=13.0,
+        start_delay=26.0,
+    )
+
+    add_rviz_instance(
+        ld,
+        config_path=config_path,
+        use_sim_time=use_sim_time,
+        robot_arg='courier',
+        robot_namespace='parrot2',
+        rviz_config='41068_parrot2.rviz',
+        start_delay=32.0,
     )
 
     return ld
