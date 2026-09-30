@@ -27,7 +27,7 @@
     ]
   },
   "world_adjustments": {
-    "demo_animal": "Z raised from 0 to 3.82 m to sit on the moved outcrop; XY unchanged"
+    "demo_animal": "Replaced placeholder with kangaroo; placed beside person1 at 1.1 0.9 0.003 (wombat1 on the other side at -1.2 0.9)."
   },
   "river": "Upward normals, terrain clearance and explicit SDF blue-green ambient/diffuse material",
   "comparison_previous": {
@@ -36,5 +36,53 @@
   },
   "tree_height_multiplier": 1.5,
   "foliage_original_proportions": true,
-  "tree_bases_preserved": true
+  "tree_bases_preserved": true,
+  "animal_models": {
+    "kangaroo": {
+      "source_blend": "/Users/harrymentis/Documents/UNI STUFF/Y3S2/RS1/BLENDER/kangaroo.blend",
+      "source_sha256": "9bc9340900e6cbc6583e659dd33c9d212e90350768d82b6fd1c291d16eacfdc3",
+      "dimensions_m": [
+        0.5736604928970337,
+        1.7759762108325958,
+        1.600000023841858
+      ],
+      "visual_triangles": 3116,
+      "collision_boxes": 8
+    },
+    "wombat": {
+      "source_blend": "/Users/harrymentis/Documents/UNI STUFF/Y3S2/RS1/BLENDER/wombat.blend",
+      "source_sha256": "e555dd8848146c325bf5fb6cef4931c68899f4ba8ac0dc9bd195a62e2992a9d2",
+      "dimensions_m": [
+        0.5030539631843567,
+        1.050000011920929,
+        0.5005553960800171
+      ],
+      "visual_triangles": 5904,
+      "collision_boxes": 6
+    }
+  },
+  "animal_placements": {
+    "demo_animal": {
+      "model": "kangaroo",
+      "pose": [
+        1.1,
+        0.9,
+        0.003,
+        0,
+        0,
+        0
+      ]
+    },
+    "wombat1": {
+      "model": "wombat",
+      "pose": [
+        -1.2,
+        0.9,
+        0.003,
+        0,
+        0,
+        0
+      ]
+    }
+  }
 }

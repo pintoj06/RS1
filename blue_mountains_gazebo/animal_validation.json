@@ -1,0 +1,24 @@
+{
+  "kangaroo": {
+    "triangles": 3116,
+    "dimensions_m": [
+      0.5736604,
+      1.7759766,
+      1.6
+    ],
+    "collision_boxes": 8,
+    "materials": 6
+  },
+  "wombat": {
+    "triangles": 5904,
+    "dimensions_m": [
+      0.503054,
+      1.0499999999999998,
+      0.5005554
+    ],
+    "collision_boxes": 6,
+    "materials": 7
+  },
+  "checks_passed": true,
+  "gazebo_runtime_tested": false
+}

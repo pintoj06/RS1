@@ -1,0 +1,92 @@
+<?xml version='1.0' encoding='utf-8'?>
+<sdf version="1.8">
+  <model name="kangaroo">
+    <static>false</static>
+    <link name="body">
+      <inertial>
+        <pose>0 0 0.7 0 0 0</pose>
+        <mass>40</mass>
+        <inertia>
+          <ixx>8.67</ixx>
+          <iyy>7.07</iyy>
+          <izz>2.67</izz>
+          <ixy>0</ixy>
+          <ixz>0</ixz>
+          <iyz>0</iyz>
+        </inertia>
+      </inertial>
+      <visual name="animal_visual">
+        <geometry>
+          <mesh>
+            <uri>model://kangaroo/meshes/kangaroo.dae</uri>
+            <scale>1 1 1</scale>
+          </mesh>
+        </geometry>
+      </visual>
+      <collision name="torso">
+        <pose>0 0 0.74 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.37 0.35 0.7</size>
+          </box>
+        </geometry>
+      </collision>
+      <collision name="head">
+        <pose>0 0.255 1.28 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.18 0.34 0.18</size>
+          </box>
+        </geometry>
+      </collision>
+      <collision name="tail_base">
+        <pose>0 -0.39 0.25 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.2 0.48 0.28</size>
+          </box>
+        </geometry>
+      </collision>
+      <collision name="tail_tip">
+        <pose>0.02 -0.91 0.065 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.08 0.68 0.12</size>
+          </box>
+        </geometry>
+      </collision>
+      <collision name="leg_-1">
+        <pose>-0.164 0 0.3 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.21 0.3 0.55</size>
+          </box>
+        </geometry>
+      </collision>
+      <collision name="foot_-1">
+        <pose>-0.164 0.12 0.04 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.1 0.4 0.08</size>
+          </box>
+        </geometry>
+      </collision>
+      <collision name="leg_1">
+        <pose>0.164 0 0.3 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.21 0.3 0.55</size>
+          </box>
+        </geometry>
+      </collision>
+      <collision name="foot_1">
+        <pose>0.164 0.12 0.04 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.1 0.4 0.08</size>
+          </box>
+        </geometry>
+      </collision>
+    </link>
+  </model>
+</sdf>

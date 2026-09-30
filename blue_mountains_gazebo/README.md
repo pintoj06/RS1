@@ -1,3 +1,5 @@
+> **Animal update:** see [ANIMALS.md](ANIMALS.md) for the new kangaroo and wombat, placement changes, and launch checks. This supersedes the original demo-animal placement notes below.
+
 # Blue Mountains — trimmed Three Sisters map
 
 Updated environment package for **Gazebo Fortress 6.x**, using SDF 1.8 and COLLADA meshes. Ready to commit to GitHub. Replace the old package folder in full so obsolete meshes are removed.

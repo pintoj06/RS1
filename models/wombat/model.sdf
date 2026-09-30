@@ -1,0 +1,76 @@
+<?xml version='1.0' encoding='utf-8'?>
+<sdf version="1.8">
+  <model name="wombat">
+    <static>false</static>
+    <link name="body">
+      <inertial>
+        <pose>0 0 0.25 0 0 0</pose>
+        <mass>30</mass>
+        <inertia>
+          <ixx>3.0</ixx>
+          <iyy>1.06</iyy>
+          <izz>3.05</izz>
+          <ixy>0</ixy>
+          <ixz>0</ixz>
+          <iyz>0</iyz>
+        </inertia>
+      </inertial>
+      <visual name="animal_visual">
+        <geometry>
+          <mesh>
+            <uri>model://wombat/meshes/wombat.dae</uri>
+            <scale>1 1 1</scale>
+          </mesh>
+        </geometry>
+      </visual>
+      <collision name="body">
+        <pose>0 -0.1 0.29 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.47 0.74 0.41</size>
+          </box>
+        </geometry>
+      </collision>
+      <collision name="head">
+        <pose>0 0.36 0.255 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.37 0.36 0.3</size>
+          </box>
+        </geometry>
+      </collision>
+      <collision name="paw_-1_-0.335">
+        <pose>-0.181 -0.31 0.09 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.16 0.23 0.18</size>
+          </box>
+        </geometry>
+      </collision>
+      <collision name="paw_-1_0.238">
+        <pose>-0.181 0.263 0.09 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.16 0.23 0.18</size>
+          </box>
+        </geometry>
+      </collision>
+      <collision name="paw_1_-0.335">
+        <pose>0.181 -0.31 0.09 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.16 0.23 0.18</size>
+          </box>
+        </geometry>
+      </collision>
+      <collision name="paw_1_0.238">
+        <pose>0.181 0.263 0.09 0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.16 0.23 0.18</size>
+          </box>
+        </geometry>
+      </collision>
+    </link>
+  </model>
+</sdf>

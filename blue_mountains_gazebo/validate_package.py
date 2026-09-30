@@ -44,7 +44,8 @@ world=E.parse(out/'worlds/large_demo.sdf').getroot().find('world')
 assert world.get('name')=='large_demo'
 for name in manifest['preserved_entities']:
     assert any(n.get('name')==name or n.findtext('name')==name for n in world)
-assert world.find("model[@name='demo_animal']/pose").text.split()[:3]==['-4','4','3.82']
+assert world.find("include[name='demo_animal']/uri").text == 'model://kangaroo'
+assert world.find("include[name='wombat1']/uri").text == 'model://wombat'
 water=next((model/'meshes').glob('*winding_river_water.dae'))
 r=E.parse(water).getroot()
 normals=list(map(float,r.find(".//c:source[@id='normals']/c:float_array",ns).text.split()))
