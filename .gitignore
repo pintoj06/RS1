@@ -18,3 +18,7 @@ __pycache__/
 # resolve on another machine. Ignore it rather than committing paths
 # that only work on this computer.
 .vscode/
+
+# Captured YOLO training images - generated output, not source; large
+# binary files bloat git history rather than diffing/compressing cleanly.
+YoloTraining/

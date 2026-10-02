@@ -139,6 +139,17 @@ class GroundStationNode(Node):
         self.rgb_frame: Optional[np.ndarray] = None
         self.thermal_frame: Optional[np.ndarray] = None
 
+        # AI (YOLO) detections overlay from yolo_person_detector.py, boxes
+        # already drawn on by that node. display_frame is what the VIS page
+        # and map PIP actually show: the AI overlay while that node is alive
+        # and publishing, falling back to the plain RGB feed otherwise (e.g.
+        # the detector node isn't running) so the camera view never just
+        # goes blank because of a node that's merely optional.
+        self.ai_frame: Optional[np.ndarray] = None
+        self.display_frame: Optional[np.ndarray] = None
+        self._ai_frame_time = 0.0
+        self._ai_stale_after_s = 2.0
+
         self.map_image: Optional[np.ndarray] = None
         self.map_resolution = 0.0
         self.map_origin = (0.0, 0.0)
@@ -165,6 +176,11 @@ class GroundStationNode(Node):
                                  self._on_rgb, qos_profile_sensor_data)
         self.create_subscription(Image, "camera/thermal",
                                  self._on_thermal, qos_profile_sensor_data)
+        # Published by yolo_person_detector.py (scripts/yolo_person_detector.py) -
+        # optional node, not started by this one. Topic name has to match its
+        # 'annotated_topic' parameter (default below is that default).
+        self.create_subscription(Image, "camera/person_detections_image",
+                                 self._on_ai, qos_profile_sensor_data)
         self.create_subscription(OccupancyGrid, "map", self._on_map, map_qos)
 
         self.decision_pub = self.create_publisher(String, "operator/decision", 10)
@@ -189,8 +205,23 @@ class GroundStationNode(Node):
     def _on_rgb(self, msg: Image):
         try:
             self.rgb_frame = self.bridge.imgmsg_to_cv2(msg, "bgr8")
+            # Reclaim the display feed from a dead/never-started AI node.
+            # Runs on every RGB frame (always arriving, detector or not),
+            # so it's the natural heartbeat to check AI staleness against -
+            # no separate timer needed.
+            ai_fresh = (time.monotonic() - self._ai_frame_time) < self._ai_stale_after_s
+            if not ai_fresh:
+                self.display_frame = self.rgb_frame
         except Exception as exc:
             self.get_logger().warn(f"RGB decode failed: {exc}", once=True)
+
+    def _on_ai(self, msg: Image):
+        try:
+            self.ai_frame = self.bridge.imgmsg_to_cv2(msg, "bgr8")
+            self._ai_frame_time = time.monotonic()
+            self.display_frame = self.ai_frame
+        except Exception as exc:
+            self.get_logger().warn(f"AI detections decode failed: {exc}", once=True)
 
     def _on_thermal(self, msg: Image):
         """Thermal may arrive 16-bit, 8-bit or colour depending on the xacro.
@@ -372,11 +403,13 @@ class MapPage(QWidget):
     which is why it is the default.
     """
 
+    # "display" rather than "rgb" - see GroundStationNode.display_frame: the
+    # AI (YOLO) overlay when that node is alive, plain RGB otherwise.
     PIP_MODES = [
         ("OFF",  []),
         ("IR",   ["thermal"]),
-        ("VIS",  ["rgb"]),
-        ("BOTH", ["thermal", "rgb"]),
+        ("VIS",  ["display"]),
+        ("BOTH", ["thermal", "display"]),
     ]
 
     def __init__(self, node: GroundStationNode):
@@ -492,7 +525,7 @@ class VideoPage(QWidget):
     def __init__(self, node: GroundStationNode, source: str, empty_text: str):
         super().__init__()
         self.node = node
-        self.source = source            # "rgb" or "thermal"
+        self.source = source            # "display" (RGB or AI overlay), "thermal"
         self.empty_text = empty_text
         self.frozen: Optional[np.ndarray] = None
         self.setStyleSheet(f"background:{BASE};")
@@ -603,7 +636,10 @@ class MainWindow(QMainWindow):
                            f"QLabel {{ color:{TEXT}; }}")
 
         self.map_page = MapPage(node)
-        self.vis_page = VideoPage(node, "rgb", "No camera feed")
+        # "display": AI (YOLO) detection overlay while yolo_person_detector.py
+        # is alive and publishing, falling back to plain RGB otherwise - see
+        # GroundStationNode.display_frame.
+        self.vis_page = VideoPage(node, "display", "No camera feed")
         self.ir_page = VideoPage(node, "thermal", "No thermal feed")
         self.contacts_page = ContactsPage()
 

@@ -13,6 +13,7 @@ def generate_launch_description():
     slam = LaunchConfiguration('slam')
     nav2 = LaunchConfiguration('nav2')
     world = LaunchConfiguration('world')
+    headless = LaunchConfiguration('headless')
 
     ld.add_action(DeclareLaunchArgument(
         'use_sim_time',
@@ -40,6 +41,11 @@ def generate_launch_description():
         description='Which world to load',
         choices=['simple_trees', 'large_demo'],
     ))
+    ld.add_action(DeclareLaunchArgument(
+        'headless',
+        default_value='False',
+        description='Run Gazebo without its GUI client (server only, no rendering window)',
+    ))
 
     ld.add_action(IncludeLaunchDescription(
         PythonLaunchDescriptionSource(PathJoinSubstitution([
@@ -53,6 +59,7 @@ def generate_launch_description():
             'slam': slam,
             'nav2': nav2,
             'world': world,
+            'headless': headless,
             'husky': 'False',
             'parrot': 'True',
         }.items(),

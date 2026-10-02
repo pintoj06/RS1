@@ -11,7 +11,7 @@ find_package(ament_cmake REQUIRED)
 find_package(ros_ign_interfaces REQUIRED)
 
 install(
-  DIRECTORY config launch models urdf_husky worlds urdf_parrot
+  DIRECTORY config launch models urdf_husky worlds urdf_parrot weights
   DESTINATION share/${PROJECT_NAME}
 )
 
@@ -21,6 +21,9 @@ install(
     scripts/dynamic_world_demo.py
     scripts/basic_autonomy_demo.py
     scripts/circle_dataset_capture.py
+    scripts/multi_location_dataset_capture.py
+    scripts/multi_entity_dataset_capture.py
+    scripts/yolo_person_detector.py
     scripts/search_node.py
     scripts/courier_node.py
     UI/ground_station.py

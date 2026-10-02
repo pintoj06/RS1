@@ -286,6 +286,13 @@ def generate_launch_description():
     )
     ld.add_action(world_launch_arg)
 
+    headless_launch_arg = DeclareLaunchArgument(
+        'headless',
+        default_value='False',
+        description='Run Gazebo without its GUI client (server only, no rendering window)',
+    )
+    ld.add_action(headless_launch_arg)
+
     # Load common Gazebo server systems from a shared config file. This keeps
     # required systems such as Sensors out of individual robot and world files,
     # so custom student worlds do not need to copy plugin blocks.
@@ -310,6 +317,12 @@ def generate_launch_description():
             value=[models_path, os.pathsep, os.environ.get(resource_path_var, '')],
         ))
 
+    # -s runs the server only (no gzclient GUI window) for headless operation,
+    # e.g. on VMs without a GPU or when driving the sim without a desktop.
+    headless_flag = PythonExpression(
+        ["' -s' if '", LaunchConfiguration('headless'), "'.lower() in ", _TRUE_STRINGS, " else ''"]
+    )
+
     # Start Gazebo once.
     ld.add_action(IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
@@ -327,6 +340,7 @@ def generate_launch_description():
                     [LaunchConfiguration('world'), '.sdf'],
                 ]),
                 ' -r',
+                headless_flag,
             ]
         }.items(),
     ))

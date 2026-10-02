@@ -174,7 +174,13 @@
     <turnGravityOff>true</turnGravityOff>
     <sensor name="rgbd_camera" type="rgbd_camera">
       <camera>
-        <horizontal_fov>1.0472</horizontal_fov>
+        <!-- Widened from 1.0472 (60 deg) to 1.4 (80.2 deg): a wider lens
+             means a bigger ground footprint at any given altitude, so the
+             orbit_radius=2.5 off-centre framing calibrated against the old,
+             narrower FOV (see circle_dataset_capture.py's "Off-center
+             framing note") stays safely in frame here too - if anything
+             with more margin, not less. -->
+        <horizontal_fov>1.4</horizontal_fov>
         <image>
           <width>720</width>
           <height>480</height>
