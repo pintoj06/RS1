@@ -183,15 +183,15 @@ local_costmap:
       width: 10
       height: 10
       resolution: 0.05
-      # Large courier: body is 0.50 x 0.57 m, plus ~5 cm margin each side.
-      footprint: '[ [0.30, 0.33], [0.30, -0.33], [-0.30, -0.33], [-0.30, 0.33] ]'
+      # Large courier (3x Parrot): body is 1.0 x 1.14 m, plus ~5 cm margin each side.
+      footprint: '[ [0.55, 0.62], [0.55, -0.62], [-0.55, -0.62], [-0.55, 0.62] ]'
       plugins:
       - obstacle_layer
       - inflation_layer
       inflation_layer:
         plugin: nav2_costmap_2d::InflationLayer
         cost_scaling_factor: 3.0
-        inflation_radius: 0.8  # large courier (was 0.6)
+        inflation_radius: 1.1  # large courier (was 0.6); > 0.83 m circumscribed radius
       obstacle_layer:
         plugin: nav2_costmap_2d::ObstacleLayer
         enabled: true
@@ -227,8 +227,8 @@ global_costmap:
       rolling_window: true
       width: 50
       height: 50
-      # Large courier: body is 0.50 x 0.57 m, plus ~5 cm margin each side.
-      footprint: '[ [0.30, 0.33], [0.30, -0.33], [-0.30, -0.33], [-0.30, 0.33] ]'
+      # Large courier (3x Parrot): body is 1.0 x 1.14 m, plus ~5 cm margin each side.
+      footprint: '[ [0.55, 0.62], [0.55, -0.62], [-0.55, -0.62], [-0.55, 0.62] ]'
       resolution: 0.1
       # Treat never-observed cells as free. At survey altitude the lidar sees
       # nothing, so everything is unobserved; leaving this true stops the
@@ -260,7 +260,7 @@ global_costmap:
       inflation_layer:
         plugin: nav2_costmap_2d::InflationLayer
         cost_scaling_factor: 3.0
-        inflation_radius: 0.8  # large courier (was 0.6)
+        inflation_radius: 1.1  # large courier (was 0.6); > 0.83 m circumscribed radius
       always_send_full_costmap: true
 map_server:
   ros__parameters:
