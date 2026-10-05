@@ -323,9 +323,8 @@ class GroundStationNode(Node):
 
         Stamped in this robot's own map frame (self.map_frame, e.g.
         "parrot1_map") since that is where the contact's (x, y) were
-        recorded. The courier has no TF connection to this robot's frames -
-        it converts using a fixed spawn-point offset instead (see
-        courier_node.py).
+        recorded. The courier reads this robot's TF to convert the point
+        into its own frame (see courier_node.py).
         """
         msg = PointStamped()
         msg.header.frame_id = self.map_frame

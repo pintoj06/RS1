@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 
 
-"Wait for the operator to confirm a contact on the ground station, then fly to a fixed delivery point above the person, using NAV2"
+"Wait for the operator to confirm a contact on the ground station, then fly to it, using NAV2"
+
+import math
 
 import rclpy
 from action_msgs.msg import GoalStatus
@@ -16,6 +18,8 @@ from rclpy.node import Node
 from rclpy.qos import QoSDurabilityPolicy, QoSProfile
 # ColorRGBA lets us colour the target marker.
 from std_msgs.msg import ColorRGBA
+# TFMessage is what /<robot>/tf carries; used to read the scout's TF tree.
+from tf2_msgs.msg import TFMessage
 # tf2_ros answers "where is the drone right now?" by reading the transform tree.
 import tf2_ros
 # Marker = one drawing in RViz. MarkerArray = several sent together.
@@ -31,28 +35,40 @@ class CourierNode(Node):
         # Absolute (leading "/") because the ground station runs on the
         # scout's namespace, a different robot to this node.
         self.declare_parameter('confirmed_point_topic', '/parrot1/operator/confirmed_point')
-        # Fixed delivery point in Gazebo world coordinates: directly above
-        # person1 in worlds/large_demo.sdf. Keep in step with that pose.
+        # The scout's namespace. Its TF tree (/<scout_name>/tf) is read to
+        # move a confirmed contact out of the scout's SLAM map frame.
+        self.declare_parameter('scout_name', 'parrot1')
+        # True: fly to the contact position the scout reported.
+        # False: ignore it and fly to the fixed target_world_x/y below.
+        self.declare_parameter('use_contact_position', True)
+        # Fixed delivery point in Gazebo world coordinates, used only when
+        # use_contact_position is False: directly above person1 in
+        # worlds/large_demo.sdf. Keep in step with that pose.
         self.declare_parameter('target_world_x', -6.36)
         self.declare_parameter('target_world_y', -3.07)
-        # This robot's odom frame starts at its spawn pose in world
-        # coordinates (see 41068_ignition.launch.py), so
-        # point_in_my_frame = world - my_spawn. Keep these in step with the
-        # spawn x/y used there.
-        self.declare_parameter('own_spawn_x', 2.0)
-        self.declare_parameter('own_spawn_y', -2.0)
 
         robot_name = self.get_parameter('robot_name').value
+        scout_name = self.get_parameter('scout_name').value
+        self.use_contact_position = self.get_parameter('use_contact_position').value
         # Goals are stamped in the frame Nav2 plans in. That is now the odom
         # frame, not the SLAM map frame - see global_frame in the nav2 params.
         # Must stay in step with those, or Nav2 will not understand our goals.
         self.map_frame = f'{robot_name}_odom'  # e.g. "parrot2_odom", NOT "odom"
+        self.scout_odom_frame = f'{scout_name}_odom'
 
-        # The delivery point in this robot's own odom frame.
+        # Every drone's odom frame is the Gazebo world frame: the odometry
+        # plugin reports world pose, so at spawn parrot1 reads (2, 0) and
+        # parrot2 reads (2, -2) - not (0, 0). A world point, or a point in
+        # the scout's odom frame, is therefore already in this robot's odom
+        # frame with no spawn offset.
         self.delivery_point = (
-            self.get_parameter('target_world_x').value - self.get_parameter('own_spawn_x').value,
-            self.get_parameter('target_world_y').value - self.get_parameter('own_spawn_y').value,
+            self.get_parameter('target_world_x').value,
+            self.get_parameter('target_world_y').value,
         )
+
+        # The latest confirmed contact, waiting to be converted into
+        # this robot's frame (needs the scout's TF, which may lag).
+        self.pending_contact = None
 
         self.target = None  # (x, y) in this robot's own odom frame, once confirmed
         self.sent = False   # set True once the delivery goal has been sent
@@ -87,6 +103,18 @@ class CourierNode(Node):
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
 
+        # A second buffer for the scout's TF tree. Each robot publishes TF on
+        # its own /<robot>/tf topic, and the listener above is remapped to
+        # this robot's, so the scout's topics are subscribed to directly.
+        self.scout_tf_buffer = tf2_ros.Buffer()
+        self.create_subscription(
+            TFMessage, f'/{scout_name}/tf',
+            lambda msg: self.store_scout_tf(msg, static=False), 100)
+        self.create_subscription(
+            TFMessage, f'/{scout_name}/tf_static',
+            lambda msg: self.store_scout_tf(msg, static=True),
+            QoSProfile(depth=100, durability=QoSDurabilityPolicy.TRANSIENT_LOCAL))
+
         # Publisher for the blue breadcrumb trail of where the drone has been.
         self.trail_pub = self.create_publisher(Marker, 'courier_trail', 10)
 
@@ -116,24 +144,74 @@ class CourierNode(Node):
         self.trail_timer = self.create_timer(0.5, self.record_trail)
         self.target_timer = self.create_timer(1.0, self.publish_target_marker)
 
+    def store_scout_tf(self, msg, static):
+        for t in msg.transforms:
+            if static:
+                self.scout_tf_buffer.set_transform_static(t, 'scout_tf')
+            else:
+                self.scout_tf_buffer.set_transform(t, 'scout_tf')
+
     def on_confirmed_point(self, msg):
         """Called when the operator confirms a contact on the ground station.
 
-        The confirm is only the go signal; the contact's own position is not
-        used. The courier always flies to the fixed delivery point.
+        The contact is stored and converted in tick(), because the
+        conversion needs the scout's TF, which may not have arrived yet.
         """
-        if self.target is not None:  # already set - ignore repeat confirms
-            return
-        self.target = self.delivery_point
+        if self.target is not None or self.pending_contact is not None:
+            return  # already have one - ignore repeat confirms
         self.get_logger().info(
-            f'Contact confirmed. Delivery target: ({self.target[0]:.2f}, {self.target[1]:.2f})'
+            f'Contact confirmed at ({msg.point.x:.2f}, {msg.point.y:.2f}) '
+            f'in {msg.header.frame_id or "(no frame)"}'
         )
+        self.pending_contact = msg
+
+    def contact_to_own_frame(self, msg):
+        """Return the contact as (x, y) in this robot's odom frame, or None if
+        the scout's TF isn't available yet.
+
+        The ground station stamps the point in the scout's SLAM map frame.
+        map -> odom is SLAM's drift correction, so applying it gives the
+        point in the scout's odom frame, which (see __init__) is the world
+        frame and so also this robot's odom frame.
+        """
+        frame = msg.header.frame_id
+        if frame == self.scout_odom_frame:
+            return (msg.point.x, msg.point.y)
+        try:
+            t = self.scout_tf_buffer.lookup_transform(
+                self.scout_odom_frame, frame, rclpy.time.Time())
+        except Exception as e:
+            self.get_logger().info(
+                f'Waiting for scout transform {frame} -> {self.scout_odom_frame}: {e}',
+                throttle_duration_sec=5.0)
+            return None
+        # Drones fly level, so a 2D (yaw-only) transform is enough.
+        q = t.transform.rotation
+        yaw = math.atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y ** 2 + q.z ** 2))
+        px, py = msg.point.x, msg.point.y
+        x = t.transform.translation.x + math.cos(yaw) * px - math.sin(yaw) * py
+        y = t.transform.translation.y + math.sin(yaw) * px + math.cos(yaw) * py
+        return (x, y)
 
     def tick(self):
         """Called every second; sends the delivery goal once, once a contact is confirmed."""
         if self.sent:  # already sent (or in flight/finished) - nothing more to do
             return
+        if self.target is None and self.pending_contact is not None:
+            if self.use_contact_position:
+                self.target = self.contact_to_own_frame(self.pending_contact)
+            else:
+                self.target = self.delivery_point
+            if self.target is not None:
+                source = 'contact position' if self.use_contact_position else 'fixed point'
+                self.get_logger().info(
+                    f'Delivery target ({source}): '
+                    f'({self.target[0]:.2f}, {self.target[1]:.2f}) in {self.map_frame}'
+                )
         if self.target is None:
+            if self.pending_contact is not None:
+                return  # confirmed, still waiting on the scout's TF
+
             self.get_logger().info('Waiting for the operator to confirm a contact...')
             return
         if self.busy:  # goal is already in flight
