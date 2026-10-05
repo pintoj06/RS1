@@ -2,6 +2,7 @@ from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 
 
 def generate_launch_description():
@@ -12,8 +13,7 @@ def generate_launch_description():
     confirmed_point_topic = LaunchConfiguration('confirmed_point_topic')
     target_world_x = LaunchConfiguration('target_world_x')
     target_world_y = LaunchConfiguration('target_world_y')
-    own_spawn_x = LaunchConfiguration('own_spawn_x')
-    own_spawn_y = LaunchConfiguration('own_spawn_y')
+    use_contact_position = LaunchConfiguration('use_contact_position')
 
     ld.add_action(DeclareLaunchArgument(
         'robot',
@@ -30,26 +30,20 @@ def generate_launch_description():
         default_value='/parrot1/operator/confirmed_point',
         description='Absolute topic the ground station publishes a confirmed contact to.',
     ))
-    # Fixed delivery point in world coordinates: above person1 in
-    # worlds/large_demo.sdf.
+    ld.add_action(DeclareLaunchArgument(
+        'use_contact_position', default_value='True',
+        description='Fly to the contact position confirmed by the scout. '
+                    'False flies to the fixed target_world_x/y instead.',
+    ))
+    # Fixed delivery point in world coordinates, used only when
+    # use_contact_position is False: above person1 in worlds/large_demo.sdf.
     ld.add_action(DeclareLaunchArgument(
         'target_world_x', default_value='-6.36',
-        description='Delivery point x in Gazebo world coordinates.',
+        description='Fixed delivery point x in Gazebo world coordinates.',
     ))
     ld.add_action(DeclareLaunchArgument(
         'target_world_y', default_value='-3.07',
-        description='Delivery point y in Gazebo world coordinates.',
-    ))
-    # These two must stay in step with parrot2's spawn x/y in
-    # 41068_ignition.launch.py - they are how courier_node.py converts the
-    # world point into its own odom frame.
-    ld.add_action(DeclareLaunchArgument(
-        'own_spawn_x', default_value='2.0',
-        description="Courier drone's own spawn x in 41068_ignition.launch.py.",
-    ))
-    ld.add_action(DeclareLaunchArgument(
-        'own_spawn_y', default_value='-2.0',
-        description="Courier drone's own spawn y in 41068_ignition.launch.py.",
+        description='Fixed delivery point y in Gazebo world coordinates.',
     ))
 
     # This launch file intentionally does not start Gazebo, robots, SLAM,
@@ -66,10 +60,9 @@ def generate_launch_description():
             'use_sim_time': use_sim_time,
             'robot_name': robot,
             'confirmed_point_topic': confirmed_point_topic,
-            'target_world_x': target_world_x,
-            'target_world_y': target_world_y,
-            'own_spawn_x': own_spawn_x,
-            'own_spawn_y': own_spawn_y,
+            'use_contact_position': ParameterValue(use_contact_position, value_type=bool),
+            'target_world_x': ParameterValue(target_world_x, value_type=float),
+            'target_world_y': ParameterValue(target_world_y, value_type=float),
         }],
         remappings=[
             ('/tf', 'tf'),

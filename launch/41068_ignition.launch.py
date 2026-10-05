@@ -159,7 +159,18 @@ def add_navigation_instance(
     robot_arg,
     robot_namespace,
     start_delay,
+    nav2_config_suffix=None,
 ):
+    nav_launch_arguments = {
+        'use_sim_time': use_sim_time,
+        'namespace': robot_namespace,
+        'config_filename_suffix': '_' + robot_namespace,
+        'slam': LaunchConfiguration('slam'),
+        'nav2': LaunchConfiguration('nav2'),
+    }
+    if nav2_config_suffix is not None:
+        nav_launch_arguments['nav2_config_filename_suffix'] = nav2_config_suffix
+
     nav_include = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             PathJoinSubstitution([
@@ -168,13 +179,7 @@ def add_navigation_instance(
                 '41068_navigation.launch.py',
             ])
         ),
-        launch_arguments={
-            'use_sim_time': use_sim_time,
-            'namespace': robot_namespace,
-            'config_filename_suffix': '_' + robot_namespace,
-            'slam': LaunchConfiguration('slam'),
-            'nav2': LaunchConfiguration('nav2'),
-        }.items(),
+        launch_arguments=nav_launch_arguments.items(),
     )
 
     # Scope is important: without it, repeated IncludeLaunchDescription calls can
@@ -277,6 +282,15 @@ def generate_launch_description():
         description='Launch a second Parrot drone (the courier) in namespace /parrot2',
     )
     ld.add_action(courier_launch_arg)
+
+    large_courier_launch_arg = DeclareLaunchArgument(
+        'large_courier',
+        default_value='False',
+        description='Use the large courier model (urdf_parrot/courier_large.urdf.xacro, '
+                    'nav2_params_parrot2_large.yaml) for /parrot2 instead of the standard Parrot',
+    )
+    ld.add_action(large_courier_launch_arg)
+    large_courier = PythonExpression(_is_true_expression('large_courier'))
 
     world_launch_arg = DeclareLaunchArgument(
         'world',
@@ -402,7 +416,9 @@ def generate_launch_description():
         namespace='parrot2',
         frame_prefix='parrot2_',
         gz_model_name='parrot2',
-        xacro_parts=['urdf_parrot', 'parrot.urdf.xacro'],
+        xacro_parts=['urdf_parrot', PythonExpression([
+            "'courier_large.urdf.xacro' if ", large_courier, " else 'parrot.urdf.xacro'",
+        ])],
         bridge_config='gazebo_bridge_parrot2.yaml',
         localization_config='robot_localization_parrot2.yaml',
         # Same x as parrot1, 2m south in y - see courier_node.py's spawn-offset
@@ -441,6 +457,9 @@ def generate_launch_description():
         robot_arg='courier',
         robot_namespace='parrot2',
         start_delay=26.0,
+        nav2_config_suffix=PythonExpression([
+            "'_parrot2_large' if ", large_courier, " else '_parrot2'",
+        ]),
     )
 
     add_rviz_instance(

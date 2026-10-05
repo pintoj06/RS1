@@ -62,6 +62,15 @@ def generate_launch_description():
         description='Robot filename suffix, e.g. _husky1 or _parrot1'
     )
 
+    # Lets a robot variant use its own Nav2 params (e.g. a larger footprint)
+    # while sharing the SLAM params. Defaults to config_filename_suffix.
+    nav2_config_filename_suffix = LaunchConfiguration('nav2_config_filename_suffix')
+    nav2_config_filename_suffix_launch_arg = DeclareLaunchArgument(
+        'nav2_config_filename_suffix',
+        default_value=config_filename_suffix,
+        description='Nav2 params filename suffix, e.g. _parrot2_large. Defaults to config_filename_suffix'
+    )
+
     slam_launch_arg = DeclareLaunchArgument(
         'slam',
         default_value='False',
@@ -81,7 +90,7 @@ def generate_launch_description():
 
     nav2_params_file = PathJoinSubstitution([
         config_path,
-        _params_filename('nav2_params', config_filename_suffix)
+        _params_filename('nav2_params', nav2_config_filename_suffix)
     ])
 
     # Start Simultaneous Localisation and Mapping (SLAM).
@@ -150,6 +159,7 @@ def generate_launch_description():
     ld.add_action(use_sim_time_launch_arg)
     ld.add_action(namespace_launch_arg)
     ld.add_action(config_filename_suffix_launch_arg)
+    ld.add_action(nav2_config_filename_suffix_launch_arg)
     ld.add_action(slam_launch_arg)
     ld.add_action(nav2_launch_arg)
     ld.add_action(slam)

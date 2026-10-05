@@ -1,0 +1,161 @@
+<?xml version="1.0" ?>
+<!-- Large courier variant of parrot.urdf.xacro: 3x the size, 2x the mass.
+     Uses the same parrot.gazebo.xacro, so plugins and Gazebo topics
+     (/model/<gz_model_name>/...) are identical to the original Parrot. -->
+<robot name="parrot_courier_large" xmlns:xacro="http://ros.org/wiki/xacro">
+
+  <xacro:arg name="prefix" default=""/>
+  <xacro:property name="prefix" value="$(arg prefix)"/>
+
+  <xacro:include filename="$(find 41068_ignition_bringup)/urdf_parrot/common_properties.urdf.xacro"/>
+  <xacro:include filename="$(find 41068_ignition_bringup)/urdf_parrot/parrot.gazebo.xacro"/>
+
+  <xacro:property name="r200_cam_rgb_px" value="0.005"/>
+  <xacro:property name="r200_cam_rgb_py" value="0.018"/>
+  <xacro:property name="r200_cam_rgb_pz" value="0.013"/>
+  <xacro:property name="r200_cam_depth_offset" value="0.01"/>
+
+  <!-- Size and mass relative to the original Parrot (0.503 kg). -->
+  <xacro:property name="scale" value="3.0"/>
+  <xacro:property name="body_mass" value="${0.503 * 2.0}"/>
+
+  <!-- Body bounding box including propellers. The original is about
+       0.333 x 0.38 x 0.09 m (hull.dae is 0.18 x 0.22 x 0.07 m with a 1.223x
+       node scale, plus the propellers); at 3x that is 1.0 x 1.14 x 0.27 m. -->
+  <xacro:property name="body_x" value="${0.333 * scale}"/>
+  <xacro:property name="body_y" value="${0.38 * scale}"/>
+  <xacro:property name="body_z" value="${0.09 * scale}"/>
+
+  <!-- Main link -->
+  <link name="${prefix}base_link">
+    <inertial>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <mass value="${body_mass}"/> <!-- kg -->
+      <!-- Solid box: ixx = m/12*(y^2+z^2), iyy = m/12*(x^2+z^2), izz = m/12*(x^2+y^2) -->
+      <inertia ixx="${body_mass / 12.0 * (body_y*body_y + body_z*body_z)}" ixy="0" ixz="0"
+               iyy="${body_mass / 12.0 * (body_x*body_x + body_z*body_z)}" iyz="0"
+               izz="${body_mass / 12.0 * (body_x*body_x + body_y*body_y)}" />
+    </inertial>
+    <collision name="collision">
+      <origin xyz="0 0 ${-0.006 * scale}" rpy="0 0 0"/>
+      <geometry>
+        <box size="${body_x} ${body_y} ${body_z}"/>
+      </geometry>
+    </collision>
+    <visual name="hull">
+      <geometry>
+        <mesh filename="file://$(find 41068_ignition_bringup)/urdf_parrot/meshes/hull.dae" scale="${scale} ${scale} ${scale}"/>
+      </geometry>
+    </visual>
+    <visual name="propeller_rr">
+      <origin xyz="${-0.09035 * scale} ${-0.11423 * scale} ${-0.00501 * scale}" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="file://$(find 41068_ignition_bringup)/urdf_parrot/meshes/propeller_rr.dae" scale="${scale} ${scale} ${scale}"/>
+      </geometry>
+    </visual>
+    <visual name="propeller_rl">
+      <origin xyz="${0.09035 * scale} ${0.11452 * scale} ${-0.00501 * scale}" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="file://$(find 41068_ignition_bringup)/urdf_parrot/meshes/propeller_rl.dae" scale="${scale} ${scale} ${scale}"/>
+      </geometry>
+    </visual>
+    <visual name="propeller_fr">
+      <origin xyz="${0.08456 * scale} ${-0.11435 * scale} ${-0.00501 * scale}" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="file://$(find 41068_ignition_bringup)/urdf_parrot/meshes/propeller_fr.dae" scale="${scale} ${scale} ${scale}"/>
+      </geometry>
+    </visual>
+    <visual name="propeller_fl">
+      <origin xyz="${0.08456 * scale} ${0.11463 * scale} ${-0.00501 * scale}" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="file://$(find 41068_ignition_bringup)/urdf_parrot/meshes/propeller_fl.dae" scale="${scale} ${scale} ${scale}"/>
+      </geometry>
+    </visual>
+  </link>
+
+  <!-- Sensors moved outward so they sit clear of the larger body
+       (top of body ~ +0.12 m, bottom ~ -0.15 m). -->
+  <joint name="${prefix}imu_joint" type="fixed">
+    <parent link="${prefix}base_link"/>
+    <child link="${prefix}imu_link"/>
+    <origin xyz="0.0 0 0.18" rpy="0 0 0"/> <!-- original: 0.068 -->
+  </joint>
+
+  <link name="${prefix}imu_link"/>
+
+  <joint name="${prefix}scan_joint" type="fixed">
+    <parent link="${prefix}base_link"/>
+    <child link="${prefix}base_scan"/>
+    <origin xyz="0 0 0.35" rpy="0 0 0"/> <!-- original: 0.2 -->
+  </joint>
+
+  <link name="${prefix}base_scan">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <cylinder length="0.04" radius="0.09"/>
+      </geometry>
+      <material name="dark"/>
+    </visual>
+
+    <inertial>
+      <mass value="0" />
+      <origin xyz="0 0 0" />
+      <inertia ixx="0.001" ixy="0.0" ixz="0.0"
+               iyy="0.001" iyz="0.0"
+               izz="0.001" />
+    </inertial>
+  </link>
+
+  <joint name="${prefix}camera_joint" type="fixed">
+    <origin xyz="0.30 0.0 -0.30" rpy="0 1.5708 0"/> <!-- original: 0.15 0.0 -0.2 -->
+    <parent link="${prefix}base_link"/>
+    <child link="${prefix}camera_link"/>
+  </joint>
+
+  <link name="${prefix}camera_link">
+    <visual>
+     <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <box size="0.02 0.08 0.05"/>
+      </geometry>
+      <material name="dark"/>
+    </visual>
+    <visual>
+     <origin xyz="0.015 0 0" rpy="0 1.57 0"/>
+      <geometry>
+        <cylinder length="0.03" radius="0.02"/>
+      </geometry>
+      <material name="dark"/>
+    </visual>
+  </link>
+
+  <joint name="${prefix}camera_rgb_joint" type="fixed">
+    <origin xyz="${r200_cam_rgb_px} ${r200_cam_rgb_py} ${r200_cam_rgb_pz}" rpy="0 0 0"/>
+    <parent link="${prefix}camera_link"/>
+    <child link="${prefix}camera_rgb_frame"/>
+  </joint>
+  <link name="${prefix}camera_rgb_frame"/>
+
+  <joint name="${prefix}camera_rgb_optical_joint" type="fixed">
+    <origin xyz="0 0 0" rpy="-1.57 0 -1.57"/>
+    <parent link="${prefix}camera_rgb_frame"/>
+    <child link="${prefix}camera_rgb_optical_frame"/>
+  </joint>
+  <link name="${prefix}camera_rgb_optical_frame"/>
+
+  <joint name="${prefix}camera_depth_joint" type="fixed">
+    <origin xyz="${r200_cam_rgb_px} ${r200_cam_rgb_py + r200_cam_depth_offset} ${r200_cam_rgb_pz}" rpy="0 0 0"/>
+    <parent link="${prefix}camera_link"/>
+    <child link="${prefix}camera_depth_frame"/>
+  </joint>
+  <link name="${prefix}camera_depth_frame"/>
+
+  <joint name="${prefix}camera_depth_optical_joint" type="fixed">
+    <origin xyz="0 0 0" rpy="-1.57 0 -1.57"/>
+    <parent link="${prefix}camera_depth_frame"/>
+    <child link="${prefix}camera_depth_optical_frame"/>
+  </joint>
+  <link name="${prefix}camera_depth_optical_frame"/>
+
+</robot>
