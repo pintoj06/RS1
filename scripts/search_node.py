@@ -1,4 +1,4 @@
-#!/usr/bin/env python3 
+#!/usr/bin/env python3
 
 
 "Fly a lawnmower search patter over a rectangle, using NAV2"
@@ -10,7 +10,9 @@ import numpy as np
 import rclpy
 from action_msgs.msg import GoalStatus
 # Point is a plain (x, y, z) location. Markers are built out of lists of these.
-from geometry_msgs.msg import Point, PoseStamped
+# PolygonStamped carries the search area the operator draws in the ground
+# station: a list of corners plus the frame they were measured in.
+from geometry_msgs.msg import Point, PolygonStamped, PoseStamped
 from nav2_msgs.action import NavigateToPose
 # OccupancyGrid is the standard ROS "2D grid of values" message. RViz draws it
 # as a coloured overlay, so we use it to show which ground has been searched.
@@ -87,7 +89,7 @@ def make_sweep_polygon(polygon, spacing, sweep_angle=None):
     polygon: list of (x, y) vertices, in order around the shape.
     Returns a flat list of (x, y) waypoints to visit in order.
     """
-    if len(polygon) < 3 or spacing <= 0:
+    if len(polygon) < 3 or spacing is None or spacing <= 0:
         return []
 
     if sweep_angle is None:
@@ -201,8 +203,8 @@ class SearchNode(Node):
 
         # An arbitrary search polygon, as a flat list: [x1, y1, x2, y2, ...].
         # Leave it empty to use the min_x/max_x/min_y/max_y rectangle instead.
-        # The mission GUI will eventually publish a shape the operator draws;
-        # until then this is how you test non-rectangular areas by hand.
+        # This is the STARTING area; the operator can redraw it at any time
+        # from the ground station (see on_area_request).
         self.declare_parameter('polygon', [0.0])
 
         robot_name= self.get_parameter('robot_name').value
@@ -350,41 +352,103 @@ class SearchNode(Node):
 
         self.coverage_resolution = float(self.get_parameter('coverage_resolution').value)
 
-        # Pad the grid a little beyond the search box so edge passes still land
-        # inside it.
-        pad = 5.0
-        poly_min_x = min(p[0] for p in self.polygon)
-        poly_max_x = max(p[0] for p in self.polygon)
-        poly_min_y = min(p[1] for p in self.polygon)
-        poly_max_y = max(p[1] for p in self.polygon)
-        self.cov_origin_x = poly_min_x - pad
-        self.cov_origin_y = poly_min_y - pad
-        span_x = (poly_max_x - poly_min_x) + 2 * pad
-        span_y = (poly_max_y - poly_min_y) + 2 * pad
-        self.cov_cols = max(1, int(span_x / self.coverage_resolution))
-        self.cov_rows = max(1, int(span_y / self.coverage_resolution))
-
-        # 0 = not yet searched, 100 = searched. Same convention OccupancyGrid
-        # uses, so it can be published directly.
-        self.coverage = np.zeros((self.cov_rows, self.cov_cols), dtype=np.int8)
-
-        # Which grid cells are actually inside the search polygon. Computed
-        # once, and used so the coverage percentage is measured against the
-        # real shape - otherwise a non-rectangular area could never reach
-        # 100%, because cells in the bounding box but outside the shape would
-        # count as forever unsearched.
-        self.inside_mask = self._build_inside_mask()
-        self.cells_to_search = int(np.count_nonzero(self.inside_mask))
+        # Sized to the search polygon. Built here for the starting area and
+        # rebuilt whenever the operator redraws it (see on_area_request).
+        self.last_coverage_log = 0.0
+        self._rebuild_coverage_grid()
 
         self.coverage_pub = self.create_publisher(OccupancyGrid, 'search_coverage', 10)
         self.coverage_timer = self.create_timer(0.5, self.update_coverage)
-        self.last_coverage_log = 0.0
 
         # Report the footprint periodically rather than once at startup: at
         # startup neither CameraInfo nor TF has arrived, so the numbers would
         # be the fallbacks rather than the real ones. This also means the log
         # follows the drone if its altitude changes mid-flight.
         self.footprint_timer = self.create_timer(10.0, self._log_footprint)
+
+        # Live search area from the ground station: the operator drags a box on
+        # the map and this replaces whatever the launch parameter set.
+        #
+        # Registered LAST in __init__ on purpose. It is transient-local, so a
+        # message already waiting on the topic is delivered the moment we
+        # subscribe - and the callback touches the TF buffer, the coverage grid
+        # and the planner state, all of which are built above.
+        area_qos = QoSProfile(depth=1,
+                              reliability=QoSReliabilityPolicy.RELIABLE,
+                              durability=QoSDurabilityPolicy.TRANSIENT_LOCAL)
+        self.create_subscription(
+            PolygonStamped, 'search_area_request', self.on_area_request, area_qos)
+
+    def on_area_request(self, msg):
+        """Operator drew a new search area in the ground station.
+
+        Rather than building the path here, this resets self.planned so
+        plan_sweep() redoes it on the next tick - that way the new area still
+        gets footprint-derived spacing, the pre-flight coverage check and the
+        return-to-spawn waypoint, instead of a bare sweep that skips all three.
+        """
+        pts = [(p.x, p.y) for p in msg.polygon.points]
+        if len(pts) < 3:
+            self.get_logger().warn(
+                f'Search area needs at least three corners, got {len(pts)}.')
+            return
+
+        # The ground station stamps the polygon in the scout's MAP frame; this
+        # node plans in odom. Translation only: the two frames differ by an
+        # offset with no rotation here, so shifting the corners is enough.
+        try:
+            tf = self.tf_buffer.lookup_transform(
+                self.map_frame, msg.header.frame_id,
+                rclpy.time.Time(), timeout=Duration(seconds=0.5))
+        except Exception as exc:
+            self.get_logger().warn(f'Cannot transform search area: {exc}')
+            return
+
+        dx = tf.transform.translation.x
+        dy = tf.transform.translation.y
+        self.polygon = [(x + dx, y + dy) for x, y in pts]
+
+        # The coverage grid is sized to the polygon, so it has to be rebuilt -
+        # otherwise progress would be measured against the old shape.
+        self._rebuild_coverage_grid()
+
+        # Abandon the current leg. The operator has new information, so
+        # finishing a waypoint from the old area is wasted flying.
+        if self.goal_handle is not None:
+            self.goal_handle.cancel_goal_async()
+        self.busy = False
+        self.index = 0
+        self.home_index = None
+        self.planned = False
+
+        self.get_logger().info(
+            f'Operator set a new {len(self.polygon)}-sided search area; '
+            f'replanning on the next tick.')
+
+    def _rebuild_coverage_grid(self):
+        """Size and clear the coverage grid for the current polygon.
+
+        Pads a little beyond the search area so edge passes still land inside
+        the grid, and recomputes which cells are actually inside the shape -
+        the percentage is measured against those only, or a non-rectangular
+        area could never reach 100%.
+        """
+        pad = 5.0
+        xs = [p[0] for p in self.polygon]
+        ys = [p[1] for p in self.polygon]
+        self.cov_origin_x = min(xs) - pad
+        self.cov_origin_y = min(ys) - pad
+        span_x = (max(xs) - min(xs)) + 2 * pad
+        span_y = (max(ys) - min(ys)) + 2 * pad
+        self.cov_cols = max(1, int(span_x / self.coverage_resolution))
+        self.cov_rows = max(1, int(span_y / self.coverage_resolution))
+
+        # 0 = not yet searched, 100 = searched. Same convention OccupancyGrid
+        # uses, so it can be published directly.
+        self.coverage = np.zeros((self.cov_rows, self.cov_cols), dtype=np.int8)
+        self.inside_mask = self._build_inside_mask()
+        self.cells_to_search = int(np.count_nonzero(self.inside_mask))
+        self.last_coverage_log = 0.0
 
     def _log_footprint(self):
         """Log what the camera can currently see, and the spacing in use.
@@ -577,7 +641,7 @@ class SearchNode(Node):
 
         goal = NavigateToPose.Goal()
         goal.pose = PoseStamped()
-        goal.pose.header.frame_id = self.map_frame 
+        goal.pose.header.frame_id = self.map_frame
         goal.pose.header.stamp = self.get_clock().now().to_msg()
         goal.pose.pose.position.x = float(x)
         goal.pose.pose.position.y = float(y)
@@ -594,7 +658,7 @@ class SearchNode(Node):
         send_future= self.nav_client.send_goal_async(goal)
         send_future.add_done_callback(self.goal_response)
 
-   
+
 
     def goal_response(self,future):
         """Stage 2: Nav2 has accepted or rejected the goal. """
@@ -604,7 +668,7 @@ class SearchNode(Node):
             self.get_logger().warn('Nav2 rejected that goal. Skipping it.')
             self.next_waypoint()
             return
-        
+
         self.goal_handle = goal_handle
         if self.holding:
             # Hold arrived while this goal was still being accepted.
@@ -615,12 +679,14 @@ class SearchNode(Node):
         result_future.add_done_callback(self.goal_finished)
 
     def goal_finished(self,future):
-        """Stage 3: Nav2 has arrived, failed or given up"""       
+        """Stage 3: Nav2 has arrived, failed or given up"""
         self.goal_handle = None
         status = future.result().status
         if self.holding or status == GoalStatus.STATUS_CANCELED:
-            # Cancelled by a hold. Don't advance, so resuming re-flies to the
-            # same waypoint instead of skipping it.
+            # Cancelled by a hold, or by the operator redrawing the search
+            # area. Don't advance: on a hold, resuming re-flies the same
+            # waypoint instead of skipping it, and on a redraw the index has
+            # already been reset to the start of the new pattern.
             self.busy = False
             return
         if future.result().status ==GoalStatus.STATUS_SUCCEEDED:
@@ -980,15 +1046,9 @@ class SearchNode(Node):
 
 
 def main():
-    rclpy.init() 
+    rclpy.init()
     node = SearchNode()
     rclpy.spin(node)
 
 if __name__ == '__main__':
-        main()
-
-
-
-
-
-                         
+        main() 
