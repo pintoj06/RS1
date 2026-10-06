@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""AeroAid ground station  AMPCD-style operator interface.
+"""AeroAid ground station  AMPCD-style operator interface.
 
     ros2 run 41068_ignition_bringup ground_station.py --ros-args \
         -r __ns:=/parrot1 -p robot_name:=parrot1
@@ -10,12 +10,13 @@ change to suit whichever page is up, and the label tells you what the button
 currently does.
 
 Slot allocation is deliberate and fixed:
-    left column    page selection  never changes, so it can be hit blind
+    left column    page selection  never changes, so it can be hit blind
     right column   actions for the current page
-    bottom row     contact ruling  always available, because a decision on a
+    bottom row     contact ruling  always available, because a decision on a
                    possible person should never be more than one press away
 
-Keyboard equivalents: 1-4 left, F1-F5 right, Q/W/E bottom.
+Keyboard equivalents: 1-4 left, F1-F6 right, Q/W/E bottom, Esc cancels an
+area drag.
 
 Qt owns the event loop; rclpy is pumped from a QTimer (see main()). Never
 block inside a callback or the window freezes.
@@ -35,7 +36,7 @@ from rclpy.node import Node
 from rclpy.qos import (QoSDurabilityPolicy, QoSHistoryPolicy, QoSProfile,
                        QoSReliabilityPolicy, qos_profile_sensor_data)
 
-from geometry_msgs.msg import PointStamped
+from geometry_msgs.msg import Point32, PointStamped, PolygonStamped
 from nav_msgs.msg import OccupancyGrid
 from sensor_msgs.msg import Image
 from std_msgs.msg import Bool, String
@@ -57,7 +58,7 @@ from PyQt5.QtWidgets import (QApplication, QFrame, QGridLayout, QHBoxLayout,
 #
 # Slate base rather than black: the operator is in a command vehicle in
 # daylight and pure black panels glare against a bright cabin. Amber is the
-# loudest colour in the palette and is reserved for one thing only  a contact
+# loudest colour in the palette and is reserved for one thing only  a contact
 # nobody has ruled on yet. Nothing else is allowed to compete with it.
 # ---------------------------------------------------------------------------
 BASE = "#1C2229"
@@ -76,6 +77,11 @@ MAP_FREE = (226, 232, 238)
 MAP_WALL = (26, 31, 36)
 
 PAGE_MAP, PAGE_VIS, PAGE_IR, PAGE_CONTACTS = range(4)
+
+# Six option select buttons down the right bezel. The map page fills all six;
+# other pages leave the spare slots blank rather than reflowing, so a given
+# function stays in the same physical place.
+RIGHT_SLOTS = 6
 
 
 @dataclass
@@ -97,7 +103,7 @@ class Contact:
 # ROS
 # ---------------------------------------------------------------------------
 class GroundStationNode(Node):
-    """Caches the latest data. No Qt, no drawing  the GUI reads whatever is
+    """Caches the latest data. No Qt, no drawing  the GUI reads whatever is
     current when it repaints, which decouples frame rate from message rate."""
 
     def __init__(self):
@@ -164,7 +170,7 @@ class GroundStationNode(Node):
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
 
         # SLAM publishes the map transient-local. A default subscription
-        # receives nothing at all, with no error  this QoS is required.
+        # receives nothing at all, with no error  this QoS is required.
         map_qos = QoSProfile(
             depth=1,
             history=QoSHistoryPolicy.KEEP_LAST,
@@ -198,6 +204,14 @@ class GroundStationNode(Node):
         # started after the confirm still gets the last confirmed position.
         self.confirmed_point_pub = self.create_publisher(
             PointStamped, "operator/confirmed_point", hold_qos)
+
+        # Operator-drawn search area. PolygonStamped rather than a custom
+        # message so nothing needs building and search_node can subscribe
+        # without waiting on an interface build; same transient-local
+        # reasoning as the two publishers above.
+        self.area_pub = self.create_publisher(
+            PolygonStamped, "search_area_request", hold_qos)
+
         self.create_timer(0.1, self._poll_pose)
 
         self.get_logger().info(f"Ground station up for {self.robot_name}")
@@ -333,6 +347,26 @@ class GroundStationNode(Node):
         msg.point.y = y
         self.confirmed_point_pub.publish(msg)
 
+    def publish_search_area(self, min_x: float, min_y: float,
+                            max_x: float, max_y: float):
+        """Send the operator-drawn box as a four-corner polygon.
+
+        Stamped in this robot's map frame, same as the confirmed point, since
+        that is the frame the operator drew it in. search_node plans in the
+        odom frame, so it has to convert these corners through TF rather than
+        use them raw.
+        """
+        msg = PolygonStamped()
+        msg.header.frame_id = self.map_frame
+        msg.header.stamp = self.get_clock().now().to_msg()
+        for x, y in [(min_x, min_y), (max_x, min_y),
+                     (max_x, max_y), (min_x, max_y)]:
+            msg.polygon.points.append(Point32(x=float(x), y=float(y), z=0.0))
+        self.area_pub.publish(msg)
+        self.get_logger().info(
+            f"Search area set: {min_x:.1f},{min_y:.1f} to {max_x:.1f},{max_y:.1f}"
+            f" ({abs(max_x - min_x):.0f} x {abs(max_y - min_y):.0f} m)")
+
 
 # ---------------------------------------------------------------------------
 # Shared helpers
@@ -350,7 +384,7 @@ def numpy_to_pixmap(bgr: np.ndarray) -> QPixmap:
 class BezelButton(QPushButton):
     """One option select button.
 
-    Generic hardware, page-specific label  the whole point of the layout.
+    Generic hardware, page-specific label  the whole point of the layout.
     A boxed border means the option is currently selected, which is the
     convention on real multifunction displays and reads faster than colour.
     Sized for a gloved finger on a touchscreen: nothing under 48 px.
@@ -411,6 +445,11 @@ class MapPage(QWidget):
         ("BOTH", ["thermal", "display"]),
     ]
 
+    # Below this, a drag is almost certainly a stray click rather than an
+    # intended area. Sending it would task the drone with a patch of ground
+    # smaller than its own turning circle.
+    MIN_AREA_SIDE_M = 1.0
+
     def __init__(self, node: GroundStationNode):
         super().__init__()
         self.pip_mode = 1        # IR by default
@@ -422,9 +461,17 @@ class MapPage(QWidget):
         self.setStyleSheet(f"background:{BASE};")
         self._scale, self._ox, self._oy = 1.0, 0.0, 0.0
 
+        # Operator-drawn search area.
+        self.draw_mode = False
+        self.area: Optional[Tuple[float, float, float, float]] = None
+        self._drag_a = None      # widget coords, live during a drag
+        self._drag_b = None
+        self.on_area_set: Optional[Callable] = None
+
     def cycle_pip(self):
         self.pip_mode = (self.pip_mode + 1) % len(self.PIP_MODES)
 
+    # -- coordinate transforms --------------------------------------------
     def _world_to_widget(self, x: float, y: float) -> QPointF:
         res = self.node.map_resolution
         ox, oy = self.node.map_origin
@@ -433,6 +480,59 @@ class MapPage(QWidget):
         py = h - (y - oy) / res
         return QPointF(self._ox + px * self._scale, self._oy + py * self._scale)
 
+    def _widget_to_world(self, pt) -> Optional[Tuple[float, float]]:
+        """Inverse of the above. Returns None before a map exists, since
+        without resolution and origin there is nothing to convert against."""
+        if self.node.map_image is None or self._scale == 0:
+            return None
+        res = self.node.map_resolution
+        ox, oy = self.node.map_origin
+        h = self.node.map_image.shape[0]
+        px = (pt.x() - self._ox) / self._scale
+        py = (pt.y() - self._oy) / self._scale
+        return px * res + ox, (h - py) * res + oy
+
+    # -- area drawing ------------------------------------------------------
+    def begin_draw(self):
+        self.draw_mode = True
+        self.setCursor(Qt.CrossCursor)
+
+    def clear_area(self):
+        self.area = None
+        self.draw_mode = False
+        self._drag_a = self._drag_b = None
+        self.setCursor(Qt.ArrowCursor)
+
+    def mousePressEvent(self, ev):
+        if self.draw_mode and ev.button() == Qt.LeftButton:
+            self._drag_a = ev.pos()
+            self._drag_b = ev.pos()
+
+    def mouseMoveEvent(self, ev):
+        if self._drag_a is not None:
+            self._drag_b = ev.pos()
+
+    def mouseReleaseEvent(self, ev):
+        if self._drag_a is None:
+            return
+        a = self._widget_to_world(self._drag_a)
+        b = self._widget_to_world(ev.pos())
+        self._drag_a = self._drag_b = None
+
+        if a is None or b is None:
+            return
+        if (abs(a[0] - b[0]) < self.MIN_AREA_SIDE_M or
+                abs(a[1] - b[1]) < self.MIN_AREA_SIDE_M):
+            return   # stray click, stay armed so the operator can try again
+
+        self.area = (min(a[0], b[0]), min(a[1], b[1]),
+                     max(a[0], b[0]), max(a[1], b[1]))
+        self.draw_mode = False
+        self.setCursor(Qt.ArrowCursor)
+        if self.on_area_set:
+            self.on_area_set(*self.area)
+
+    # -- painting ----------------------------------------------------------
     def paintEvent(self, _):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
@@ -449,10 +549,12 @@ class MapPage(QWidget):
         qimg = QImage(img.data, w, h, 3 * w, QImage.Format_RGB888).copy()
 
         # Fit to the widget, then apply zoom, keeping the drone centred when
-        # zoomed in  panning a map by hand during a search is a distraction.
+        # zoomed in  panning a map by hand during a search is a distraction.
+        # Drone-follow is suspended while drawing: a map that moves under the
+        # cursor makes it impossible to place a corner.
         fit = min(self.width() / w, self.height() / h)
         self._scale = fit * self.zoom
-        if self.zoom > 1.0 and self.node.drone_xy:
+        if self.zoom > 1.0 and self.node.drone_xy and not self.draw_mode:
             dx = (self.node.drone_xy[0] - self.node.map_origin[0]) / self.node.map_resolution
             dy = h - (self.node.drone_xy[1] - self.node.map_origin[1]) / self.node.map_resolution
             self._ox = self.width() / 2 - dx * self._scale
@@ -463,6 +565,10 @@ class MapPage(QWidget):
 
         p.drawPixmap(QRectF(self._ox, self._oy, w * self._scale, h * self._scale),
                      QPixmap.fromImage(qimg), QRectF(0, 0, w, h))
+
+        # Under the trail and contacts, so it reads as ground marking rather
+        # than another overlay competing with the things that need a decision.
+        self._draw_area(p)
 
         if self.show_trail and len(self.node.trail) > 1:
             p.setPen(QPen(QColor(CYAN), 2))
@@ -492,12 +598,48 @@ class MapPage(QWidget):
             p.drawPolygon(QPointF(12, 0), QPointF(-7, 7), QPointF(-7, -7))
             p.restore()
 
+        if self.draw_mode and self._drag_a is None:
+            p.setPen(QColor(AMBER))
+            p.setFont(QFont("DejaVu Sans Mono", 10, QFont.Bold))
+            p.drawText(18, 28, "DRAG TO SET SEARCH AREA   (ESC TO CANCEL)")
+
         if self.PIP_MODES[self.pip_mode][1]:
             self._draw_pips(p)
 
+    def _draw_area(self, p: QPainter):
+        """Dashed amber while dragging, solid green once committed and sent.
+        The live dimensions matter: an operator sizing a search box needs to
+        know whether they have drawn 20 m or 200 m of ground."""
+        if self._drag_a is not None and self._drag_b is not None:
+            rect = QRectF(self._drag_a, self._drag_b).normalized()
+            p.setPen(QPen(QColor(AMBER), 2, Qt.DashLine))
+            p.setBrush(Qt.NoBrush)
+            p.drawRect(rect)
+
+            a = self._widget_to_world(self._drag_a)
+            b = self._widget_to_world(self._drag_b)
+            if a and b:
+                p.setPen(QColor(AMBER))
+                p.setFont(QFont("DejaVu Sans Mono", 9))
+                p.drawText(rect.topLeft() + QPointF(6, -6),
+                           f"{abs(a[0] - b[0]):.0f} x {abs(a[1] - b[1]):.0f} m")
+            return
+
+        if self.area:
+            x0, y0, x1, y1 = self.area
+            rect = QRectF(self._world_to_widget(x0, y1),
+                          self._world_to_widget(x1, y0))
+            p.setPen(QPen(QColor(GREEN), 2))
+            p.setBrush(QColor(76, 175, 109, 25))
+            p.drawRect(rect)
+            p.setPen(QColor(GREEN))
+            p.setFont(QFont("DejaVu Sans Mono", 9))
+            p.drawText(rect.topLeft() + QPointF(6, -6),
+                       f"SEARCH AREA  {abs(x1 - x0):.0f} x {abs(y1 - y0):.0f} m")
+
     def _draw_pips(self, p: QPainter):
         """Insets stack upward from the bottom-right corner. Two at once eats
-        real map area, which is why OFF and single-feed modes exist — the
+        real map area, which is why OFF and single-feed modes exist  the
         operator decides how much map they are willing to trade."""
         pw, ph = 200, 150
         x = self.width() - pw - 14
@@ -629,7 +771,7 @@ class MainWindow(QMainWindow):
         # operator explicitly resumes the search.
         self.hold_for_confirmed = False
 
-        self.setWindowTitle("AeroAid  ground station")
+        self.setWindowTitle("AeroAid  ground station")
         self.resize(1440, 900)
         self.setStyleSheet(f"QMainWindow {{ background:{BEZEL}; }}"
                            f"QLabel {{ color:{TEXT}; }}")
@@ -641,6 +783,8 @@ class MainWindow(QMainWindow):
         self.vis_page = VideoPage(node, "display", "No camera feed")
         self.ir_page = VideoPage(node, "thermal", "No thermal feed")
         self.contacts_page = ContactsPage()
+
+        self.map_page.on_area_set = self.node.publish_search_area
 
         self.stack = QStackedWidget()
         for page in (self.map_page, self.vis_page, self.ir_page,
@@ -685,7 +829,7 @@ class MainWindow(QMainWindow):
         self.stack.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         grid.addWidget(self.stack, 1, 1)
 
-        self.right_buttons = [BezelButton(f"R{i+1}") for i in range(5)]
+        self.right_buttons = [BezelButton(f"R{i+1}") for i in range(RIGHT_SLOTS)]
         right = QVBoxLayout()
         right.setSpacing(8)
         right.addStretch(1)
@@ -751,12 +895,14 @@ class MainWindow(QMainWindow):
     def _build_shortcuts(self):
         for i, key in enumerate(["1", "2", "3", "4"]):
             QShortcut(QKeySequence(key), self, lambda n=i: self.select_page(n))
-        for i in range(5):
+        for i in range(RIGHT_SLOTS):
             QShortcut(QKeySequence(f"F{i+1}"), self,
                       lambda n=i: self._press_right(n))
         QShortcut(QKeySequence("Q"), self, lambda: self._rule("CONFIRMED"))
         QShortcut(QKeySequence("W"), self, lambda: self._rule("DISMISSED"))
         QShortcut(QKeySequence("E"), self, self._simulate_contact)
+        # Escape stands down an armed area draw without setting one.
+        QShortcut(QKeySequence("Escape"), self, self._cancel_draw)
 
     # -- page plumbing -----------------------------------------------------
     def select_page(self, index: int):
@@ -767,39 +913,43 @@ class MainWindow(QMainWindow):
         """Label, handler and boxed-state for the right column, for whichever
         page is current. Rebuilding it each refresh is what lets a toggle show
         its own state in the label box."""
+        blank = ("", lambda: None, False)
+
         if self.page == PAGE_MAP:
             m = self.map_page
             return [
                 ("TRAIL", lambda: setattr(m, "show_trail", not m.show_trail), m.show_trail),
                 ("CNTCT", lambda: setattr(m, "show_contacts", not m.show_contacts), m.show_contacts),
-                # ("IR PIP", lambda: setattr(m, "pip", not m.pip), m.pip),
                 (f"PIP\n{MapPage.PIP_MODES[m.pip_mode][0]}", m.cycle_pip, m.pip_mode != 0),
                 ("ZOOM+", lambda: setattr(m, "zoom", min(m.zoom * 1.5, 8.0)), False),
                 ("ZOOM-", lambda: setattr(m, "zoom", max(m.zoom / 1.5, 1.0)), False),
+                # One slot, three states: no area, armed, area set. The label
+                # names the action the next press performs, not the state.
+                ("CLR\nAREA" if m.area else "SET\nAREA",
+                 self._toggle_area_draw, m.draw_mode or bool(m.area)),
             ]
         if self.page in (PAGE_VIS, PAGE_IR):
             v = self.vis_page if self.page == PAGE_VIS else self.ir_page
-            return [
-                ("FREEZE", v.toggle_freeze, v.frozen is not None),
-                ("", lambda: None, False),
-                ("", lambda: None, False),
-                ("", lambda: None, False),
-                ("", lambda: None, False),
-            ]
+            return [("FREEZE", v.toggle_freeze, v.frozen is not None)] + [blank] * 5
         if self.page == PAGE_CONTACTS:
-            return [
-                ("RESUME", self._resume_search, False),
-                ("", lambda: None, False),
-                ("", lambda: None, False),
-                ("", lambda: None, False),
-                ("", lambda: None, False),
-            ]
-        return [("", lambda: None, False)] * 5
+            return [("RESUME", self._resume_search, False)] + [blank] * 5
+        return [blank] * RIGHT_SLOTS
 
     def _press_right(self, slot: int):
         actions = self._right_actions()
         if slot < len(actions) and actions[slot][0]:
             actions[slot][1]()
+
+    def _toggle_area_draw(self):
+        m = self.map_page
+        if m.area or m.draw_mode:
+            m.clear_area()      # clear a set area, or stand down an armed one
+        else:
+            m.begin_draw()
+
+    def _cancel_draw(self):
+        if self.map_page.draw_mode:
+            self.map_page.clear_area()
 
     def _sync_bezels(self):
         pending = sum(1 for c in self.contacts if c.status == "UNCONFIRMED")
@@ -953,4 +1103,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    main() 
