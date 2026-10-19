@@ -61,20 +61,21 @@ from PyQt5.QtWidgets import (QApplication, QFrame, QGridLayout, QHBoxLayout,
 # loudest colour in the palette and is reserved for one thing only  a contact
 # nobody has ruled on yet. Nothing else is allowed to compete with it.
 # ---------------------------------------------------------------------------
-BASE = "#1C2229"
-PANEL = "#232B33"
-BEZEL = "#151A1F"
-LINE = "#333E49"
-TEXT = "#E4E9ED"
-MUTED = "#8A98A6"
-AMBER = "#E8A33D"
-GREEN = "#4CAF6D"
-RED = "#D9534F"
-CYAN = "#5AA9E6"
+BASE  = "#2B001E"   # display background, behind the map
+PANEL = "#160010"   # status strip, selected rows — recessed below the display
+BEZEL = "#220F1C"   # window surround and button faces
+LINE  = "#4A2A3C"   # borders and dividers, plum-tinted
+TEXT  = "#EDE6EA"   # primary text, warmed a touch so it sits on plum
+MUTED = "#9B8793"   # labels, secondary text, disabled
 
-MAP_UNKNOWN = (58, 66, 74)
-MAP_FREE = (226, 232, 238)
-MAP_WALL = (26, 31, 36)
+ALERT = "#D6FF00"   # unruled contact — the one thing demanding a decision
+CONFIRM = "#5AE1E6"   # confirmed, committed area, LINK OK
+RED   = "#FF4136"   # dismissed
+DRONE  = "#FFFFFF"   # drone marker and flight trail
+
+MAP_UNKNOWN = (62, 38, 54)      # unscanned, plum-dark
+MAP_FREE    = (188, 188, 188)   # swept and clear — #BCBCBC
+MAP_WALL    = (18, 18, 18)      # obstacle — #121212
 
 PAGE_MAP, PAGE_VIS, PAGE_IR, PAGE_CONTACTS = range(4)
 
@@ -270,7 +271,7 @@ class GroundStationNode(Node):
         if count < self.person_min_pixels:
             return None
         x, y, w, h = cv2.boundingRect(hot.astype(np.uint8))
-        cv2.rectangle(frame, (x, y), (x + w, y + h), (61, 163, 232), 2)  # AMBER
+        cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 214), 2)  # ALERT
         return float(kelvin[hot].max()), count
 
     def _on_map(self, msg: OccupancyGrid):
@@ -571,7 +572,7 @@ class MapPage(QWidget):
         self._draw_area(p)
 
         if self.show_trail and len(self.node.trail) > 1:
-            p.setPen(QPen(QColor(CYAN), 2))
+            p.setPen(QPen(QColor(DRONE), 2))
             pts = [self._world_to_widget(x, y) for x, y in self.node.trail]
             for a, b in zip(pts, pts[1:]):
                 p.drawLine(a, b)
@@ -581,7 +582,7 @@ class MapPage(QWidget):
                 if c.status == "DISMISSED":
                     continue
                 pos = self._world_to_widget(c.x, c.y)
-                colour = QColor(GREEN if c.status == "CONFIRMED" else AMBER)
+                colour = QColor(CONFIRM if c.status == "CONFIRMED" else ALERT)
                 p.setPen(QPen(colour, 2))
                 p.setBrush(QColor(colour.red(), colour.green(), colour.blue(), 60))
                 p.drawEllipse(pos, 11, 11)
@@ -593,13 +594,13 @@ class MapPage(QWidget):
             p.save()
             p.translate(pos)
             p.rotate(-np.degrees(self.node.drone_yaw))
-            p.setBrush(QColor(CYAN))
+            p.setBrush(QColor(DRONE))
             p.setPen(QPen(QColor(TEXT), 1))
             p.drawPolygon(QPointF(12, 0), QPointF(-7, 7), QPointF(-7, -7))
             p.restore()
 
         if self.draw_mode and self._drag_a is None:
-            p.setPen(QColor(AMBER))
+            p.setPen(QColor(ALERT))
             p.setFont(QFont("DejaVu Sans Mono", 10, QFont.Bold))
             p.drawText(18, 28, "DRAG TO SET SEARCH AREA   (ESC TO CANCEL)")
 
@@ -612,14 +613,14 @@ class MapPage(QWidget):
         know whether they have drawn 20 m or 200 m of ground."""
         if self._drag_a is not None and self._drag_b is not None:
             rect = QRectF(self._drag_a, self._drag_b).normalized()
-            p.setPen(QPen(QColor(AMBER), 2, Qt.DashLine))
+            p.setPen(QPen(QColor(ALERT), 2, Qt.DashLine))
             p.setBrush(Qt.NoBrush)
             p.drawRect(rect)
 
             a = self._widget_to_world(self._drag_a)
             b = self._widget_to_world(self._drag_b)
             if a and b:
-                p.setPen(QColor(AMBER))
+                p.setPen(QColor(ALERT))
                 p.setFont(QFont("DejaVu Sans Mono", 9))
                 p.drawText(rect.topLeft() + QPointF(6, -6),
                            f"{abs(a[0] - b[0]):.0f} x {abs(a[1] - b[1]):.0f} m")
@@ -629,10 +630,10 @@ class MapPage(QWidget):
             x0, y0, x1, y1 = self.area
             rect = QRectF(self._world_to_widget(x0, y1),
                           self._world_to_widget(x1, y0))
-            p.setPen(QPen(QColor(GREEN), 2))
+            p.setPen(QPen(QColor(CONFIRM), 2))
             p.setBrush(QColor(76, 175, 109, 25))
             p.drawRect(rect)
-            p.setPen(QColor(GREEN))
+            p.setPen(QColor(CONFIRM))
             p.setFont(QFont("DejaVu Sans Mono", 9))
             p.drawText(rect.topLeft() + QPointF(6, -6),
                        f"SEARCH AREA  {abs(x1 - x0):.0f} x {abs(y1 - y0):.0f} m")
@@ -698,7 +699,7 @@ class VideoPage(QWidget):
                      (self.height() - pix.height()) // 2, pix)
 
         if self.frozen is not None:
-            p.setPen(QColor(AMBER))
+            p.setPen(QColor(ALERT))
             p.setFont(QFont("DejaVu Sans Mono", 11, QFont.Bold))
             p.drawText(18, 30, "FROZEN")
 
@@ -739,8 +740,8 @@ class ContactsPage(QWidget):
                 f"{c.id:02d}   {c.x:+7.1f} {c.y:+7.1f} m     "
                 f"VIS {c.rgb_confidence:>4.0%}   IR {c.thermal_confidence:>4.0%}"
                 f"     {c.status}")
-            item.setForeground(QColor({"UNCONFIRMED": AMBER,
-                                       "CONFIRMED": GREEN,
+            item.setForeground(QColor({"UNCONFIRMED": ALERT,
+                                       "CONFIRMED": CONFIRM,
                                        "DISMISSED": MUTED}[c.status]))
             self.list.addItem(item)
         if 0 <= keep < self.list.count():
@@ -868,7 +869,7 @@ class MainWindow(QMainWindow):
         row.addWidget(title)
 
         self.page_label = QLabel("")
-        self.page_label.setStyleSheet(f"color:{CYAN}; border:none; padding-left:20px;")
+        self.page_label.setStyleSheet(f"color:{DRONE}; border:none; padding-left:20px;")
         row.addWidget(self.page_label)
 
         row.addStretch(1)
@@ -921,7 +922,7 @@ class MainWindow(QMainWindow):
                 ("TRAIL", lambda: setattr(m, "show_trail", not m.show_trail), m.show_trail),
                 ("CNTCT", lambda: setattr(m, "show_contacts", not m.show_contacts), m.show_contacts),
                 (f"PIP\n{MapPage.PIP_MODES[m.pip_mode][0]}", m.cycle_pip, m.pip_mode != 0),
-                ("ZOOM+", lambda: setattr(m, "zoom", min(m.zoom * 1.5, 8.0)), False),
+                (f"ZOOM+\n{m.zoom:.1f}x", lambda: setattr(m, "zoom", min(m.zoom * 1.5, 8.0)), m.zoom > 1.0),
                 ("ZOOM-", lambda: setattr(m, "zoom", max(m.zoom / 1.5, 1.0)), False),
                 # One slot, three states: no area, armed, area set. The label
                 # names the action the next press performs, not the state.
@@ -955,7 +956,7 @@ class MainWindow(QMainWindow):
         pending = sum(1 for c in self.contacts if c.status == "UNCONFIRMED")
         labels = [("MAP", TEXT), ("VIS", TEXT), ("IR", TEXT),
                   (f"CNTCT\n{len(self.contacts):02d}",
-                   AMBER if pending else TEXT)]
+                   ALERT if pending else TEXT)]
         for i, (btn, (label, tone)) in enumerate(zip(self.left_buttons, labels)):
             btn.configure(label, tone, boxed=(i == self.page))
 
@@ -964,7 +965,7 @@ class MainWindow(QMainWindow):
 
         sel = self._selected()
         can_rule = sel is not None and sel.status == "UNCONFIRMED"
-        self.bottom_buttons[0].configure("CONFIRM", GREEN, enabled=can_rule)
+        self.bottom_buttons[0].configure("CONFIRM", CONFIRM, enabled=can_rule)
         self.bottom_buttons[1].configure("DISMISS", RED, enabled=can_rule)
         self.bottom_buttons[2].configure("SIM", MUTED)
 
@@ -1065,7 +1066,7 @@ class MainWindow(QMainWindow):
         if pending:
             self.caution.setText(f"CONTACT  {pending}")
             self.caution.setStyleSheet(
-                f"color:{AMBER if self._blink else PANEL}; border:none;")
+                f"color:{ALERT if self._blink else PANEL}; border:none;")
         else:
             self.caution.setText("")
 
@@ -1074,7 +1075,7 @@ class MainWindow(QMainWindow):
         live = self.node.drone_xy is not None
         self.link_label.setText("LINK OK" if live else "LINK ---")
         self.link_label.setStyleSheet(
-            f"color:{GREEN if live else MUTED}; border:none; padding-left:24px;")
+            f"color:{CONFIRM if live else MUTED}; border:none; padding-left:24px;")
 
         self._sync_bezels()
 
