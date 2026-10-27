@@ -207,6 +207,11 @@ class SearchNode(Node):
         # from the ground station (see on_area_request).
         self.declare_parameter('polygon', [0.0])
 
+        # True: hover at spawn and do nothing until the operator draws a search
+        # area in the ground station. False: start sweeping the launch-parameter
+        # area (polygon or min/max rectangle) straight away, as before.
+        self.declare_parameter('wait_for_area', True)
+
         robot_name= self.get_parameter('robot_name').value
         # Goals are stamped in the frame Nav2 plans in. That is now the odom
         # frame, not the SLAM map frame - see global_frame in the nav2 params.
@@ -216,6 +221,15 @@ class SearchNode(Node):
         # Build the search shape: an explicit polygon if one was given,
         # otherwise the rectangle from the min/max parameters.
         self.polygon = self._resolve_polygon()
+        # Whether there is an area to search yet. While waiting for the
+        # operator, self.polygon still holds the launch-parameter shape so the
+        # coverage grid has something to size itself to, but nothing flies,
+        # draws or measures coverage against it.
+        self.area_set = not self.get_parameter('wait_for_area').value
+        if not self.area_set:
+            self.get_logger().info(
+                'Idle: waiting for the operator to draw a search area '
+                'in the ground station.')
 
         # The sweep is deliberately NOT built here. Leg spacing comes from how
         # much ground the camera can see, which depends on the field of view -
@@ -407,6 +421,7 @@ class SearchNode(Node):
         dx = tf.transform.translation.x
         dy = tf.transform.translation.y
         self.polygon = [(x + dx, y + dy) for x, y in pts]
+        self.area_set = True
 
         # The coverage grid is sized to the polygon, so it has to be rebuilt -
         # otherwise progress would be measured against the old shape.
@@ -458,6 +473,10 @@ class SearchNode(Node):
         and this message keeps reporting spacing as though it were still
         flying - which reads like nothing is wrong.
         """
+        if not self.area_set:
+            self.get_logger().info(
+                'Still idle: draw a search area in the ground station to start.')
+            return
         if not self.planned:
             return
         if self.holding:
@@ -618,6 +637,8 @@ class SearchNode(Node):
 
     def tick(self):
         """Called every second; sends the next waypoint to Nav2 once it's ready and we're not already flying to one."""
+        if not self.area_set:  # nothing to search until the operator draws it
+            return
         if self.holding:
             return
         if self.busy: #goal is already in flight
@@ -772,6 +793,8 @@ class SearchNode(Node):
         Rebuilt and republished every second so the waypoint colours update
         as the sweep progresses.
         """
+        if not self.area_set:
+            return
         stamp = self.get_clock().now().to_msg()
         markers = MarkerArray()
 
@@ -986,6 +1009,8 @@ class SearchNode(Node):
 
     def update_coverage(self):
         """Mark the ground currently under the camera as searched."""
+        if not self.area_set:
+            return
         pos = self._lookup_robot_xy()
         if pos is None:
             return                       # TF not ready yet
@@ -1051,4 +1076,4 @@ def main():
     rclpy.spin(node)
 
 if __name__ == '__main__':
-        main() 
+        main()
