@@ -11,7 +11,7 @@ find_package(ament_cmake REQUIRED)
 find_package(ros_ign_interfaces REQUIRED)
 
 install(
-  DIRECTORY config launch models urdf_husky worlds urdf_parrot weights
+  DIRECTORY config launch maps models urdf_husky worlds urdf_parrot weights
   DESTINATION share/${PROJECT_NAME}
 )
 
@@ -26,6 +26,7 @@ install(
     scripts/yolo_person_detector.py
     scripts/search_node.py
     scripts/courier_node.py
+    scripts/capture_aerial_map.py
     UI/ground_station.py
   DESTINATION lib/${PROJECT_NAME}
 )

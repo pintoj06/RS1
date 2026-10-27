@@ -22,6 +22,7 @@ Qt owns the event loop; rclpy is pumped from a QTimer (see main()). Never
 block inside a callback or the window freezes.
 """
 
+import os
 import sys
 import time
 from collections import deque
@@ -44,6 +45,7 @@ import tf2_ros
 
 from cv_bridge import CvBridge
 import cv2
+import yaml
 
 from PyQt5.QtCore import QPointF, QRectF, Qt, QTimer
 from PyQt5.QtGui import (QColor, QFont, QImage, QKeySequence, QPainter, QPen,
@@ -82,7 +84,7 @@ PAGE_MAP, PAGE_VIS, PAGE_IR, PAGE_CONTACTS = range(4)
 # Six option select buttons down the right bezel. The map page fills all six;
 # other pages leave the spare slots blank rather than reflowing, so a given
 # function stays in the same physical place.
-RIGHT_SLOTS = 6
+RIGHT_SLOTS = 7
 
 
 @dataclass
@@ -158,9 +160,24 @@ class GroundStationNode(Node):
         self._ai_stale_after_s = 2.0
 
         self.map_image: Optional[np.ndarray] = None
+        # Same grid as RGBA: unknown fully transparent, so an aerial photo
+        # underneath shows through wherever SLAM has not looked yet.
+        self.map_overlay: Optional[np.ndarray] = None
         self.map_resolution = 0.0
         self.map_origin = (0.0, 0.0)
         self.map_frame = ""
+
+        # Optional aerial photo of the world to draw under the map, written by
+        # scripts/capture_aerial_map.py. Empty = no photo, plain map as before.
+        # The photo is in Gazebo world coordinates while the map frame starts
+        # where the scout spawned, so the spawn point is needed to line them
+        # up. Keep it in step with parrot1's x/y in 41068_ignition.launch.py.
+        self.declare_parameter("aerial_map", "")
+        self.declare_parameter("scout_spawn_x", 2.0)
+        self.declare_parameter("scout_spawn_y", 0.0)
+        self.aerial_image: Optional[np.ndarray] = None   # RGB
+        self.aerial_bounds: Optional[Tuple[float, float, float, float]] = None
+        self._load_aerial(str(self.get_parameter("aerial_map").value))
 
         self.drone_xy: Optional[Tuple[float, float]] = None
         self.drone_yaw = 0.0
@@ -216,6 +233,34 @@ class GroundStationNode(Node):
         self.create_timer(0.1, self._poll_pose)
 
         self.get_logger().info(f"Ground station up for {self.robot_name}")
+
+    def _load_aerial(self, path: str):
+        """Read the aerial photo and work out where it sits in the map frame.
+
+        Any problem is a warning, not a crash: the photo is a convenience and
+        the ground station is fully usable without it.
+        """
+        if not path:
+            return
+        try:
+            with open(path) as f:
+                meta = yaml.safe_load(f)
+            img_path = os.path.join(os.path.dirname(path), meta["image"])
+            bgr = cv2.imread(img_path)
+            if bgr is None:
+                raise IOError(f"cannot read {img_path}")
+        except Exception as exc:
+            self.get_logger().warn(f"No aerial map ({path}): {exc}")
+            return
+
+        sx = float(self.get_parameter("scout_spawn_x").value)
+        sy = float(self.get_parameter("scout_spawn_y").value)
+        self.aerial_image = np.ascontiguousarray(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
+        # World -> map frame is a pure shift by the spawn point: SLAM starts
+        # its map where the scout starts, with no rotation.
+        self.aerial_bounds = (float(meta["x_min"]) - sx, float(meta["y_min"]) - sy,
+                              float(meta["x_max"]) - sx, float(meta["y_max"]) - sy)
+        self.get_logger().info(f"Aerial map loaded: {img_path}")
 
     def _on_rgb(self, msg: Image):
         try:
@@ -289,6 +334,14 @@ class GroundStationNode(Node):
         # image is the top. Flip once here so everything downstream can treat
         # the map like an ordinary picture.
         self.map_image = np.flipud(img).copy()
+
+        # Over a photo: scanned ground gets a light wash so "where have we
+        # looked" still reads, walls stay dark, unknown lets the photo through.
+        overlay = np.zeros((h, w, 4), dtype=np.uint8)
+        overlay[grid == 0] = (*MAP_FREE, 70)
+        overlay[grid > 50] = (*MAP_WALL, 200)
+        self.map_overlay = np.flipud(overlay).copy()
+
         self.map_resolution = msg.info.resolution
         self.map_origin = (msg.info.origin.position.x, msg.info.origin.position.y)
         self.map_frame = msg.header.frame_id
@@ -459,8 +512,13 @@ class MapPage(QWidget):
         self.show_trail = True
         self.show_contacts = True
         self.zoom = 1.0
+        self.show_aerial = node.aerial_image is not None
+        self._aerial_pixmap: Optional[QPixmap] = None
         self.setStyleSheet(f"background:{BASE};")
+        # Pixels per metre, the widget position of the view's top-left, and
+        # the map-frame coordinates (min x, max y) that sit at that corner.
         self._scale, self._ox, self._oy = 1.0, 0.0, 0.0
+        self._vx0, self._vy1 = 0.0, 0.0
 
         # Operator-drawn search area.
         self.draw_mode = False
@@ -473,25 +531,39 @@ class MapPage(QWidget):
         self.pip_mode = (self.pip_mode + 1) % len(self.PIP_MODES)
 
     # -- coordinate transforms --------------------------------------------
+    # Everything is placed in map-frame metres rather than SLAM grid pixels,
+    # so the aerial photo and the SLAM grid - two images with different
+    # extents and resolutions - can share one view.
     def _world_to_widget(self, x: float, y: float) -> QPointF:
-        res = self.node.map_resolution
-        ox, oy = self.node.map_origin
-        h = self.node.map_image.shape[0]
-        px = (x - ox) / res
-        py = h - (y - oy) / res
-        return QPointF(self._ox + px * self._scale, self._oy + py * self._scale)
+        return QPointF(self._ox + (x - self._vx0) * self._scale,
+                       self._oy + (self._vy1 - y) * self._scale)
 
     def _widget_to_world(self, pt) -> Optional[Tuple[float, float]]:
         """Inverse of the above. Returns None before a map exists, since
-        without resolution and origin there is nothing to convert against."""
+        the view is not laid out until then."""
         if self.node.map_image is None or self._scale == 0:
             return None
+        return (self._vx0 + (pt.x() - self._ox) / self._scale,
+                self._vy1 - (pt.y() - self._oy) / self._scale)
+
+    def _slam_bounds(self) -> Tuple[float, float, float, float]:
+        h, w, _ = self.node.map_image.shape
         res = self.node.map_resolution
         ox, oy = self.node.map_origin
-        h = self.node.map_image.shape[0]
-        px = (pt.x() - self._ox) / self._scale
-        py = (pt.y() - self._oy) / self._scale
-        return px * res + ox, (h - py) * res + oy
+        return ox, oy, ox + w * res, oy + h * res
+
+    def _view_bounds(self) -> Tuple[float, float, float, float]:
+        """The area to fit on screen: the SLAM map, grown to take in the whole
+        aerial photo when it is shown, so unexplored ground can be tasked."""
+        x0, y0, x1, y1 = self._slam_bounds()
+        if self.show_aerial and self.node.aerial_bounds:
+            ax0, ay0, ax1, ay1 = self.node.aerial_bounds
+            x0, y0, x1, y1 = min(x0, ax0), min(y0, ay0), max(x1, ax1), max(y1, ay1)
+        return x0, y0, x1, y1
+
+    def _rect_for(self, x0: float, y0: float, x1: float, y1: float) -> QRectF:
+        """Widget rectangle covering a map-frame rectangle."""
+        return QRectF(self._world_to_widget(x0, y1), self._world_to_widget(x1, y0))
 
     # -- area drawing ------------------------------------------------------
     def begin_draw(self):
@@ -545,27 +617,43 @@ class MapPage(QWidget):
                        "No map. Start the simulation with nav2:=true")
             return
 
-        img = self.node.map_image
-        h, w, _ = img.shape
-        qimg = QImage(img.data, w, h, 3 * w, QImage.Format_RGB888).copy()
-
         # Fit to the widget, then apply zoom, keeping the drone centred when
         # zoomed in  panning a map by hand during a search is a distraction.
         # Drone-follow is suspended while drawing: a map that moves under the
         # cursor makes it impossible to place a corner.
-        fit = min(self.width() / w, self.height() / h)
+        vx0, vy0, vx1, vy1 = self._view_bounds()
+        span_x, span_y = max(vx1 - vx0, 1e-6), max(vy1 - vy0, 1e-6)
+        self._vx0, self._vy1 = vx0, vy1
+        fit = min(self.width() / span_x, self.height() / span_y)
         self._scale = fit * self.zoom
         if self.zoom > 1.0 and self.node.drone_xy and not self.draw_mode:
-            dx = (self.node.drone_xy[0] - self.node.map_origin[0]) / self.node.map_resolution
-            dy = h - (self.node.drone_xy[1] - self.node.map_origin[1]) / self.node.map_resolution
-            self._ox = self.width() / 2 - dx * self._scale
-            self._oy = self.height() / 2 - dy * self._scale
+            dx, dy = self.node.drone_xy
+            self._ox = self.width() / 2 - (dx - vx0) * self._scale
+            self._oy = self.height() / 2 - (vy1 - dy) * self._scale
         else:
-            self._ox = (self.width() - w * self._scale) / 2
-            self._oy = (self.height() - h * self._scale) / 2
+            self._ox = (self.width() - span_x * self._scale) / 2
+            self._oy = (self.height() - span_y * self._scale) / 2
 
-        p.drawPixmap(QRectF(self._ox, self._oy, w * self._scale, h * self._scale),
-                     QPixmap.fromImage(qimg), QRectF(0, 0, w, h))
+        slam_rect = self._rect_for(*self._slam_bounds())
+        if self.show_aerial and self.node.aerial_image is not None:
+            if self._aerial_pixmap is None:
+                a = self.node.aerial_image
+                ah, aw, _ = a.shape
+                self._aerial_pixmap = QPixmap.fromImage(
+                    QImage(a.data, aw, ah, 3 * aw, QImage.Format_RGB888).copy())
+            p.setRenderHint(QPainter.SmoothPixmapTransform)
+            p.drawPixmap(self._rect_for(*self.node.aerial_bounds), self._aerial_pixmap,
+                         QRectF(self._aerial_pixmap.rect()))
+            p.setRenderHint(QPainter.SmoothPixmapTransform, False)
+            img = self.node.map_overlay
+            h, w, _ = img.shape
+            qimg = QImage(img.data, w, h, 4 * w, QImage.Format_RGBA8888).copy()
+        else:
+            img = self.node.map_image
+            h, w, _ = img.shape
+            qimg = QImage(img.data, w, h, 3 * w, QImage.Format_RGB888).copy()
+
+        p.drawPixmap(slam_rect, QPixmap.fromImage(qimg), QRectF(0, 0, w, h))
 
         # Under the trail and contacts, so it reads as ground marking rather
         # than another overlay competing with the things that need a decision.
@@ -928,12 +1016,16 @@ class MainWindow(QMainWindow):
                 # names the action the next press performs, not the state.
                 ("CLR\nAREA" if m.area else "SET\nAREA",
                  self._toggle_area_draw, m.draw_mode or bool(m.area)),
+                # Only offered when a photo was loaded (see aerial_map).
+                ("AERIAL", lambda: setattr(m, "show_aerial", not m.show_aerial),
+                 m.show_aerial) if self.node.aerial_image is not None else blank,
             ]
         if self.page in (PAGE_VIS, PAGE_IR):
             v = self.vis_page if self.page == PAGE_VIS else self.ir_page
-            return [("FREEZE", v.toggle_freeze, v.frozen is not None)] + [blank] * 5
+            return ([("FREEZE", v.toggle_freeze, v.frozen is not None)]
+                    + [blank] * (RIGHT_SLOTS - 1))
         if self.page == PAGE_CONTACTS:
-            return [("RESUME", self._resume_search, False)] + [blank] * 5
+            return [("RESUME", self._resume_search, False)] + [blank] * (RIGHT_SLOTS - 1)
         return [blank] * RIGHT_SLOTS
 
     def _press_right(self, slot: int):
@@ -1104,4 +1196,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main() 
+    main()

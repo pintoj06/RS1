@@ -1,0 +1,7 @@
+image: blue_mountains_aerial.png
+frame: gazebo world
+world: large_demo
+x_min: -18.77
+x_max: 51.23
+y_min: -8.77
+y_max: 36.5
