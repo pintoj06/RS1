@@ -57,6 +57,7 @@ def add_robot(
     yaw='0.0',
     spawn_delay=0.0,
     takeoff_altitude=None,
+    extra_xacro_args='',
 ):
     """Add one robot instance to the launch description.
 
@@ -81,6 +82,7 @@ def add_robot(
             'prefix:=', frame_prefix,
             ' ',
             'gz_model_name:=', gz_model_name,
+            ' ', extra_xacro_args,
         ]),
         value_type=str,
     )
@@ -475,13 +477,16 @@ def generate_launch_description():
         # courier_node.py), so nothing else depends on this position.
         x='2.47',
         y='-1.10',
-        # Clear of the pad for the large courier, whose collision box
-        # reaches 0.15 m below its base_link.
-        z=PythonExpression(["'1.20' if ", large_courier, " else '1.08'"]),
+        # Puts the bottom of the care package on the pad (z = 1.03): it hangs
+        # 0.277 m below base_link on the large courier, 0.126 m on the
+        # standard Parrot (see the care_package calls in the two xacros).
+        z=PythonExpression(["'1.31' if ", large_courier, " else '1.16'"]),
         spawn_delay=9.0,
         # 2 m below the scout. The drone has gravity off and Nav2 only
         # drives it in x/y, so it holds this height for the whole flight.
         takeoff_altitude=8.0,
+        # The courier carries the care package to the confirmed contact.
+        extra_xacro_args='care_package:=true',
     )
 
     add_navigation_instance(

@@ -1,0 +1,110 @@
+<?xml version="1.0" ?>
+<!-- Care package carried by the courier drone (parrot2) to a confirmed contact.
+     A white first-aid case with green crosses and orange straps, held in a dark
+     mount plate with a release servo at the back, fixed under the hull.
+
+     Built from primitives so it needs no mesh. Visual only, no collision, like
+     the rest of the Parrot model.
+
+       prefix   frame prefix, e.g. parrot2_
+       s        size factor on the 0.16 x 0.12 x 0.09 m case (1 for the standard
+                Parrot, larger for courier_large)
+       x        x of the case centre in base_link
+       top_z    z of the top of the mount plate in base_link
+       mass     kg
+
+     Colours are inline rather than the shared names in common_properties: the
+     URDF to SDF conversion Gazebo does drops named-material colours.
+
+     The bottom of the case is at top_z - 0.098 * s. Keep it above the downward
+     camera's lens (camera_link z) so the case never shows up in its images. -->
+<robot xmlns:xacro="http://ros.org/wiki/xacro">
+  <xacro:macro name="care_package" params="prefix s x top_z mass">
+
+    <xacro:property name="L" value="${0.16 * s}"/>   <!-- case length (x) -->
+    <xacro:property name="W" value="${0.12 * s}"/>   <!-- case width (y) -->
+    <xacro:property name="H" value="${0.09 * s}"/>   <!-- case height (z) -->
+    <xacro:property name="plate" value="${0.008 * s}"/>
+    <xacro:property name="t" value="${0.002 * s}"/>  <!-- decal / strap thickness -->
+    <!-- Case centre, relative to the top of the mount plate. -->
+    <xacro:property name="cz" value="${-plate - H / 2}"/>
+    <xacro:property name="arm" value="${0.6 * W}"/>  <!-- first-aid cross arm length -->
+    <xacro:property name="bar" value="${0.2 * W}"/>  <!-- first-aid cross arm width -->
+
+    <joint name="${prefix}care_package_joint" type="fixed">
+      <parent link="${prefix}base_link"/>
+      <child link="${prefix}care_package_link"/>
+      <origin xyz="${x} 0 ${top_z}" rpy="0 0 0"/>
+    </joint>
+
+    <link name="${prefix}care_package_link">
+      <inertial>
+        <origin xyz="0 0 ${cz}" rpy="0 0 0"/>
+        <mass value="${mass}"/>
+        <!-- Solid box -->
+        <inertia ixx="${mass / 12.0 * (W*W + H*H)}" ixy="0" ixz="0"
+                 iyy="${mass / 12.0 * (L*L + H*H)}" iyz="0"
+                 izz="${mass / 12.0 * (L*L + W*W)}"/>
+      </inertial>
+
+      <!-- Mount plate, bolted to the hull -->
+      <visual name="mount_plate">
+        <origin xyz="0 0 ${-plate / 2}" rpy="0 0 0"/>
+        <geometry><box size="${L + 0.02 * s} ${W + 0.02 * s} ${plate}"/></geometry>
+        <material name="care_package_dark"><color rgba="0.18 0.19 0.20 1"/></material>
+      </visual>
+
+      <!-- Release servo at the back of the plate -->
+      <visual name="release_servo">
+        <origin xyz="${-L / 2 - 0.012 * s} 0 ${-plate - 0.012 * s}" rpy="0 0 0"/>
+        <geometry><box size="${0.024 * s} ${0.04 * s} ${0.024 * s}"/></geometry>
+        <material name="care_package_black"><color rgba="0.03 0.03 0.03 1"/></material>
+      </visual>
+
+      <!-- Case -->
+      <visual name="case">
+        <origin xyz="0 0 ${cz}" rpy="0 0 0"/>
+        <geometry><box size="${L} ${W} ${H}"/></geometry>
+        <material name="care_package_white"><color rgba="0.92 0.93 0.94 1"/></material>
+      </visual>
+
+      <!-- Orange straps wrapping round the case, front and back -->
+      <xacro:macro name="care_package_strap" params="sx">
+        <visual name="strap_${'front' if sx > 0 else 'back'}">
+          <origin xyz="${sx * 0.35 * L} 0 ${cz - t / 2}" rpy="0 0 0"/>
+          <geometry><box size="${0.08 * L} ${W + 2 * t} ${H + t}"/></geometry>
+          <material name="care_package_orange"><color rgba="1.0 0.42 0.04 1"/></material>
+        </visual>
+      </xacro:macro>
+      <xacro:care_package_strap sx="1"/>
+      <xacro:care_package_strap sx="-1"/>
+
+      <!-- Green crosses on the bottom (seen from below) and on both sides -->
+      <visual name="cross_bottom_x">
+        <origin xyz="0 0 ${cz - H / 2 - t / 2}" rpy="0 0 0"/>
+        <geometry><box size="${arm} ${bar} ${t}"/></geometry>
+        <material name="care_package_green"><color rgba="0.0 0.62 0.25 1"/></material>
+      </visual>
+      <visual name="cross_bottom_y">
+        <origin xyz="0 0 ${cz - H / 2 - t / 2}" rpy="0 0 0"/>
+        <geometry><box size="${bar} ${arm} ${t}"/></geometry>
+        <material name="care_package_green"><color rgba="0.0 0.62 0.25 1"/></material>
+      </visual>
+      <xacro:macro name="care_package_side_cross" params="sy">
+        <visual name="cross_${'left' if sy > 0 else 'right'}_x">
+          <origin xyz="0 ${sy * (W / 2 + t / 2)} ${cz}" rpy="0 0 0"/>
+          <geometry><box size="${0.6 * H} ${t} ${bar * 0.75}"/></geometry>
+          <material name="care_package_green"><color rgba="0.0 0.62 0.25 1"/></material>
+        </visual>
+        <visual name="cross_${'left' if sy > 0 else 'right'}_z">
+          <origin xyz="0 ${sy * (W / 2 + t / 2)} ${cz}" rpy="0 0 0"/>
+          <geometry><box size="${bar * 0.75} ${t} ${0.6 * H}"/></geometry>
+          <material name="care_package_green"><color rgba="0.0 0.62 0.25 1"/></material>
+        </visual>
+      </xacro:macro>
+      <xacro:care_package_side_cross sy="1"/>
+      <xacro:care_package_side_cross sy="-1"/>
+    </link>
+
+  </xacro:macro>
+</robot>

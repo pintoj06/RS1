@@ -5,10 +5,13 @@
 <robot name="parrot_courier_large" xmlns:xacro="http://ros.org/wiki/xacro">
 
   <xacro:arg name="prefix" default=""/>
+  <!-- Care package under the hull; only the courier (parrot2) sets this. -->
+  <xacro:arg name="care_package" default="false"/>
   <xacro:property name="prefix" value="$(arg prefix)"/>
 
   <xacro:include filename="$(find 41068_ignition_bringup)/urdf_parrot/common_properties.urdf.xacro"/>
   <xacro:include filename="$(find 41068_ignition_bringup)/urdf_parrot/parrot.gazebo.xacro"/>
+  <xacro:include filename="$(find 41068_ignition_bringup)/urdf_parrot/care_package.urdf.xacro"/>
 
   <xacro:property name="r200_cam_rgb_px" value="0.005"/>
   <xacro:property name="r200_cam_rgb_py" value="0.018"/>
@@ -72,6 +75,12 @@
       </geometry>
     </visual>
   </link>
+
+  <!-- Below the hull, above and behind the camera lens (z -0.30). Bigger
+       than the standard Parrot's, but not the full 3x. -->
+  <xacro:if value="$(arg care_package)">
+    <xacro:care_package prefix="${prefix}" s="1.6" x="-0.03" top_z="-0.12" mass="0.6"/>
+  </xacro:if>
 
   <!-- Sensors moved outward so they sit clear of the larger body
        (top of body ~ +0.12 m, bottom ~ -0.15 m). -->

@@ -2,10 +2,13 @@
 <robot name="parrot" xmlns:xacro="http://ros.org/wiki/xacro">
 
   <xacro:arg name="prefix" default=""/>
+  <!-- Care package under the hull; only the courier (parrot2) sets this. -->
+  <xacro:arg name="care_package" default="false"/>
   <xacro:property name="prefix" value="$(arg prefix)"/>
   
   <xacro:include filename="$(find 41068_ignition_bringup)/urdf_parrot/common_properties.urdf.xacro"/>
   <xacro:include filename="$(find 41068_ignition_bringup)/urdf_parrot/parrot.gazebo.xacro"/>
+  <xacro:include filename="$(find 41068_ignition_bringup)/urdf_parrot/care_package.urdf.xacro"/>
 
   <xacro:property name="r200_cam_rgb_px" value="0.005"/>
   <xacro:property name="r200_cam_rgb_py" value="0.018"/>
@@ -58,6 +61,11 @@
       </geometry>
     </visual>
   </link>
+
+  <!-- Below the hull, above and behind the camera lens (z -0.2). -->
+  <xacro:if value="$(arg care_package)">
+    <xacro:care_package prefix="${prefix}" s="1.0" x="-0.01" top_z="-0.028" mass="0.25"/>
+  </xacro:if>
 
 
   <joint name="${prefix}imu_joint" type="fixed">
