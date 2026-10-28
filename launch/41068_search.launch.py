@@ -88,13 +88,13 @@ def generate_launch_description():
                     'to force a fixed spacing for testing.',
     ))
     # Height the drone flies at. The camera footprint - and so the leg spacing -
-    # is worked out from this and the field of view, so it MUST match the Parrot's
-    # spawn z in 41068_ignition.launch.py or the coverage maths will be wrong.
+    # is worked out from this and the field of view, so it MUST match the scout's
+    # takeoff_altitude in 41068_ignition.launch.py or the coverage maths will be wrong.
     ld.add_action(DeclareLaunchArgument(
         'flight_altitude',
         default_value='10.0',
-        description='Height the drone flies at (m). Must match the Parrot spawn '
-                    'height in 41068_ignition.launch.py.',
+        description='Height the drone flies at (m). Must match the scout\'s '
+                    'takeoff_altitude in 41068_ignition.launch.py.',
     ))
     ld.add_action(DeclareLaunchArgument(
         'overlap',

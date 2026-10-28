@@ -5,10 +5,12 @@ from launch.actions import (
     DeclareLaunchArgument,
     GroupAction,
     IncludeLaunchDescription,
+    RegisterEventHandler,
     SetEnvironmentVariable,
     TimerAction,
 )
 from launch.conditions import IfCondition
+from launch.event_handlers import OnProcessExit
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import Command, LaunchConfiguration, PathJoinSubstitution, PythonExpression
 from launch_ros.actions import Node
@@ -54,8 +56,14 @@ def add_robot(
     z,
     yaw='0.0',
     spawn_delay=0.0,
+    takeoff_altitude=None,
 ):
     """Add one robot instance to the launch description.
+
+    If takeoff_altitude is given, the robot is a drone spawned on its landing
+    pad: once it is in Gazebo, takeoff_node.py climbs it to that height. The
+    takeoff node is returned so Nav2 can wait for it (see
+    add_navigation_instance). Otherwise returns None.
 
     Convention used here:
       - ROS nodes/topics are under /<namespace>/...
@@ -137,6 +145,25 @@ def add_robot(
         condition=robot_enabled,
     ))
 
+    takeoff = None
+    if takeoff_altitude is not None:
+        takeoff = Node(
+            package='41068_ignition_bringup',
+            executable='takeoff_node.py',
+            namespace=namespace,
+            name='takeoff_node',
+            output='screen',
+            parameters=[{
+                'use_sim_time': use_sim_time,
+                'target_altitude': float(takeoff_altitude),
+            }],
+        )
+        # The spawner exits once the robot is in Gazebo.
+        ld.add_action(RegisterEventHandler(OnProcessExit(
+            target_action=robot_spawner,
+            on_exit=[takeoff],
+        )))
+
     ld.add_action(Node(
         package='ros_ign_bridge',
         executable='parameter_bridge',
@@ -150,6 +177,8 @@ def add_robot(
         condition=robot_enabled,
     ))
 
+    return takeoff
+
 
 def add_navigation_instance(
     ld,
@@ -160,7 +189,15 @@ def add_navigation_instance(
     robot_namespace,
     start_delay,
     nav2_config_suffix=None,
+    after_takeoff=None,
 ):
+    """Start SLAM/Nav2 for one robot.
+
+    start_delay counts from launch, or, if after_takeoff (a robot's takeoff
+    node) is given, from the moment that drone finishes climbing. SLAM must
+    not start while the drone is still on the ute: its lidar would map the
+    ute's cab as a wall right next to the drone.
+    """
     nav_launch_arguments = {
         'use_sim_time': use_sim_time,
         'namespace': robot_namespace,
@@ -184,14 +221,21 @@ def add_navigation_instance(
 
     # Scope is important: without it, repeated IncludeLaunchDescription calls can
     # leak/overwrite launch configurations such as namespace and config suffix.
-    ld.add_action(TimerAction(
+    nav_timer = TimerAction(
         period=start_delay,
         actions=[GroupAction(
             scoped=True,
             actions=[nav_include],
         )],
         condition=_if_true(robot_arg),
-    ))
+    )
+    if after_takeoff is None:
+        ld.add_action(nav_timer)
+    else:
+        ld.add_action(RegisterEventHandler(OnProcessExit(
+            target_action=after_takeoff,
+            on_exit=[nav_timer],
+        )))
 
 
 def add_rviz_instance(
@@ -389,7 +433,10 @@ def generate_launch_description():
         spawn_delay=3.0,
     )
 
-    add_robot(
+    # Both drones start on their landing pads on the AeroAid ute
+    # (worlds/large_demo.sdf, model://aeroaid_ute). Spawn x/y are the pad
+    # centres; spawn z puts the drone on the pad surface (z = 1.03).
+    scout_takeoff = add_robot(
         ld,
         pkg_path=pkg_path,
         config_path=config_path,
@@ -401,13 +448,16 @@ def generate_launch_description():
         xacro_parts=['urdf_parrot', 'parrot.urdf.xacro'],
         bridge_config='gazebo_bridge_parrot1.yaml',
         localization_config='robot_localization_parrot1.yaml',
+        # Scout pad. The ground station's scout_spawn_x/y match this.
         x='2.0',
         y='0.0',
-        z='10',
+        z='1.08',
         spawn_delay=6.0,
+        # Must match flight_altitude in 41068_search.launch.py.
+        takeoff_altitude=10.0,
     )
 
-    add_robot(
+    courier_takeoff = add_robot(
         ld,
         pkg_path=pkg_path,
         config_path=config_path,
@@ -421,15 +471,17 @@ def generate_launch_description():
         ])],
         bridge_config='gazebo_bridge_parrot2.yaml',
         localization_config='robot_localization_parrot2.yaml',
-        # Same x as parrot1, 2m south in y - see courier_node.py's spawn-offset
-        # parameters, which rely on this exact relationship to translate a
-        # confirmed contact position between the two drones' odom frames.
-        x='2.0',
-        y='-2.0',
-        # 1m below the scout. The drone has gravity off and Nav2 only drives
-        # it in x/y, so it holds this spawn height for the whole flight.
-        z='8',
+        # Courier pad. Odom frames are the Gazebo world frame (see
+        # courier_node.py), so nothing else depends on this position.
+        x='2.47',
+        y='-1.10',
+        # Clear of the pad for the large courier, whose collision box
+        # reaches 0.15 m below its base_link.
+        z=PythonExpression(["'1.20' if ", large_courier, " else '1.08'"]),
         spawn_delay=9.0,
+        # 2 m below the scout. The drone has gravity off and Nav2 only
+        # drives it in x/y, so it holds this height for the whole flight.
+        takeoff_altitude=8.0,
     )
 
     add_navigation_instance(
@@ -447,7 +499,8 @@ def generate_launch_description():
         use_sim_time=use_sim_time,
         robot_arg='parrot',
         robot_namespace='parrot1',
-        start_delay=10.0,
+        start_delay=0.0,
+        after_takeoff=scout_takeoff,
     )
 
     add_navigation_instance(
@@ -456,7 +509,13 @@ def generate_launch_description():
         use_sim_time=use_sim_time,
         robot_arg='courier',
         robot_namespace='parrot2',
-        start_delay=26.0,
+        # Staggered behind the scout's stack so both don't come up at once:
+        # both drones take off together on LAUNCH, and starting two Nav2
+        # stacks a few seconds apart can leave one lifecycle manager waiting
+        # forever on a service DDS never discovers. The courier is not
+        # needed until a contact is confirmed, so it can afford to wait.
+        start_delay=16.0,
+        after_takeoff=courier_takeoff,
         nav2_config_suffix=PythonExpression([
             "'_parrot2_large' if ", large_courier, " else '_parrot2'",
         ]),

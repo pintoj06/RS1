@@ -26,6 +26,7 @@ install(
     scripts/yolo_person_detector.py
     scripts/search_node.py
     scripts/courier_node.py
+    scripts/takeoff_node.py
     scripts/capture_aerial_map.py
     UI/ground_station.py
   DESTINATION lib/${PROJECT_NAME}

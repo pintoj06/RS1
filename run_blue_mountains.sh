@@ -50,9 +50,22 @@ cleanup() {
     pkill -f search_node       2>/dev/null
     pkill -f courier_node      2>/dev/null
     pkill -f rviz2             2>/dev/null
+    pkill -f takeoff_node      2>/dev/null
+    # The rest of the sim launch. Killing Gazebo alone leaves these running,
+    # and a leftover Nav2 or SLAM node shares its name with the next run's.
+    local stack="ros2 launch $PKG|slam_toolbox|ekf_node|robot_state_publisher"
+    stack+="|controller_server|planner_server|smoother_server|behavior_server"
+    stack+="|bt_navigator|waypoint_follower|velocity_smoother|lifecycle_manager"
+    pkill -f "$stack"          2>/dev/null
     tmux kill-session -t "$SESSION" 2>/dev/null
+    sleep 2
+    pkill -9 -f "$stack|ign gazebo|parameter_bridge" 2>/dev/null
     sleep 1
     ros2 daemon stop >/dev/null 2>&1
+    # FastDDS shared-memory files left by processes that did not exit
+    # cleanly. Stale ones stop new nodes discovering each other's services
+    # (e.g. a Nav2 lifecycle manager waiting forever on smoother_server).
+    rm -f /dev/shm/fastrtps_* /dev/shm/sem.fastrtps_* 2>/dev/null
     ros2 daemon start >/dev/null 2>&1
     echo "Done."
 }
@@ -104,10 +117,10 @@ tab() {
     esac
 }
 
-echo "1/4  Simulation (Blue Mountains) + scout + courier + Nav2 + RViz"
+echo "1/4  Simulation (Blue Mountains) + scout + courier + Nav2"
 tab "sim" "ros2 launch $PKG 41068_ignition.launch.py \
     world:=$WORLD parrot:=true courier:=true large_courier:=$LARGE_COURIER \
-    husky:=false nav2:=true rviz:=true"
+    husky:=false nav2:=true rviz:=false"
 
 echo "     waiting ${SIM_WAIT}s for the simulation to come up..."
 sleep "$SIM_WAIT"
@@ -118,7 +131,8 @@ tab "gui" "ros2 run $PKG ground_station.py --ros-args \
 
 sleep 2
 
-# The scout idles until a search area is drawn in the ground station.
+# The scout idles until a search area is drawn in the ground station, and
+# both drones stay on the ute until LAUNCH is pressed there.
 echo "3/4  Scout search"
 tab "scout" "ros2 launch $PKG 41068_search.launch.py robot:=$SCOUT"
 
@@ -131,7 +145,11 @@ cat <<EOF
 
 All four stages started ($TERM_KIND).
 
-  The scout is idle. Drag a box on the ground station map to start the search.
+  Both drones are sitting on the ute. In the ground station:
+    1. SET AREA, then drag a box on the map (the aerial photo is shown
+       until SLAM starts).
+    2. LAUNCH (bottom right, or R). The drones climb to 10 m and 8 m,
+       SLAM and Nav2 come up, and the scout flies the search area.
 
   Check it worked:   ros2 node list
   Stop everything:   $0 kill

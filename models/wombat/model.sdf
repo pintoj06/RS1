@@ -22,6 +22,11 @@
             <scale>1 1 1</scale>
           </mesh>
         </geometry>
+        <!-- Body surface temperature, same as person1 in large_demo.sdf:
+             310 K = 37 C. -->
+        <plugin filename="ignition-gazebo-thermal-system" name="ignition::gazebo::systems::Thermal">
+          <temperature>310.0</temperature>
+        </plugin>
       </visual>
       <collision name="body">
         <pose>0 -0.1 0.29 0 0 0</pose>

@@ -163,7 +163,7 @@ Launch the Parrot only with SLAM, Nav2, and RViz:
 ros2 launch 41068_ignition_bringup 41068_ignition_parrot.launch.py slam:=true nav2:=true rviz:=true world:=large_demo
 ```
 
-The drone currently flies at a fixed altitude. You can change its spawn height in `launch/41068_ignition.launch.py` by finding the Parrot `add_robot(...)` block and changing the `z` argument.
+The drones start on their landing pads on the AeroAid ute (`models/aeroaid_ute`) and stay there until LAUNCH is pressed in the ground station. Then `scripts/takeoff_node.py` climbs each one to a fixed flight altitude, and SLAM and Nav2 start once it is up. To have them climb straight away without the ground station, publish the launch yourself: `ros2 topic pub --once --qos-durability transient_local /aeroaid/launch std_msgs/msg/Bool "{data: true}"`. You can change that altitude in `launch/41068_ignition.launch.py` by finding the Parrot `add_robot(...)` block and changing the `takeoff_altitude` argument (keep `flight_altitude` in `41068_search.launch.py` in step for the scout).
 
 The drone camera is set up to tilt downwards towards the ground. You can adjust this in `urdf_parrot/parrot.urdf.xacro` by finding the `camera_joint` and changing its pitch.
 

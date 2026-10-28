@@ -179,6 +179,9 @@ def make_sweep(min_x, max_x, min_y, max_y, spacing):
 
 
 class SearchNode(Node):
+    # Rejections of one waypoint before it is skipped, a second apart.
+    MAX_REJECTIONS = 5
+
     def __init__(self):
         super().__init__('search_node')
 
@@ -250,6 +253,8 @@ class SearchNode(Node):
         # operator has ruled on the contact.
         self.holding = False
         self.goal_handle = None
+        # Times in a row Nav2 has rejected the current waypoint (see goal_response).
+        self.rejections = 0
 
         self.nav_client= ActionClient(self, NavigateToPose, 'navigate_to_pose')
 
@@ -346,8 +351,8 @@ class SearchNode(Node):
         #
         # It is a parameter rather than a measurement because nothing in flight
         # changes it: Nav2 is a 2D planner and never commands height, so the
-        # drone holds whatever altitude it was spawned at. Keep this in step with
-        # the Parrot's spawn z in 41068_ignition.launch.py.
+        # drone holds whatever altitude takeoff_node.py climbed it to. Keep this
+        # in step with the scout's takeoff_altitude in 41068_ignition.launch.py.
         self.declare_parameter('flight_altitude', 10.0)           # metres
         self.declare_parameter('coverage_resolution', 0.5)       # metres per cell
 
@@ -390,6 +395,8 @@ class SearchNode(Node):
         area_qos = QoSProfile(depth=1,
                               reliability=QoSReliabilityPolicy.RELIABLE,
                               durability=QoSDurabilityPolicy.TRANSIENT_LOCAL)
+        # An area that arrived before the map frame existed (see on_area_request).
+        self.pending_area = None
         self.create_subscription(
             PolygonStamped, 'search_area_request', self.on_area_request, area_qos)
 
@@ -410,13 +417,24 @@ class SearchNode(Node):
         # The ground station stamps the polygon in the scout's MAP frame; this
         # node plans in odom. Translation only: the two frames differ by an
         # offset with no rotation here, so shifting the corners is enough.
+        #
+        # The map frame only exists once SLAM is running, which is after
+        # takeoff and often later still (no lidar returns at survey height).
+        # The ground station sends areas drawn before then in odom instead,
+        # but if the frame is missing anyway the area is kept and retried
+        # from tick() rather than dropped.
         try:
             tf = self.tf_buffer.lookup_transform(
                 self.map_frame, msg.header.frame_id,
                 rclpy.time.Time(), timeout=Duration(seconds=0.5))
-        except Exception as exc:
-            self.get_logger().warn(f'Cannot transform search area: {exc}')
+        except Exception:
+            if self.pending_area is None:
+                self.get_logger().info(
+                    'Search area received; it will be used once the drone '
+                    'is airborne and SLAM is up.')
+            self.pending_area = msg
             return
+        self.pending_area = None
 
         dx = tf.transform.translation.x
         dy = tf.transform.translation.y
@@ -637,6 +655,8 @@ class SearchNode(Node):
 
     def tick(self):
         """Called every second; sends the next waypoint to Nav2 once it's ready and we're not already flying to one."""
+        if self.pending_area is not None:  # drawn before takeoff, see on_area_request
+            self.on_area_request(self.pending_area)
         if not self.area_set:  # nothing to search until the operator draws it
             return
         if self.holding:
@@ -686,10 +706,23 @@ class SearchNode(Node):
         goal_handle = future.result()
 
         if not goal_handle.accepted:
+            # Nav2 rejects goals for a moment after its action server first
+            # appears, before bt_navigator is active. That is exactly when the
+            # first goal goes out if the area was drawn before LAUNCH, so try
+            # the same waypoint again on the next tick before giving up on it.
+            self.rejections += 1
+            if self.rejections < self.MAX_REJECTIONS:
+                self.get_logger().warn(
+                    f'Nav2 rejected that goal ({self.rejections}/'
+                    f'{self.MAX_REJECTIONS}). Retrying.')
+                self.busy = False
+                return
             self.get_logger().warn('Nav2 rejected that goal. Skipping it.')
+            self.rejections = 0
             self.next_waypoint()
             return
 
+        self.rejections = 0
         self.goal_handle = goal_handle
         if self.holding:
             # Hold arrived while this goal was still being accepted.
@@ -976,14 +1009,14 @@ class SearchNode(Node):
         """Height of the camera above the ground, in metres.
 
         Read from the flight_altitude parameter. It deliberately does NOT come
-        from TF: Ignition's odometry publisher is planar, so /parrot1/odometry
-        reports z = 0.0 however high the drone flies, and the only z in the
+        from TF: the EKF does not fuse z, so odom -> base_link stays at
+        z = 0.0 however high the drone flies, and the only z in the
         odom -> camera_link chain is the camera's own 0.2 m mounting offset.
         Reading that gave a 0.2 m "altitude", a camera footprint smaller than
         one grid cell, and a coverage map that never marked anything at all.
 
         A parameter is the right answer rather than a stopgap: Nav2 is a 2D
-        planner and never commands height, so the drone holds its spawn
+        planner and never commands height, so the drone holds its takeoff
         altitude for the whole flight. The figure is constant and known.
         """
         return float(self.get_parameter('flight_altitude').value)

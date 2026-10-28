@@ -15,8 +15,12 @@ Slot allocation is deliberate and fixed:
     bottom row     contact ruling  always available, because a decision on a
                    possible person should never be more than one press away
 
-Keyboard equivalents: 1-4 left, F1-F6 right, Q/W/E bottom, Esc cancels an
-area drag.
+Keyboard equivalents: 1-4 left, F1-F6 right, Q/W/R bottom, Esc cancels an
+area drag. E raises a fake contact for testing the interface.
+
+The drones wait on their pads on the ute until LAUNCH is pressed. A search
+area can be drawn on the aerial photo before then; the scout flies it once
+it is airborne.
 
 Qt owns the event loop; rclpy is pumped from a QTimer (see main()). Never
 block inside a callback or the window freezes.
@@ -165,7 +169,11 @@ class GroundStationNode(Node):
         self.map_overlay: Optional[np.ndarray] = None
         self.map_resolution = 0.0
         self.map_origin = (0.0, 0.0)
-        self.map_frame = ""
+        # SLAM's map frame (slam_params_<robot>.yaml). Known up front so a
+        # search area drawn before SLAM starts can still be stamped in it;
+        # the map header confirms it once SLAM is running.
+        self.map_frame = f"{self.robot_name}_map"
+        self.odom_frame = f"{self.robot_name}_odom"
 
         # Optional aerial photo of the world to draw under the map, written by
         # scripts/capture_aerial_map.py. Empty = no photo, plain map as before.
@@ -175,6 +183,8 @@ class GroundStationNode(Node):
         self.declare_parameter("aerial_map", "")
         self.declare_parameter("scout_spawn_x", 2.0)
         self.declare_parameter("scout_spawn_y", 0.0)
+        self.spawn_xy = (float(self.get_parameter("scout_spawn_x").value),
+                         float(self.get_parameter("scout_spawn_y").value))
         self.aerial_image: Optional[np.ndarray] = None   # RGB
         self.aerial_bounds: Optional[Tuple[float, float, float, float]] = None
         self._load_aerial(str(self.get_parameter("aerial_map").value))
@@ -230,6 +240,12 @@ class GroundStationNode(Node):
         self.area_pub = self.create_publisher(
             PolygonStamped, "search_area_request", hold_qos)
 
+        # Lifts both drones off the ute (scripts/takeoff_node.py). Absolute,
+        # since the courier listens too, and transient local so a takeoff
+        # node that is slow to start still gets the press.
+        self.launch_pub = self.create_publisher(Bool, "/aeroaid/launch", hold_qos)
+        self.launched = False
+
         self.create_timer(0.1, self._poll_pose)
 
         self.get_logger().info(f"Ground station up for {self.robot_name}")
@@ -253,8 +269,7 @@ class GroundStationNode(Node):
             self.get_logger().warn(f"No aerial map ({path}): {exc}")
             return
 
-        sx = float(self.get_parameter("scout_spawn_x").value)
-        sy = float(self.get_parameter("scout_spawn_y").value)
+        sx, sy = self.spawn_xy
         self.aerial_image = np.ascontiguousarray(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
         # World -> map frame is a pure shift by the spawn point: SLAM starts
         # its map where the scout starts, with no rotation.
@@ -354,17 +369,24 @@ class GroundStationNode(Node):
         pull those apart. Looking up into whatever frame the map header
         declares keeps the drone marker on the map over a long mission.
         """
-        if not self.map_frame:
-            return
         try:
             tf = self.tf_buffer.lookup_transform(
                 self.map_frame, self.base_frame, rclpy.time.Time(),
                 timeout=Duration(seconds=0.05))
+            x = tf.transform.translation.x
+            y = tf.transform.translation.y
         except Exception:
-            return  # normal at startup, before transforms flow
-
-        x = tf.transform.translation.x
-        y = tf.transform.translation.y
+            # No map frame until SLAM starts, which is after takeoff. Until
+            # then use odom, which is the Gazebo world frame, shifted by the
+            # spawn point into where the map frame will be.
+            try:
+                tf = self.tf_buffer.lookup_transform(
+                    self.odom_frame, self.base_frame, rclpy.time.Time(),
+                    timeout=Duration(seconds=0.05))
+            except Exception:
+                return  # normal at startup, before transforms flow
+            x = tf.transform.translation.x - self.spawn_xy[0]
+            y = tf.transform.translation.y - self.spawn_xy[1]
         self.drone_xy = (x, y)
 
         q = tf.transform.rotation
@@ -381,6 +403,13 @@ class GroundStationNode(Node):
         self.holding = hold
         self.hold_pub.publish(Bool(data=hold))
         self.get_logger().info("Search HOLD" if hold else "Search resumed")
+
+    def launch(self):
+        if self.launched:
+            return
+        self.launched = True
+        self.launch_pub.publish(Bool(data=True))
+        self.get_logger().info("LAUNCH: drones lifting off the ute")
 
     def send_decision(self, contact_id: int, decision: str):
         self.decision_pub.publish(String(data=f"{decision}:{contact_id}"))
@@ -406,15 +435,26 @@ class GroundStationNode(Node):
         """Send the operator-drawn box as a four-corner polygon.
 
         Stamped in this robot's map frame, same as the confirmed point, since
-        that is the frame the operator drew it in. search_node plans in the
+        that is the frame the operator drew it in (or in odom before there is
+        a map, see below). search_node plans in the
         odom frame, so it has to convert these corners through TF rather than
         use them raw.
         """
         msg = PolygonStamped()
-        msg.header.frame_id = self.map_frame
         msg.header.stamp = self.get_clock().now().to_msg()
-        for x, y in [(min_x, min_y), (max_x, min_y),
-                     (max_x, max_y), (min_x, max_y)]:
+        corners = [(min_x, min_y), (max_x, min_y), (max_x, max_y), (min_x, max_y)]
+        if self.map_image is None:
+            # Drawn on the aerial photo before SLAM has a map - usually while
+            # the drones are still on the ute, and SLAM gets no lidar returns
+            # at survey height, so the map frame may not exist for a while.
+            # Send it in odom instead, which is the Gazebo world frame: the
+            # same spawn shift the photo was placed with, the other way.
+            msg.header.frame_id = self.odom_frame
+            sx, sy = self.spawn_xy
+            corners = [(x + sx, y + sy) for x, y in corners]
+        else:
+            msg.header.frame_id = self.map_frame
+        for x, y in corners:
             msg.polygon.points.append(Point32(x=float(x), y=float(y), z=0.0))
         self.area_pub.publish(msg)
         self.get_logger().info(
@@ -539,12 +579,19 @@ class MapPage(QWidget):
                        self._oy + (self._vy1 - y) * self._scale)
 
     def _widget_to_world(self, pt) -> Optional[Tuple[float, float]]:
-        """Inverse of the above. Returns None before a map exists, since
-        the view is not laid out until then."""
-        if self.node.map_image is None or self._scale == 0:
+        """Inverse of the above. Returns None before there is anything to
+        show (no map and no aerial photo), since the view is not laid out
+        until then."""
+        if not self._has_view() or self._scale == 0:
             return None
         return (self._vx0 + (pt.x() - self._ox) / self._scale,
                 self._vy1 - (pt.y() - self._oy) / self._scale)
+
+    def _has_view(self) -> bool:
+        """Something to draw: the SLAM map, or the aerial photo on its own
+        while the drones are still on the ute and SLAM has not started."""
+        return (self.node.map_image is not None or
+                (self.show_aerial and self.node.aerial_image is not None))
 
     def _slam_bounds(self) -> Tuple[float, float, float, float]:
         h, w, _ = self.node.map_image.shape
@@ -555,6 +602,8 @@ class MapPage(QWidget):
     def _view_bounds(self) -> Tuple[float, float, float, float]:
         """The area to fit on screen: the SLAM map, grown to take in the whole
         aerial photo when it is shown, so unexplored ground can be tasked."""
+        if self.node.map_image is None:
+            return self.node.aerial_bounds
         x0, y0, x1, y1 = self._slam_bounds()
         if self.show_aerial and self.node.aerial_bounds:
             ax0, ay0, ax1, ay1 = self.node.aerial_bounds
@@ -611,9 +660,11 @@ class MapPage(QWidget):
         p.setRenderHint(QPainter.Antialiasing)
         p.fillRect(self.rect(), QColor(BASE))
 
-        if self.node.map_image is None:
+        if not self._has_view():
             p.setPen(QColor(MUTED))
             p.drawText(self.rect(), Qt.AlignCenter,
+                       "No map yet. SLAM starts once the drones are launched."
+                       if not self.node.launched else
                        "No map. Start the simulation with nav2:=true")
             return
 
@@ -634,7 +685,7 @@ class MapPage(QWidget):
             self._ox = (self.width() - span_x * self._scale) / 2
             self._oy = (self.height() - span_y * self._scale) / 2
 
-        slam_rect = self._rect_for(*self._slam_bounds())
+        have_map = self.node.map_image is not None
         if self.show_aerial and self.node.aerial_image is not None:
             if self._aerial_pixmap is None:
                 a = self.node.aerial_image
@@ -645,15 +696,18 @@ class MapPage(QWidget):
             p.drawPixmap(self._rect_for(*self.node.aerial_bounds), self._aerial_pixmap,
                          QRectF(self._aerial_pixmap.rect()))
             p.setRenderHint(QPainter.SmoothPixmapTransform, False)
-            img = self.node.map_overlay
-            h, w, _ = img.shape
-            qimg = QImage(img.data, w, h, 4 * w, QImage.Format_RGBA8888).copy()
-        else:
+            if have_map:
+                img = self.node.map_overlay
+                h, w, _ = img.shape
+                qimg = QImage(img.data, w, h, 4 * w, QImage.Format_RGBA8888).copy()
+        elif have_map:
             img = self.node.map_image
             h, w, _ = img.shape
             qimg = QImage(img.data, w, h, 3 * w, QImage.Format_RGB888).copy()
 
-        p.drawPixmap(slam_rect, QPixmap.fromImage(qimg), QRectF(0, 0, w, h))
+        if have_map:
+            p.drawPixmap(self._rect_for(*self._slam_bounds()),
+                         QPixmap.fromImage(qimg), QRectF(0, 0, w, h))
 
         # Under the trail and contacts, so it reads as ground marking rather
         # than another overlay competing with the things that need a decision.
@@ -937,7 +991,7 @@ class MainWindow(QMainWindow):
         bottom.addStretch(1)
         self.bottom_buttons[0].clicked.connect(lambda: self._rule("CONFIRMED"))
         self.bottom_buttons[1].clicked.connect(lambda: self._rule("DISMISSED"))
-        self.bottom_buttons[2].clicked.connect(self._simulate_contact)
+        self.bottom_buttons[2].clicked.connect(self.node.launch)
         grid.addLayout(bottom, 2, 1)
 
         grid.setColumnStretch(1, 1)
@@ -989,6 +1043,8 @@ class MainWindow(QMainWindow):
                       lambda n=i: self._press_right(n))
         QShortcut(QKeySequence("Q"), self, lambda: self._rule("CONFIRMED"))
         QShortcut(QKeySequence("W"), self, lambda: self._rule("DISMISSED"))
+        QShortcut(QKeySequence("R"), self, self.node.launch)
+        # Fake contact for testing the interface; keyboard only.
         QShortcut(QKeySequence("E"), self, self._simulate_contact)
         # Escape stands down an armed area draw without setting one.
         QShortcut(QKeySequence("Escape"), self, self._cancel_draw)
@@ -1059,7 +1115,12 @@ class MainWindow(QMainWindow):
         can_rule = sel is not None and sel.status == "UNCONFIRMED"
         self.bottom_buttons[0].configure("CONFIRM", CONFIRM, enabled=can_rule)
         self.bottom_buttons[1].configure("DISMISS", RED, enabled=can_rule)
-        self.bottom_buttons[2].configure("SIM", MUTED)
+        # Lit until pressed, then stays down: the drones cannot go back
+        # onto the ute from here.
+        if self.node.launched:
+            self.bottom_buttons[2].configure("AIRBORNE", MUTED, enabled=False)
+        else:
+            self.bottom_buttons[2].configure("LAUNCH", CONFIRM, boxed=True)
 
     # -- behaviour ---------------------------------------------------------
     def _selected(self) -> Optional[Contact]:

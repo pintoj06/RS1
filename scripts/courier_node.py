@@ -58,7 +58,7 @@ class CourierNode(Node):
 
         # Every drone's odom frame is the Gazebo world frame: the odometry
         # plugin reports world pose, so at spawn parrot1 reads (2, 0) and
-        # parrot2 reads (2, -2) - not (0, 0). A world point, or a point in
+        # parrot2 reads (2.47, -1.10) - not (0, 0). A world point, or a point in
         # the scout's odom frame, is therefore already in this robot's odom
         # frame with no spawn offset.
         self.delivery_point = (
