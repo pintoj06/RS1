@@ -1,0 +1,11 @@
+<?xml version="1.0" ?>
+<!-- The courier's care package as its own Gazebo model, so it can be released
+     and fall (see care_package.urdf.xacro). Spawned by 41068_ignition.launch.py
+     as <gz_model_name>_care_package at the courier's spawn pose.
+
+     variant: 'standard' or 'large', matching the courier model. -->
+<robot name="care_package" xmlns:xacro="http://ros.org/wiki/xacro">
+  <xacro:arg name="variant" default="standard"/>
+  <xacro:include filename="$(find 41068_ignition_bringup)/urdf_parrot/care_package.urdf.xacro"/>
+  <xacro:care_package_case variant="$(arg variant)"/>
+</robot>

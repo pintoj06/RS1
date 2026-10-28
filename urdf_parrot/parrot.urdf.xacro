@@ -2,7 +2,7 @@
 <robot name="parrot" xmlns:xacro="http://ros.org/wiki/xacro">
 
   <xacro:arg name="prefix" default=""/>
-  <!-- Care package under the hull; only the courier (parrot2) sets this. -->
+  <!-- Carry a droppable care package; only the courier (parrot2) sets this. -->
   <xacro:arg name="care_package" default="false"/>
   <xacro:property name="prefix" value="$(arg prefix)"/>
   
@@ -62,9 +62,9 @@
     </visual>
   </link>
 
-  <!-- Below the hull, above and behind the camera lens (z -0.2). -->
+  <!-- Mount for the care package, and the joint that holds and releases it. -->
   <xacro:if value="$(arg care_package)">
-    <xacro:care_package prefix="${prefix}" s="1.0" x="-0.01" top_z="-0.028" mass="0.25"/>
+    <xacro:care_package_mount prefix="${prefix}" gz_model_name="${gz_model_name}" variant="standard"/>
   </xacro:if>
 
 

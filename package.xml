@@ -12,6 +12,7 @@
   <!-- ROS IGN -->
   <depend>ros_ign_interfaces</depend>
   <depend>ros_ign_gazebo</depend>
+  <depend>ros_gz_sim</depend>
   <depend>ros_ign_bridge</depend>
 
   <!-- Other -->

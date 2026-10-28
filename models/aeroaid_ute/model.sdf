@@ -19,9 +19,11 @@
         <pose>0.4 0 1.47 0 0 0</pose>
         <geometry><box><size>1.4 1.66 0.74</size></box></geometry>
       </collision>
+      <!-- Top at z 1.0, the tray bed in the mesh, so the pads (top 1.03) are
+           what the drones sit on. It used to reach 1.10 and bury them. -->
       <collision name="tray">
-        <pose>-1.6 0 0.975 0 0 0</pose>
-        <geometry><box><size>2.3 1.85 0.25</size></box></geometry>
+        <pose>-1.6 0 0.925 0 0 0</pose>
+        <geometry><box><size>2.3 1.85 0.15</size></box></geometry>
       </collision>
       <collision name="courier_pad">
         <pose>-1.97 0 1.015 0 0 0</pose>

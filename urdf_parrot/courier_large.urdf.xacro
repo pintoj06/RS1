@@ -5,7 +5,7 @@
 <robot name="parrot_courier_large" xmlns:xacro="http://ros.org/wiki/xacro">
 
   <xacro:arg name="prefix" default=""/>
-  <!-- Care package under the hull; only the courier (parrot2) sets this. -->
+  <!-- Carry a droppable care package; only the courier (parrot2) sets this. -->
   <xacro:arg name="care_package" default="false"/>
   <xacro:property name="prefix" value="$(arg prefix)"/>
 
@@ -76,10 +76,9 @@
     </visual>
   </link>
 
-  <!-- Below the hull, above and behind the camera lens (z -0.30). Bigger
-       than the standard Parrot's, but not the full 3x. -->
+  <!-- Mount for the care package, and the joint that holds and releases it. -->
   <xacro:if value="$(arg care_package)">
-    <xacro:care_package prefix="${prefix}" s="1.6" x="-0.03" top_z="-0.12" mass="0.6"/>
+    <xacro:care_package_mount prefix="${prefix}" gz_model_name="${gz_model_name}" variant="large"/>
   </xacro:if>
 
   <!-- Sensors moved outward so they sit clear of the larger body

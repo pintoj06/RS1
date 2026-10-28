@@ -57,7 +57,7 @@ def add_robot(
     yaw='0.0',
     spawn_delay=0.0,
     takeoff_altitude=None,
-    extra_xacro_args='',
+    care_package=None,
 ):
     """Add one robot instance to the launch description.
 
@@ -65,6 +65,12 @@ def add_robot(
     pad: once it is in Gazebo, takeoff_node.py climbs it to that height. The
     takeoff node is returned so Nav2 can wait for it (see
     add_navigation_instance). Otherwise returns None.
+
+    If care_package is given ('standard' or 'large', to match the drone
+    model), the drone carries a care package it can drop: its xacro gets
+    care_package:=true, and the package is spawned as its own Gazebo model,
+    <gz_model_name>_care_package, at the drone's spawn pose. See
+    urdf_parrot/care_package.urdf.xacro.
 
     Convention used here:
       - ROS nodes/topics are under /<namespace>/...
@@ -82,7 +88,8 @@ def add_robot(
             'prefix:=', frame_prefix,
             ' ',
             'gz_model_name:=', gz_model_name,
-            ' ', extra_xacro_args,
+            ' ',
+            'care_package:=', 'false' if care_package is None else 'true',
         ]),
         value_type=str,
     )
@@ -147,6 +154,35 @@ def add_robot(
         condition=robot_enabled,
     ))
 
+    # Started once the robot is in Gazebo (the spawner exits when it is).
+    after_spawn = []
+
+    if care_package is not None:
+        # Same pose as the drone: the package model's frame is the drone's
+        # base_link, and the drone's DetachableJoint takes hold of it as soon
+        # as it appears.
+        # ros_gz_sim rather than ros_ign_gazebo: the ros_ign_gazebo create is
+        # a shell wrapper that re-splits its arguments, which breaks -string.
+        after_spawn.append(Node(
+            package='ros_gz_sim',
+            executable='create',
+            name='spawn_' + namespace + '_care_package',
+            output='screen',
+            parameters=[{'use_sim_time': use_sim_time}],
+            arguments=[
+                '-string', Command([
+                    'xacro ',
+                    PathJoinSubstitution([pkg_path, 'urdf_parrot', 'care_package_model.urdf.xacro']),
+                    ' variant:=', care_package,
+                ]),
+                '-name', gz_model_name + '_care_package',
+                '-x', x,
+                '-y', y,
+                '-z', z,
+                '-Y', yaw,
+            ],
+        ))
+
     takeoff = None
     if takeoff_altitude is not None:
         takeoff = Node(
@@ -160,10 +196,12 @@ def add_robot(
                 'target_altitude': float(takeoff_altitude),
             }],
         )
-        # The spawner exits once the robot is in Gazebo.
+        after_spawn.append(takeoff)
+
+    if after_spawn:
         ld.add_action(RegisterEventHandler(OnProcessExit(
             target_action=robot_spawner,
-            on_exit=[takeoff],
+            on_exit=after_spawn,
         )))
 
     ld.add_action(Node(
@@ -479,14 +517,15 @@ def generate_launch_description():
         y='-1.10',
         # Puts the bottom of the care package on the pad (z = 1.03): it hangs
         # 0.277 m below base_link on the large courier, 0.126 m on the
-        # standard Parrot (see the care_package calls in the two xacros).
+        # standard Parrot (see care_package_dims in care_package.urdf.xacro).
         z=PythonExpression(["'1.31' if ", large_courier, " else '1.16'"]),
         spawn_delay=9.0,
         # 2 m below the scout. The drone has gravity off and Nav2 only
         # drives it in x/y, so it holds this height for the whole flight.
         takeoff_altitude=8.0,
-        # The courier carries the care package to the confirmed contact.
-        extra_xacro_args='care_package:=true',
+        # The courier carries the care package and drops it on the
+        # confirmed contact (courier_node.py).
+        care_package=PythonExpression(["'large' if ", large_courier, " else 'standard'"]),
     )
 
     add_navigation_instance(
