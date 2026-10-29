@@ -17,7 +17,10 @@ from geometry_msgs.msg import Point, PolygonStamped, PoseStamped
 from nav2_msgs.action import NavigateToPose
 # OccupancyGrid is the standard ROS "2D grid of values" message. RViz draws it
 # as a coloured overlay, so we use it to show which ground has been searched.
-from nav_msgs.msg import OccupancyGrid
+# Path is the standard type for a planned route, so anything that wants to
+# draw the sweep (the ground station) can read it without knowing about
+# RViz markers.
+from nav_msgs.msg import OccupancyGrid, Path
 from rclpy.action import ActionClient
 # CameraInfo carries the camera's focal length and image size, from which the
 # real field of view can be worked out - no need to copy numbers from the xacro.
@@ -234,6 +237,9 @@ def make_sweep(min_x, max_x, min_y, max_y, spacing):
 
 
 class SearchNode(Node):
+    # Rejections of one waypoint before it is skipped, a second apart.
+    MAX_REJECTIONS = 5
+
     def __init__(self):
         super().__init__('search_node')
 
@@ -270,11 +276,15 @@ class SearchNode(Node):
         self.declare_parameter('obstacle_clearance', 1.0)
         # Pieces of a split leg shorter than this are not worth flying.
         self.declare_parameter('min_leg_length', 1.5)
-        # Give up on a waypoint that has not been reached in this long. Without
-        # it, a goal inside an unreachable pocket (the hollow middle of a
-        # part-mapped mountain, say) keeps Nav2 planning longer and longer
-        # detours and the sweep stalls there indefinitely.
-        self.declare_parameter('goal_timeout', 90.0)   # seconds, 0 disables
+        # Give up on a waypoint only once the drone has stopped GETTING CLOSER
+        # to it for this long. An earlier version used a flat time limit from
+        # when the goal was sent, which was wrong: a sweep leg can be 30 m and
+        # the drone makes about 0.3 m/s, so a perfectly healthy leg took far
+        # longer than the limit and got abandoned a third of the way along.
+        # Measuring progress instead tells a slow leg apart from a stuck one.
+        self.declare_parameter('goal_stall_timeout', 60.0)  # seconds, 0 disables
+        # Getting this much closer counts as progress and resets the clock.
+        self.declare_parameter('goal_progress_threshold', 0.5)   # metres
         # Drop waypoints the drone cannot actually get to, worked out by
         # flooding outwards from its position across free costmap cells.
         self.declare_parameter('drop_unreachable', True)
@@ -285,6 +295,11 @@ class SearchNode(Node):
         # from the ground station (see on_area_request).
         self.declare_parameter('polygon', [0.0])
 
+        # True: hover at spawn and do nothing until the operator draws a search
+        # area in the ground station. False: start sweeping the launch-parameter
+        # area (polygon or min/max rectangle) straight away, as before.
+        self.declare_parameter('wait_for_area', True)
+
         robot_name= self.get_parameter('robot_name').value
         # Goals are stamped in the frame Nav2 plans in. That is now the odom
         # frame, not the SLAM map frame - see global_frame in the nav2 params.
@@ -294,6 +309,15 @@ class SearchNode(Node):
         # Build the search shape: an explicit polygon if one was given,
         # otherwise the rectangle from the min/max parameters.
         self.polygon = self._resolve_polygon()
+        # Whether there is an area to search yet. While waiting for the
+        # operator, self.polygon still holds the launch-parameter shape so the
+        # coverage grid has something to size itself to, but nothing flies,
+        # draws or measures coverage against it.
+        self.area_set = not self.get_parameter('wait_for_area').value
+        if not self.area_set:
+            self.get_logger().info(
+                'Idle: waiting for the operator to draw a search area '
+                'in the ground station.')
 
         # The sweep is deliberately NOT built here. Leg spacing comes from how
         # much ground the camera can see, which depends on the field of view -
@@ -305,8 +329,9 @@ class SearchNode(Node):
         self.points = []
         self.planned = False
         self.spacing = None
-        self.goal_started = None    # when the current goal was sent
-        self.timed_out = False      # set when we abandon one for taking too long
+        self.goal_best_dist = None  # closest the drone has got to this goal
+        self.goal_progress_at = None  # when it last got closer (seconds, node clock)
+        self.timed_out = False      # set when we abandon one as stuck
         self.home_index = None
 
         self.index = 0
@@ -316,6 +341,8 @@ class SearchNode(Node):
         # operator has ruled on the contact.
         self.holding = False
         self.goal_handle = None
+        # Times in a row Nav2 has rejected the current waypoint (see goal_response).
+        self.rejections = 0
 
         self.nav_client= ActionClient(self, NavigateToPose, 'navigate_to_pose')
 
@@ -412,8 +439,8 @@ class SearchNode(Node):
         #
         # It is a parameter rather than a measurement because nothing in flight
         # changes it: Nav2 is a 2D planner and never commands height, so the
-        # drone holds whatever altitude it was spawned at. Keep this in step with
-        # the Parrot's spawn z in 41068_ignition.launch.py.
+        # drone holds whatever altitude takeoff_node.py climbed it to. Keep this
+        # in step with the scout's takeoff_altitude in 41068_ignition.launch.py.
         self.declare_parameter('flight_altitude', 10.0)           # metres
         self.declare_parameter('coverage_resolution', 0.5)       # metres per cell
 
@@ -452,6 +479,12 @@ class SearchNode(Node):
         self._rebuild_coverage_grid()
 
         self.coverage_pub = self.create_publisher(OccupancyGrid, 'search_coverage', 10)
+        # Latched, so the ground station still gets the route if it starts
+        # up (or is restarted) after the sweep was planned.
+        path_qos = QoSProfile(depth=1,
+                              reliability=QoSReliabilityPolicy.RELIABLE,
+                              durability=QoSDurabilityPolicy.TRANSIENT_LOCAL)
+        self.path_pub = self.create_publisher(Path, 'search_path', path_qos)
         self.coverage_timer = self.create_timer(0.5, self.update_coverage)
 
         # Report the footprint periodically rather than once at startup: at
@@ -470,6 +503,8 @@ class SearchNode(Node):
         area_qos = QoSProfile(depth=1,
                               reliability=QoSReliabilityPolicy.RELIABLE,
                               durability=QoSDurabilityPolicy.TRANSIENT_LOCAL)
+        # An area that arrived before the map frame existed (see on_area_request).
+        self.pending_area = None
         self.create_subscription(
             PolygonStamped, 'search_area_request', self.on_area_request, area_qos)
 
@@ -490,17 +525,29 @@ class SearchNode(Node):
         # The ground station stamps the polygon in the scout's MAP frame; this
         # node plans in odom. Translation only: the two frames differ by an
         # offset with no rotation here, so shifting the corners is enough.
+        #
+        # The map frame only exists once SLAM is running, which is after
+        # takeoff and often later still (no lidar returns at survey height).
+        # The ground station sends areas drawn before then in odom instead,
+        # but if the frame is missing anyway the area is kept and retried
+        # from tick() rather than dropped.
         try:
             tf = self.tf_buffer.lookup_transform(
                 self.map_frame, msg.header.frame_id,
                 rclpy.time.Time(), timeout=Duration(seconds=0.5))
-        except Exception as exc:
-            self.get_logger().warn(f'Cannot transform search area: {exc}')
+        except Exception:
+            if self.pending_area is None:
+                self.get_logger().info(
+                    'Search area received; it will be used once the drone '
+                    'is airborne and SLAM is up.')
+            self.pending_area = msg
             return
+        self.pending_area = None
 
         dx = tf.transform.translation.x
         dy = tf.transform.translation.y
         self.polygon = [(x + dx, y + dy) for x, y in pts]
+        self.area_set = True
 
         # The coverage grid is sized to the polygon, so it has to be rebuilt -
         # otherwise progress would be measured against the old shape.
@@ -552,6 +599,10 @@ class SearchNode(Node):
         and this message keeps reporting spacing as though it were still
         flying - which reads like nothing is wrong.
         """
+        if not self.area_set:
+            self.get_logger().info(
+                'Still idle: draw a search area in the ground station to start.')
+            return
         if not self.planned:
             return
         if self.holding:
@@ -735,6 +786,7 @@ class SearchNode(Node):
             self.home_index = len(self.points) - 1
 
         self.planned = True
+        self._publish_path()
 
         sweep_deg = math.degrees(best_sweep_angle(self.polygon))
         self.get_logger().info(
@@ -769,25 +821,14 @@ class SearchNode(Node):
 
     def tick(self):
         """Called every second; sends the next waypoint to Nav2 once it's ready and we're not already flying to one."""
+        if self.pending_area is not None:  # drawn before takeoff, see on_area_request
+            self.on_area_request(self.pending_area)
+        if not self.area_set:  # nothing to search until the operator draws it
+            return
         if self.holding:
             return
         if self.busy: #goal is already in flight
-            # Abandon a waypoint that is taking far too long. A goal inside an
-            # unreachable pocket - the hollow middle of a part-mapped mountain,
-            # for instance - never fails outright: Nav2 keeps replanning longer
-            # and longer ways round and the sweep stalls there for good.
-            limit = float(self.get_parameter('goal_timeout').value)
-            if (limit > 0 and not self.holding and self.goal_started is not None
-                    and time.monotonic() - self.goal_started > limit):
-                self.get_logger().warn(
-                    f'Waypoint {self.index + 1}/{len(self.points)} not reached '
-                    f'in {limit:.0f} s - giving up on it and moving on. It is '
-                    f'probably unreachable (inside or behind an obstacle).')
-                self.timed_out = True
-                if self.goal_handle is not None:
-                    self.goal_handle.cancel_goal_async()
-                else:
-                    self.next_waypoint()
+            self._check_stalled()
             return
         # Plan on the first tick that has camera data, not in __init__.
         if not self.planned and not self.plan_sweep():
@@ -798,6 +839,49 @@ class SearchNode(Node):
             self.get_logger().info('Waiting for Nav2 to be ready...')
             return
         self.send_goal(self.points[self.index])
+
+    def _now(self):
+        """Seconds from the node's own clock, so this follows sim time."""
+        return self.get_clock().now().nanoseconds / 1e9
+
+    def _check_stalled(self):
+        """Abandon the current waypoint if the drone has stopped approaching it.
+
+        A goal in an unreachable pocket never fails outright - Nav2 just keeps
+        replanning longer ways round - so something has to call it. What that
+        something must NOT do is measure the whole leg against a fixed time:
+        sweep legs here run to 30 m at roughly 0.3 m/s, so a healthy leg takes
+        minutes and a stopwatch abandons it halfway. Distance to the goal is
+        the honest test - it falls steadily on a slow leg and flattens out on
+        a stuck one.
+        """
+        limit = float(self.get_parameter('goal_stall_timeout').value)
+        if limit <= 0 or self.holding or self.index >= len(self.points):
+            return
+        here = self._lookup_robot_xy()
+        if here is None:
+            return
+
+        gx, gy = self.points[self.index]
+        dist = math.hypot(gx - here[0], gy - here[1])
+        step = float(self.get_parameter('goal_progress_threshold').value)
+
+        if self.goal_best_dist is None or dist < self.goal_best_dist - step:
+            self.goal_best_dist = dist
+            self.goal_progress_at = self._now()
+            return
+
+        if self._now() - self.goal_progress_at > limit:
+            self.get_logger().warn(
+                f'Waypoint {self.index + 1}/{len(self.points)} has not got any '
+                f'closer for {limit:.0f} s (still {dist:.1f} m away) - giving up '
+                f'on it. It is probably unreachable, inside or behind an '
+                f'obstacle.')
+            self.timed_out = True
+            if self.goal_handle is not None:
+                self.goal_handle.cancel_goal_async()
+            else:
+                self.next_waypoint()
 
     def send_goal (self, point):
         """Send one waypoint to Nav2."""
@@ -817,7 +901,9 @@ class SearchNode(Node):
         goal.pose.pose.orientation.w = math.cos(yaw / 2.0)
 
         self.busy = True
-        self.goal_started = time.monotonic()
+        # Progress tracking, not a stopwatch on the whole leg.
+        self.goal_best_dist = None
+        self.goal_progress_at = self._now()
         self.timed_out = False
         self.get_logger().info (
             f'Waypoint {self.index +1}/{len(self.points)}: flying to ({x:.1f}, {y:.1f})'
@@ -834,10 +920,23 @@ class SearchNode(Node):
         goal_handle = future.result()
 
         if not goal_handle.accepted:
+            # Nav2 rejects goals for a moment after its action server first
+            # appears, before bt_navigator is active. That is exactly when the
+            # first goal goes out if the area was drawn before LAUNCH, so try
+            # the same waypoint again on the next tick before giving up on it.
+            self.rejections += 1
+            if self.rejections < self.MAX_REJECTIONS:
+                self.get_logger().warn(
+                    f'Nav2 rejected that goal ({self.rejections}/'
+                    f'{self.MAX_REJECTIONS}). Retrying.')
+                self.busy = False
+                return
             self.get_logger().warn('Nav2 rejected that goal. Skipping it.')
+            self.rejections = 0
             self.next_waypoint()
             return
 
+        self.rejections = 0
         self.goal_handle = goal_handle
         if self.holding:
             # Hold arrived while this goal was still being accepted.
@@ -947,6 +1046,8 @@ class SearchNode(Node):
         Rebuilt and republished every second so the waypoint colours update
         as the sweep progresses.
         """
+        if not self.area_set:
+            return
         stamp = self.get_clock().now().to_msg()
         markers = MarkerArray()
 
@@ -1226,14 +1327,14 @@ class SearchNode(Node):
         """Height of the camera above the ground, in metres.
 
         Read from the flight_altitude parameter. It deliberately does NOT come
-        from TF: Ignition's odometry publisher is planar, so /parrot1/odometry
-        reports z = 0.0 however high the drone flies, and the only z in the
+        from TF: the EKF does not fuse z, so odom -> base_link stays at
+        z = 0.0 however high the drone flies, and the only z in the
         odom -> camera_link chain is the camera's own 0.2 m mounting offset.
         Reading that gave a 0.2 m "altitude", a camera footprint smaller than
         one grid cell, and a coverage map that never marked anything at all.
 
         A parameter is the right answer rather than a stopgap: Nav2 is a 2D
-        planner and never commands height, so the drone holds its spawn
+        planner and never commands height, so the drone holds its takeoff
         altitude for the whole flight. The figure is constant and known.
         """
         return float(self.get_parameter('flight_altitude').value)
@@ -1259,6 +1360,8 @@ class SearchNode(Node):
 
     def update_coverage(self):
         """Mark the ground currently under the camera as searched."""
+        if not self.area_set:
+            return
         pos = self._lookup_robot_xy()
         if pos is None:
             return                       # TF not ready yet
@@ -1288,6 +1391,25 @@ class SearchNode(Node):
 
         self._publish_coverage()
 
+    def _publish_path(self):
+        """Publish the planned sweep so the ground station can draw it.
+
+        Sent once per plan rather than on a timer: the route only changes when
+        the sweep is replanned, and the publisher is latched so a ground
+        station starting later still receives it.
+        """
+        msg = Path()
+        msg.header.frame_id = self.map_frame
+        msg.header.stamp = self.get_clock().now().to_msg()
+        for x, y in self.points:
+            pose = PoseStamped()
+            pose.header = msg.header
+            pose.pose.position.x = float(x)
+            pose.pose.position.y = float(y)
+            pose.pose.orientation.w = 1.0
+            msg.poses.append(pose)
+        self.path_pub.publish(msg)
+
     def _publish_coverage(self):
         """Publish the coverage grid, and log the percentage now and then."""
         grid = OccupancyGrid()
@@ -1299,8 +1421,19 @@ class SearchNode(Node):
         grid.info.origin.position.x = self.cov_origin_x
         grid.info.origin.position.y = self.cov_origin_y
         grid.info.origin.orientation.w = 1.0
+        # Cells that are not part of the search go out as -1, OccupancyGrid's
+        # "unknown". The array itself only holds 0 and 100, which leaves a
+        # subscriber unable to tell "inside the area, not swept yet" from
+        # "outside the area, never meant to be swept" - and the grid is padded
+        # 5 m beyond the shape, so that difference is most of the edge. Anyone
+        # measuring progress from this message would read far too low a figure.
+        #
+        # -1 = not searchable (outside the shape, or blocked by an obstacle)
+        #  0 = inside the area, still to do
+        # 100 = swept
+        published = np.where(self.inside_mask, self.coverage, -1).astype(np.int8)
         # OccupancyGrid data is a flat row-major list, same order as the array.
-        grid.data = self.coverage.flatten().tolist()
+        grid.data = published.flatten().tolist()
         self.coverage_pub.publish(grid)
 
         # Measure progress against cells INSIDE the polygon only. The grid is

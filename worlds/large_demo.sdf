@@ -244,5 +244,13 @@
       <name>blue_mountains</name>
       <pose>0 0 0 0 0 0</pose>
     </include>
+    <!-- AeroAid ute base station. The drones spawn on its pads: this pose puts
+         the scout pad under parrot1's spawn (2, 0) and the courier pad under
+         parrot2's (2.47, -1.10) - see 41068_ignition.launch.py. -->
+    <include>
+      <uri>model://aeroaid_ute</uri>
+      <name>aeroaid_ute</name>
+      <pose>2.47 0.87 0 0 0 1.5708</pose>
+    </include>
   </world>
 </sdf>

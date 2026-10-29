@@ -6,14 +6,16 @@
 #
 #   ros2 launch 41068_ignition_bringup 41068_search.launch.py
 #
-# Leg spacing is worked out from the camera, so normally you only give the
-# area. For a 16 m box:
-#   ros2 launch 41068_ignition_bringup 41068_search.launch.py \
+# By default the drone idles until the operator draws a search area in the
+# ground station. To fly a fixed area without the ground station instead,
+# turn that off and give the area. Leg spacing is worked out from the camera.
+# For a 16 m box:
+#   ros2 launch 41068_ignition_bringup 41068_search.launch.py wait_for_area:=False \
 #       min_x:=-8.0 max_x:=8.0 min_y:=-8.0 max_y:=8.0
 #
 # Or an arbitrary polygon as a flat [x1,y1,x2,y2,...] list (overrides the
 # min/max rectangle). Note the quoting - the list has to survive the shell:
-#   ros2 launch 41068_ignition_bringup 41068_search.launch.py \
+#   ros2 launch 41068_ignition_bringup 41068_search.launch.py wait_for_area:=False \
 #       polygon:="[-8.0, -8.0, 8.0, -8.0, 8.0, 0.0, 0.0, 0.0, 0.0, 8.0, -8.0, 8.0]"
 
 from launch import LaunchDescription
@@ -39,8 +41,19 @@ def generate_launch_description():
         description='Use simulation clock. Must be True when running against Gazebo.',
     ))
 
+    # --- Where the search area comes from --------------------------------
+    # By default the drone idles until the operator draws an area in the
+    # ground station. Set this False to fly the min/max or polygon area below
+    # straight away instead (e.g. testing without the ground station).
+    ld.add_action(DeclareLaunchArgument(
+        'wait_for_area',
+        default_value='True',
+        description='Idle until the operator draws a search area in the ground '
+                    'station. False flies the launch-argument area immediately.',
+    ))
+
     # --- Search area: rectangle form -------------------------------------
-    # Used only when 'polygon' is left empty. Keep the area inside the world
+    # Only used when wait_for_area is False and 'polygon' is left empty. Keep the area inside the world
     # or the drone will be sent somewhere it cannot reach.
     ld.add_action(DeclareLaunchArgument(
         'min_x', default_value='-4.0', description='Search rectangle minimum x (m).'))
@@ -75,13 +88,13 @@ def generate_launch_description():
                     'to force a fixed spacing for testing.',
     ))
     # Height the drone flies at. The camera footprint - and so the leg spacing -
-    # is worked out from this and the field of view, so it MUST match the Parrot's
-    # spawn z in 41068_ignition.launch.py or the coverage maths will be wrong.
+    # is worked out from this and the field of view, so it MUST match the scout's
+    # takeoff_altitude in 41068_ignition.launch.py or the coverage maths will be wrong.
     ld.add_action(DeclareLaunchArgument(
         'flight_altitude',
         default_value='10.0',
-        description='Height the drone flies at (m). Must match the Parrot spawn '
-                    'height in 41068_ignition.launch.py.',
+        description='Height the drone flies at (m). Must match the scout\'s '
+                    'takeoff_altitude in 41068_ignition.launch.py.',
     ))
     ld.add_action(DeclareLaunchArgument(
         'overlap',
@@ -107,6 +120,7 @@ def generate_launch_description():
             'overlap': LaunchConfiguration('overlap'),
             'flight_altitude': LaunchConfiguration('flight_altitude'),
             'polygon': LaunchConfiguration('polygon'),
+            'wait_for_area': LaunchConfiguration('wait_for_area'),
         }],
         # This package publishes TF inside the robot namespace (/parrot1/tf).
         # Without these two remaps the node's TF lookups read the global /tf,

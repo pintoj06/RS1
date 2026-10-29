@@ -1,0 +1,71 @@
+<?xml version='1.0' encoding='utf-8'?>
+<sdf version="1.8">
+  <model name="aeroaid_ute">
+    <static>true</static>
+    <link name="body">
+      <visual name="visual">
+        <geometry>
+          <mesh>
+            <uri>model://aeroaid_ute/meshes/aeroaid_ute.obj</uri>
+            <scale>1 1 1</scale>
+          </mesh>
+        </geometry>
+      </visual>
+      <collision name="body_lower">
+        <pose>1.12 0 0.825 0 0 0</pose>
+        <geometry><box><size>3.0 1.85 0.55</size></box></geometry>
+      </collision>
+      <collision name="cab">
+        <pose>0.4 0 1.47 0 0 0</pose>
+        <geometry><box><size>1.4 1.66 0.74</size></box></geometry>
+      </collision>
+      <!-- Top at z 1.0, the tray bed in the mesh, so the pads (top 1.03) are
+           what the drones sit on. It used to reach 1.10 and bury them. -->
+      <collision name="tray">
+        <pose>-1.6 0 0.925 0 0 0</pose>
+        <geometry><box><size>2.3 1.85 0.15</size></box></geometry>
+      </collision>
+      <collision name="courier_pad">
+        <pose>-1.97 0 1.015 0 0 0</pose>
+        <geometry><box><size>1.4 1.4 0.03</size></box></geometry>
+      </collision>
+      <collision name="scout_pad">
+        <pose>-0.87 0.47 1.015 0 0 0</pose>
+        <geometry><box><size>0.8 0.8 0.03</size></box></geometry>
+      </collision>
+      <collision name="battery_locker">
+        <pose>-0.87 -0.47 1.22 0 0 0</pose>
+        <geometry><box><size>0.78 0.8 0.44</size></box></geometry>
+      </collision>
+      <collision name="headboard">
+        <pose>-0.42 0 1.45 0 0 0</pose>
+        <geometry><box><size>0.05 1.81 0.9</size></box></geometry>
+      </collision>
+      <collision name="laptop_desk">
+        <pose>-0.87 -1.15 0.985 0 0 0</pose>
+        <geometry><box><size>0.7 0.45 0.03</size></box></geometry>
+      </collision>
+      <collision name="wheel_fl">
+        <pose>1.95 0.8 0.39 1.5708 0 0</pose>
+        <geometry><cylinder><radius>0.39</radius><length>0.27</length></cylinder></geometry>
+      </collision>
+      <collision name="wheel_fr">
+        <pose>1.95 -0.8 0.39 1.5708 0 0</pose>
+        <geometry><cylinder><radius>0.39</radius><length>0.27</length></cylinder></geometry>
+      </collision>
+      <collision name="wheel_rl">
+        <pose>-1.15 0.8 0.39 1.5708 0 0</pose>
+        <geometry><cylinder><radius>0.39</radius><length>0.27</length></cylinder></geometry>
+      </collision>
+      <collision name="wheel_rr">
+        <pose>-1.15 -0.8 0.39 1.5708 0 0</pose>
+        <geometry><cylinder><radius>0.39</radius><length>0.27</length></cylinder></geometry>
+      </collision>
+    </link>
+    <!-- Landing targets in the model frame (top of pad surface):
+           courier pad (parrot2): -1.97  0.00  1.03
+           scout pad   (parrot1): -0.87  0.47  1.03
+         With the world pose used in large_demo (2.47 0.87 0, yaw 90 deg) these are
+         world (2.47, -1.10, 1.03) and (2.00, 0.00, 1.03), the drone spawn points. -->
+  </model>
+</sdf>

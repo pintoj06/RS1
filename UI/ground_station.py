@@ -15,13 +15,18 @@ Slot allocation is deliberate and fixed:
     bottom row     contact ruling  always available, because a decision on a
                    possible person should never be more than one press away
 
-Keyboard equivalents: 1-4 left, F1-F6 right, Q/W/E bottom, Esc cancels an
-area drag.
+Keyboard equivalents: 1-4 left, F1-F6 right, Q/W/R bottom, Esc cancels an
+area drag. E raises a fake contact for testing the interface.
+
+The drones wait on their pads on the ute until LAUNCH is pressed. A search
+area can be drawn on the aerial photo before then; the scout flies it once
+it is airborne.
 
 Qt owns the event loop; rclpy is pumped from a QTimer (see main()). Never
 block inside a callback or the window freezes.
 """
 
+import os
 import sys
 import time
 from collections import deque
@@ -44,6 +49,7 @@ import tf2_ros
 
 from cv_bridge import CvBridge
 import cv2
+import yaml
 
 from PyQt5.QtCore import QPointF, QRectF, Qt, QTimer
 from PyQt5.QtGui import (QColor, QFont, QImage, QKeySequence, QPainter, QPen,
@@ -61,27 +67,28 @@ from PyQt5.QtWidgets import (QApplication, QFrame, QGridLayout, QHBoxLayout,
 # loudest colour in the palette and is reserved for one thing only  a contact
 # nobody has ruled on yet. Nothing else is allowed to compete with it.
 # ---------------------------------------------------------------------------
-BASE = "#1C2229"
-PANEL = "#232B33"
-BEZEL = "#151A1F"
-LINE = "#333E49"
-TEXT = "#E4E9ED"
-MUTED = "#8A98A6"
-AMBER = "#E8A33D"
-GREEN = "#4CAF6D"
-RED = "#D9534F"
-CYAN = "#5AA9E6"
+BASE  = "#2B001E"   # display background, behind the map
+PANEL = "#160010"   # status strip, selected rows — recessed below the display
+BEZEL = "#220F1C"   # window surround and button faces
+LINE  = "#4A2A3C"   # borders and dividers, plum-tinted
+TEXT  = "#EDE6EA"   # primary text, warmed a touch so it sits on plum
+MUTED = "#9B8793"   # labels, secondary text, disabled
 
-MAP_UNKNOWN = (58, 66, 74)
-MAP_FREE = (226, 232, 238)
-MAP_WALL = (26, 31, 36)
+ALERT = "#D6FF00"   # unruled contact — the one thing demanding a decision
+CONFIRM = "#5AE1E6"   # confirmed, committed area, LINK OK
+RED   = "#FF4136"   # dismissed
+DRONE  = "#FFFFFF"   # drone marker and flight trail
+
+MAP_UNKNOWN = (62, 38, 54)      # unscanned, plum-dark
+MAP_FREE    = (188, 188, 188)   # swept and clear — #BCBCBC
+MAP_WALL    = (18, 18, 18)      # obstacle — #121212
 
 PAGE_MAP, PAGE_VIS, PAGE_IR, PAGE_CONTACTS = range(4)
 
 # Six option select buttons down the right bezel. The map page fills all six;
 # other pages leave the spare slots blank rather than reflowing, so a given
 # function stays in the same physical place.
-RIGHT_SLOTS = 6
+RIGHT_SLOTS = 7
 
 
 @dataclass
@@ -157,9 +164,30 @@ class GroundStationNode(Node):
         self._ai_stale_after_s = 2.0
 
         self.map_image: Optional[np.ndarray] = None
+        # Same grid as RGBA: unknown fully transparent, so an aerial photo
+        # underneath shows through wherever SLAM has not looked yet.
+        self.map_overlay: Optional[np.ndarray] = None
         self.map_resolution = 0.0
         self.map_origin = (0.0, 0.0)
-        self.map_frame = ""
+        # SLAM's map frame (slam_params_<robot>.yaml). Known up front so a
+        # search area drawn before SLAM starts can still be stamped in it;
+        # the map header confirms it once SLAM is running.
+        self.map_frame = f"{self.robot_name}_map"
+        self.odom_frame = f"{self.robot_name}_odom"
+
+        # Optional aerial photo of the world to draw under the map, written by
+        # scripts/capture_aerial_map.py. Empty = no photo, plain map as before.
+        # The photo is in Gazebo world coordinates while the map frame starts
+        # where the scout spawned, so the spawn point is needed to line them
+        # up. Keep it in step with parrot1's x/y in 41068_ignition.launch.py.
+        self.declare_parameter("aerial_map", "")
+        self.declare_parameter("scout_spawn_x", 2.0)
+        self.declare_parameter("scout_spawn_y", 0.0)
+        self.spawn_xy = (float(self.get_parameter("scout_spawn_x").value),
+                         float(self.get_parameter("scout_spawn_y").value))
+        self.aerial_image: Optional[np.ndarray] = None   # RGB
+        self.aerial_bounds: Optional[Tuple[float, float, float, float]] = None
+        self._load_aerial(str(self.get_parameter("aerial_map").value))
 
         self.drone_xy: Optional[Tuple[float, float]] = None
         self.drone_yaw = 0.0
@@ -212,9 +240,42 @@ class GroundStationNode(Node):
         self.area_pub = self.create_publisher(
             PolygonStamped, "search_area_request", hold_qos)
 
+        # Lifts both drones off the ute (scripts/takeoff_node.py). Absolute,
+        # since the courier listens too, and transient local so a takeoff
+        # node that is slow to start still gets the press.
+        self.launch_pub = self.create_publisher(Bool, "/aeroaid/launch", hold_qos)
+        self.launched = False
+
         self.create_timer(0.1, self._poll_pose)
 
         self.get_logger().info(f"Ground station up for {self.robot_name}")
+
+    def _load_aerial(self, path: str):
+        """Read the aerial photo and work out where it sits in the map frame.
+
+        Any problem is a warning, not a crash: the photo is a convenience and
+        the ground station is fully usable without it.
+        """
+        if not path:
+            return
+        try:
+            with open(path) as f:
+                meta = yaml.safe_load(f)
+            img_path = os.path.join(os.path.dirname(path), meta["image"])
+            bgr = cv2.imread(img_path)
+            if bgr is None:
+                raise IOError(f"cannot read {img_path}")
+        except Exception as exc:
+            self.get_logger().warn(f"No aerial map ({path}): {exc}")
+            return
+
+        sx, sy = self.spawn_xy
+        self.aerial_image = np.ascontiguousarray(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
+        # World -> map frame is a pure shift by the spawn point: SLAM starts
+        # its map where the scout starts, with no rotation.
+        self.aerial_bounds = (float(meta["x_min"]) - sx, float(meta["y_min"]) - sy,
+                              float(meta["x_max"]) - sx, float(meta["y_max"]) - sy)
+        self.get_logger().info(f"Aerial map loaded: {img_path}")
 
     def _on_rgb(self, msg: Image):
         try:
@@ -270,7 +331,7 @@ class GroundStationNode(Node):
         if count < self.person_min_pixels:
             return None
         x, y, w, h = cv2.boundingRect(hot.astype(np.uint8))
-        cv2.rectangle(frame, (x, y), (x + w, y + h), (61, 163, 232), 2)  # AMBER
+        cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 214), 2)  # ALERT
         return float(kelvin[hot].max()), count
 
     def _on_map(self, msg: OccupancyGrid):
@@ -288,6 +349,14 @@ class GroundStationNode(Node):
         # image is the top. Flip once here so everything downstream can treat
         # the map like an ordinary picture.
         self.map_image = np.flipud(img).copy()
+
+        # Over a photo: scanned ground gets a light wash so "where have we
+        # looked" still reads, walls stay dark, unknown lets the photo through.
+        overlay = np.zeros((h, w, 4), dtype=np.uint8)
+        overlay[grid == 0] = (*MAP_FREE, 70)
+        overlay[grid > 50] = (*MAP_WALL, 200)
+        self.map_overlay = np.flipud(overlay).copy()
+
         self.map_resolution = msg.info.resolution
         self.map_origin = (msg.info.origin.position.x, msg.info.origin.position.y)
         self.map_frame = msg.header.frame_id
@@ -300,17 +369,24 @@ class GroundStationNode(Node):
         pull those apart. Looking up into whatever frame the map header
         declares keeps the drone marker on the map over a long mission.
         """
-        if not self.map_frame:
-            return
         try:
             tf = self.tf_buffer.lookup_transform(
                 self.map_frame, self.base_frame, rclpy.time.Time(),
                 timeout=Duration(seconds=0.05))
+            x = tf.transform.translation.x
+            y = tf.transform.translation.y
         except Exception:
-            return  # normal at startup, before transforms flow
-
-        x = tf.transform.translation.x
-        y = tf.transform.translation.y
+            # No map frame until SLAM starts, which is after takeoff. Until
+            # then use odom, which is the Gazebo world frame, shifted by the
+            # spawn point into where the map frame will be.
+            try:
+                tf = self.tf_buffer.lookup_transform(
+                    self.odom_frame, self.base_frame, rclpy.time.Time(),
+                    timeout=Duration(seconds=0.05))
+            except Exception:
+                return  # normal at startup, before transforms flow
+            x = tf.transform.translation.x - self.spawn_xy[0]
+            y = tf.transform.translation.y - self.spawn_xy[1]
         self.drone_xy = (x, y)
 
         q = tf.transform.rotation
@@ -327,6 +403,13 @@ class GroundStationNode(Node):
         self.holding = hold
         self.hold_pub.publish(Bool(data=hold))
         self.get_logger().info("Search HOLD" if hold else "Search resumed")
+
+    def launch(self):
+        if self.launched:
+            return
+        self.launched = True
+        self.launch_pub.publish(Bool(data=True))
+        self.get_logger().info("LAUNCH: drones lifting off the ute")
 
     def send_decision(self, contact_id: int, decision: str):
         self.decision_pub.publish(String(data=f"{decision}:{contact_id}"))
@@ -352,15 +435,26 @@ class GroundStationNode(Node):
         """Send the operator-drawn box as a four-corner polygon.
 
         Stamped in this robot's map frame, same as the confirmed point, since
-        that is the frame the operator drew it in. search_node plans in the
+        that is the frame the operator drew it in (or in odom before there is
+        a map, see below). search_node plans in the
         odom frame, so it has to convert these corners through TF rather than
         use them raw.
         """
         msg = PolygonStamped()
-        msg.header.frame_id = self.map_frame
         msg.header.stamp = self.get_clock().now().to_msg()
-        for x, y in [(min_x, min_y), (max_x, min_y),
-                     (max_x, max_y), (min_x, max_y)]:
+        corners = [(min_x, min_y), (max_x, min_y), (max_x, max_y), (min_x, max_y)]
+        if self.map_image is None:
+            # Drawn on the aerial photo before SLAM has a map - usually while
+            # the drones are still on the ute, and SLAM gets no lidar returns
+            # at survey height, so the map frame may not exist for a while.
+            # Send it in odom instead, which is the Gazebo world frame: the
+            # same spawn shift the photo was placed with, the other way.
+            msg.header.frame_id = self.odom_frame
+            sx, sy = self.spawn_xy
+            corners = [(x + sx, y + sy) for x, y in corners]
+        else:
+            msg.header.frame_id = self.map_frame
+        for x, y in corners:
             msg.polygon.points.append(Point32(x=float(x), y=float(y), z=0.0))
         self.area_pub.publish(msg)
         self.get_logger().info(
@@ -458,8 +552,13 @@ class MapPage(QWidget):
         self.show_trail = True
         self.show_contacts = True
         self.zoom = 1.0
+        self.show_aerial = node.aerial_image is not None
+        self._aerial_pixmap: Optional[QPixmap] = None
         self.setStyleSheet(f"background:{BASE};")
+        # Pixels per metre, the widget position of the view's top-left, and
+        # the map-frame coordinates (min x, max y) that sit at that corner.
         self._scale, self._ox, self._oy = 1.0, 0.0, 0.0
+        self._vx0, self._vy1 = 0.0, 0.0
 
         # Operator-drawn search area.
         self.draw_mode = False
@@ -472,25 +571,48 @@ class MapPage(QWidget):
         self.pip_mode = (self.pip_mode + 1) % len(self.PIP_MODES)
 
     # -- coordinate transforms --------------------------------------------
+    # Everything is placed in map-frame metres rather than SLAM grid pixels,
+    # so the aerial photo and the SLAM grid - two images with different
+    # extents and resolutions - can share one view.
     def _world_to_widget(self, x: float, y: float) -> QPointF:
-        res = self.node.map_resolution
-        ox, oy = self.node.map_origin
-        h = self.node.map_image.shape[0]
-        px = (x - ox) / res
-        py = h - (y - oy) / res
-        return QPointF(self._ox + px * self._scale, self._oy + py * self._scale)
+        return QPointF(self._ox + (x - self._vx0) * self._scale,
+                       self._oy + (self._vy1 - y) * self._scale)
 
     def _widget_to_world(self, pt) -> Optional[Tuple[float, float]]:
-        """Inverse of the above. Returns None before a map exists, since
-        without resolution and origin there is nothing to convert against."""
-        if self.node.map_image is None or self._scale == 0:
+        """Inverse of the above. Returns None before there is anything to
+        show (no map and no aerial photo), since the view is not laid out
+        until then."""
+        if not self._has_view() or self._scale == 0:
             return None
+        return (self._vx0 + (pt.x() - self._ox) / self._scale,
+                self._vy1 - (pt.y() - self._oy) / self._scale)
+
+    def _has_view(self) -> bool:
+        """Something to draw: the SLAM map, or the aerial photo on its own
+        while the drones are still on the ute and SLAM has not started."""
+        return (self.node.map_image is not None or
+                (self.show_aerial and self.node.aerial_image is not None))
+
+    def _slam_bounds(self) -> Tuple[float, float, float, float]:
+        h, w, _ = self.node.map_image.shape
         res = self.node.map_resolution
         ox, oy = self.node.map_origin
-        h = self.node.map_image.shape[0]
-        px = (pt.x() - self._ox) / self._scale
-        py = (pt.y() - self._oy) / self._scale
-        return px * res + ox, (h - py) * res + oy
+        return ox, oy, ox + w * res, oy + h * res
+
+    def _view_bounds(self) -> Tuple[float, float, float, float]:
+        """The area to fit on screen: the SLAM map, grown to take in the whole
+        aerial photo when it is shown, so unexplored ground can be tasked."""
+        if self.node.map_image is None:
+            return self.node.aerial_bounds
+        x0, y0, x1, y1 = self._slam_bounds()
+        if self.show_aerial and self.node.aerial_bounds:
+            ax0, ay0, ax1, ay1 = self.node.aerial_bounds
+            x0, y0, x1, y1 = min(x0, ax0), min(y0, ay0), max(x1, ax1), max(y1, ay1)
+        return x0, y0, x1, y1
+
+    def _rect_for(self, x0: float, y0: float, x1: float, y1: float) -> QRectF:
+        """Widget rectangle covering a map-frame rectangle."""
+        return QRectF(self._world_to_widget(x0, y1), self._world_to_widget(x1, y0))
 
     # -- area drawing ------------------------------------------------------
     def begin_draw(self):
@@ -538,40 +660,61 @@ class MapPage(QWidget):
         p.setRenderHint(QPainter.Antialiasing)
         p.fillRect(self.rect(), QColor(BASE))
 
-        if self.node.map_image is None:
+        if not self._has_view():
             p.setPen(QColor(MUTED))
             p.drawText(self.rect(), Qt.AlignCenter,
+                       "No map yet. SLAM starts once the drones are launched."
+                       if not self.node.launched else
                        "No map. Start the simulation with nav2:=true")
             return
-
-        img = self.node.map_image
-        h, w, _ = img.shape
-        qimg = QImage(img.data, w, h, 3 * w, QImage.Format_RGB888).copy()
 
         # Fit to the widget, then apply zoom, keeping the drone centred when
         # zoomed in  panning a map by hand during a search is a distraction.
         # Drone-follow is suspended while drawing: a map that moves under the
         # cursor makes it impossible to place a corner.
-        fit = min(self.width() / w, self.height() / h)
+        vx0, vy0, vx1, vy1 = self._view_bounds()
+        span_x, span_y = max(vx1 - vx0, 1e-6), max(vy1 - vy0, 1e-6)
+        self._vx0, self._vy1 = vx0, vy1
+        fit = min(self.width() / span_x, self.height() / span_y)
         self._scale = fit * self.zoom
         if self.zoom > 1.0 and self.node.drone_xy and not self.draw_mode:
-            dx = (self.node.drone_xy[0] - self.node.map_origin[0]) / self.node.map_resolution
-            dy = h - (self.node.drone_xy[1] - self.node.map_origin[1]) / self.node.map_resolution
-            self._ox = self.width() / 2 - dx * self._scale
-            self._oy = self.height() / 2 - dy * self._scale
+            dx, dy = self.node.drone_xy
+            self._ox = self.width() / 2 - (dx - vx0) * self._scale
+            self._oy = self.height() / 2 - (vy1 - dy) * self._scale
         else:
-            self._ox = (self.width() - w * self._scale) / 2
-            self._oy = (self.height() - h * self._scale) / 2
+            self._ox = (self.width() - span_x * self._scale) / 2
+            self._oy = (self.height() - span_y * self._scale) / 2
 
-        p.drawPixmap(QRectF(self._ox, self._oy, w * self._scale, h * self._scale),
-                     QPixmap.fromImage(qimg), QRectF(0, 0, w, h))
+        have_map = self.node.map_image is not None
+        if self.show_aerial and self.node.aerial_image is not None:
+            if self._aerial_pixmap is None:
+                a = self.node.aerial_image
+                ah, aw, _ = a.shape
+                self._aerial_pixmap = QPixmap.fromImage(
+                    QImage(a.data, aw, ah, 3 * aw, QImage.Format_RGB888).copy())
+            p.setRenderHint(QPainter.SmoothPixmapTransform)
+            p.drawPixmap(self._rect_for(*self.node.aerial_bounds), self._aerial_pixmap,
+                         QRectF(self._aerial_pixmap.rect()))
+            p.setRenderHint(QPainter.SmoothPixmapTransform, False)
+            if have_map:
+                img = self.node.map_overlay
+                h, w, _ = img.shape
+                qimg = QImage(img.data, w, h, 4 * w, QImage.Format_RGBA8888).copy()
+        elif have_map:
+            img = self.node.map_image
+            h, w, _ = img.shape
+            qimg = QImage(img.data, w, h, 3 * w, QImage.Format_RGB888).copy()
+
+        if have_map:
+            p.drawPixmap(self._rect_for(*self._slam_bounds()),
+                         QPixmap.fromImage(qimg), QRectF(0, 0, w, h))
 
         # Under the trail and contacts, so it reads as ground marking rather
         # than another overlay competing with the things that need a decision.
         self._draw_area(p)
 
         if self.show_trail and len(self.node.trail) > 1:
-            p.setPen(QPen(QColor(CYAN), 2))
+            p.setPen(QPen(QColor(DRONE), 2))
             pts = [self._world_to_widget(x, y) for x, y in self.node.trail]
             for a, b in zip(pts, pts[1:]):
                 p.drawLine(a, b)
@@ -581,7 +724,7 @@ class MapPage(QWidget):
                 if c.status == "DISMISSED":
                     continue
                 pos = self._world_to_widget(c.x, c.y)
-                colour = QColor(GREEN if c.status == "CONFIRMED" else AMBER)
+                colour = QColor(CONFIRM if c.status == "CONFIRMED" else ALERT)
                 p.setPen(QPen(colour, 2))
                 p.setBrush(QColor(colour.red(), colour.green(), colour.blue(), 60))
                 p.drawEllipse(pos, 11, 11)
@@ -593,13 +736,13 @@ class MapPage(QWidget):
             p.save()
             p.translate(pos)
             p.rotate(-np.degrees(self.node.drone_yaw))
-            p.setBrush(QColor(CYAN))
+            p.setBrush(QColor(DRONE))
             p.setPen(QPen(QColor(TEXT), 1))
             p.drawPolygon(QPointF(12, 0), QPointF(-7, 7), QPointF(-7, -7))
             p.restore()
 
         if self.draw_mode and self._drag_a is None:
-            p.setPen(QColor(AMBER))
+            p.setPen(QColor(ALERT))
             p.setFont(QFont("DejaVu Sans Mono", 10, QFont.Bold))
             p.drawText(18, 28, "DRAG TO SET SEARCH AREA   (ESC TO CANCEL)")
 
@@ -612,14 +755,14 @@ class MapPage(QWidget):
         know whether they have drawn 20 m or 200 m of ground."""
         if self._drag_a is not None and self._drag_b is not None:
             rect = QRectF(self._drag_a, self._drag_b).normalized()
-            p.setPen(QPen(QColor(AMBER), 2, Qt.DashLine))
+            p.setPen(QPen(QColor(ALERT), 2, Qt.DashLine))
             p.setBrush(Qt.NoBrush)
             p.drawRect(rect)
 
             a = self._widget_to_world(self._drag_a)
             b = self._widget_to_world(self._drag_b)
             if a and b:
-                p.setPen(QColor(AMBER))
+                p.setPen(QColor(ALERT))
                 p.setFont(QFont("DejaVu Sans Mono", 9))
                 p.drawText(rect.topLeft() + QPointF(6, -6),
                            f"{abs(a[0] - b[0]):.0f} x {abs(a[1] - b[1]):.0f} m")
@@ -629,10 +772,10 @@ class MapPage(QWidget):
             x0, y0, x1, y1 = self.area
             rect = QRectF(self._world_to_widget(x0, y1),
                           self._world_to_widget(x1, y0))
-            p.setPen(QPen(QColor(GREEN), 2))
+            p.setPen(QPen(QColor(CONFIRM), 2))
             p.setBrush(QColor(76, 175, 109, 25))
             p.drawRect(rect)
-            p.setPen(QColor(GREEN))
+            p.setPen(QColor(CONFIRM))
             p.setFont(QFont("DejaVu Sans Mono", 9))
             p.drawText(rect.topLeft() + QPointF(6, -6),
                        f"SEARCH AREA  {abs(x1 - x0):.0f} x {abs(y1 - y0):.0f} m")
@@ -698,7 +841,7 @@ class VideoPage(QWidget):
                      (self.height() - pix.height()) // 2, pix)
 
         if self.frozen is not None:
-            p.setPen(QColor(AMBER))
+            p.setPen(QColor(ALERT))
             p.setFont(QFont("DejaVu Sans Mono", 11, QFont.Bold))
             p.drawText(18, 30, "FROZEN")
 
@@ -739,8 +882,8 @@ class ContactsPage(QWidget):
                 f"{c.id:02d}   {c.x:+7.1f} {c.y:+7.1f} m     "
                 f"VIS {c.rgb_confidence:>4.0%}   IR {c.thermal_confidence:>4.0%}"
                 f"     {c.status}")
-            item.setForeground(QColor({"UNCONFIRMED": AMBER,
-                                       "CONFIRMED": GREEN,
+            item.setForeground(QColor({"UNCONFIRMED": ALERT,
+                                       "CONFIRMED": CONFIRM,
                                        "DISMISSED": MUTED}[c.status]))
             self.list.addItem(item)
         if 0 <= keep < self.list.count():
@@ -848,7 +991,7 @@ class MainWindow(QMainWindow):
         bottom.addStretch(1)
         self.bottom_buttons[0].clicked.connect(lambda: self._rule("CONFIRMED"))
         self.bottom_buttons[1].clicked.connect(lambda: self._rule("DISMISSED"))
-        self.bottom_buttons[2].clicked.connect(self._simulate_contact)
+        self.bottom_buttons[2].clicked.connect(self.node.launch)
         grid.addLayout(bottom, 2, 1)
 
         grid.setColumnStretch(1, 1)
@@ -868,7 +1011,7 @@ class MainWindow(QMainWindow):
         row.addWidget(title)
 
         self.page_label = QLabel("")
-        self.page_label.setStyleSheet(f"color:{CYAN}; border:none; padding-left:20px;")
+        self.page_label.setStyleSheet(f"color:{DRONE}; border:none; padding-left:20px;")
         row.addWidget(self.page_label)
 
         row.addStretch(1)
@@ -900,6 +1043,8 @@ class MainWindow(QMainWindow):
                       lambda n=i: self._press_right(n))
         QShortcut(QKeySequence("Q"), self, lambda: self._rule("CONFIRMED"))
         QShortcut(QKeySequence("W"), self, lambda: self._rule("DISMISSED"))
+        QShortcut(QKeySequence("R"), self, self.node.launch)
+        # Fake contact for testing the interface; keyboard only.
         QShortcut(QKeySequence("E"), self, self._simulate_contact)
         # Escape stands down an armed area draw without setting one.
         QShortcut(QKeySequence("Escape"), self, self._cancel_draw)
@@ -921,18 +1066,22 @@ class MainWindow(QMainWindow):
                 ("TRAIL", lambda: setattr(m, "show_trail", not m.show_trail), m.show_trail),
                 ("CNTCT", lambda: setattr(m, "show_contacts", not m.show_contacts), m.show_contacts),
                 (f"PIP\n{MapPage.PIP_MODES[m.pip_mode][0]}", m.cycle_pip, m.pip_mode != 0),
-                ("ZOOM+", lambda: setattr(m, "zoom", min(m.zoom * 1.5, 8.0)), False),
+                (f"ZOOM+\n{m.zoom:.1f}x", lambda: setattr(m, "zoom", min(m.zoom * 1.5, 8.0)), m.zoom > 1.0),
                 ("ZOOM-", lambda: setattr(m, "zoom", max(m.zoom / 1.5, 1.0)), False),
                 # One slot, three states: no area, armed, area set. The label
                 # names the action the next press performs, not the state.
                 ("CLR\nAREA" if m.area else "SET\nAREA",
                  self._toggle_area_draw, m.draw_mode or bool(m.area)),
+                # Only offered when a photo was loaded (see aerial_map).
+                ("AERIAL", lambda: setattr(m, "show_aerial", not m.show_aerial),
+                 m.show_aerial) if self.node.aerial_image is not None else blank,
             ]
         if self.page in (PAGE_VIS, PAGE_IR):
             v = self.vis_page if self.page == PAGE_VIS else self.ir_page
-            return [("FREEZE", v.toggle_freeze, v.frozen is not None)] + [blank] * 5
+            return ([("FREEZE", v.toggle_freeze, v.frozen is not None)]
+                    + [blank] * (RIGHT_SLOTS - 1))
         if self.page == PAGE_CONTACTS:
-            return [("RESUME", self._resume_search, False)] + [blank] * 5
+            return [("RESUME", self._resume_search, False)] + [blank] * (RIGHT_SLOTS - 1)
         return [blank] * RIGHT_SLOTS
 
     def _press_right(self, slot: int):
@@ -955,7 +1104,7 @@ class MainWindow(QMainWindow):
         pending = sum(1 for c in self.contacts if c.status == "UNCONFIRMED")
         labels = [("MAP", TEXT), ("VIS", TEXT), ("IR", TEXT),
                   (f"CNTCT\n{len(self.contacts):02d}",
-                   AMBER if pending else TEXT)]
+                   ALERT if pending else TEXT)]
         for i, (btn, (label, tone)) in enumerate(zip(self.left_buttons, labels)):
             btn.configure(label, tone, boxed=(i == self.page))
 
@@ -964,9 +1113,14 @@ class MainWindow(QMainWindow):
 
         sel = self._selected()
         can_rule = sel is not None and sel.status == "UNCONFIRMED"
-        self.bottom_buttons[0].configure("CONFIRM", GREEN, enabled=can_rule)
+        self.bottom_buttons[0].configure("CONFIRM", CONFIRM, enabled=can_rule)
         self.bottom_buttons[1].configure("DISMISS", RED, enabled=can_rule)
-        self.bottom_buttons[2].configure("SIM", MUTED)
+        # Lit until pressed, then stays down: the drones cannot go back
+        # onto the ute from here.
+        if self.node.launched:
+            self.bottom_buttons[2].configure("AIRBORNE", MUTED, enabled=False)
+        else:
+            self.bottom_buttons[2].configure("LAUNCH", CONFIRM, boxed=True)
 
     # -- behaviour ---------------------------------------------------------
     def _selected(self) -> Optional[Contact]:
@@ -1065,7 +1219,7 @@ class MainWindow(QMainWindow):
         if pending:
             self.caution.setText(f"CONTACT  {pending}")
             self.caution.setStyleSheet(
-                f"color:{AMBER if self._blink else PANEL}; border:none;")
+                f"color:{ALERT if self._blink else PANEL}; border:none;")
         else:
             self.caution.setText("")
 
@@ -1074,7 +1228,7 @@ class MainWindow(QMainWindow):
         live = self.node.drone_xy is not None
         self.link_label.setText("LINK OK" if live else "LINK ---")
         self.link_label.setStyleSheet(
-            f"color:{GREEN if live else MUTED}; border:none; padding-left:24px;")
+            f"color:{CONFIRM if live else MUTED}; border:none; padding-left:24px;")
 
         self._sync_bezels()
 
@@ -1103,4 +1257,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main() 
+    main()

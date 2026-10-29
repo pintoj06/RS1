@@ -76,3 +76,10 @@
   ros_type_name: "sensor_msgs/msg/Image"
   gz_type_name: "ignition.msgs.Image"
   direction: GZ_TO_ROS
+# Care package release (ignition::gazebo::systems::DetachableJoint, see
+# urdf_parrot/care_package.urdf.xacro). courier_node.py publishes on arrival.
+- ros_topic_name: "care_package/detach"
+  gz_topic_name: "/model/parrot2/care_package/detach"
+  ros_type_name: "std_msgs/msg/Empty"
+  gz_type_name: "ignition.msgs.Empty"
+  direction: ROS_TO_GZ

@@ -17,7 +17,8 @@ from rclpy.duration import Duration
 from rclpy.node import Node
 from rclpy.qos import QoSDurabilityPolicy, QoSProfile
 # ColorRGBA lets us colour the target marker.
-from std_msgs.msg import ColorRGBA
+# Empty is a message with no content: publishing one releases the care package.
+from std_msgs.msg import ColorRGBA, Empty
 # TFMessage is what /<robot>/tf carries; used to read the scout's TF tree.
 from tf2_msgs.msg import TFMessage
 # tf2_ros answers "where is the drone right now?" by reading the transform tree.
@@ -58,7 +59,7 @@ class CourierNode(Node):
 
         # Every drone's odom frame is the Gazebo world frame: the odometry
         # plugin reports world pose, so at spawn parrot1 reads (2, 0) and
-        # parrot2 reads (2, -2) - not (0, 0). A world point, or a point in
+        # parrot2 reads (2.47, -1.10) - not (0, 0). A world point, or a point in
         # the scout's odom frame, is therefore already in this robot's odom
         # frame with no spawn offset.
         self.delivery_point = (
@@ -75,6 +76,11 @@ class CourierNode(Node):
         self.busy = False
 
         self.nav_client = ActionClient(self, NavigateToPose, 'navigate_to_pose')
+
+        # Releases the care package slung under the drone. Bridged to the
+        # DetachableJoint in Gazebo (config/gazebo_bridge_parrot2.yaml); the
+        # package then falls onto the contact.
+        self.release_pub = self.create_publisher(Empty, 'care_package/detach', 10)
 
         # Same latched QoS the ground station publishes with, so this still
         # gets the message even if it starts listening after a confirm.
@@ -262,7 +268,8 @@ class CourierNode(Node):
     def goal_finished(self, future):
         """Stage 3: Nav2 has arrived, failed or given up"""
         if future.result().status == GoalStatus.STATUS_SUCCEEDED:
-            self.get_logger().info('Delivered. ')
+            self.release_pub.publish(Empty())
+            self.get_logger().info('Arrived. Care package released.')
         else:
             self.get_logger().warn('Could not reach the delivery point.')
         self.busy = False

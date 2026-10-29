@@ -2,10 +2,13 @@
 <robot name="parrot" xmlns:xacro="http://ros.org/wiki/xacro">
 
   <xacro:arg name="prefix" default=""/>
+  <!-- Carry a droppable care package; only the courier (parrot2) sets this. -->
+  <xacro:arg name="care_package" default="false"/>
   <xacro:property name="prefix" value="$(arg prefix)"/>
   
   <xacro:include filename="$(find 41068_ignition_bringup)/urdf_parrot/common_properties.urdf.xacro"/>
   <xacro:include filename="$(find 41068_ignition_bringup)/urdf_parrot/parrot.gazebo.xacro"/>
+  <xacro:include filename="$(find 41068_ignition_bringup)/urdf_parrot/care_package.urdf.xacro"/>
 
   <xacro:property name="r200_cam_rgb_px" value="0.005"/>
   <xacro:property name="r200_cam_rgb_py" value="0.018"/>
@@ -58,6 +61,11 @@
       </geometry>
     </visual>
   </link>
+
+  <!-- Mount for the care package, and the joint that holds and releases it. -->
+  <xacro:if value="$(arg care_package)">
+    <xacro:care_package_mount prefix="${prefix}" gz_model_name="${gz_model_name}" variant="standard"/>
+  </xacro:if>
 
 
   <joint name="${prefix}imu_joint" type="fixed">

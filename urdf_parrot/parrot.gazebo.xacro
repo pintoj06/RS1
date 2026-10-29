@@ -98,6 +98,10 @@
       <odom_publish_frequency>20</odom_publish_frequency>
       <odom_frame>${prefix}odom</odom_frame>
       <robot_base_frame>${prefix}base_link</robot_base_frame>
+      <!-- 3D so the pose carries the drone's height: takeoff_node.py climbs
+           off the ute's landing pad using it. The EKF does not fuse z, so
+           TF and Nav2 stay planar. -->
+      <dimensions>3</dimensions>
     </plugin>
   </gazebo>
 
