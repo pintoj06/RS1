@@ -4,6 +4,7 @@
 "Fly a lawnmower search patter over a rectangle, using NAV2"
 
 import math
+import time
 
 import numpy as np
 
@@ -65,7 +66,8 @@ def best_sweep_angle(polygon):
     return best_angle
 
 
-def make_sweep_polygon(polygon, spacing, sweep_angle=None):
+def make_sweep_polygon(polygon, spacing, sweep_angle=None,
+                       is_blocked=None, clearance=0.0, min_leg=0.0):
     """Lawnmower pattern covering ANY simple polygon.
 
     This is boustrophedon ("as the ox ploughs") coverage. The method:
@@ -86,7 +88,16 @@ def make_sweep_polygon(polygon, spacing, sweep_angle=None):
     edge, so the real step is always <= the requested spacing. Coverage is
     complete when the camera's footprint radius is at least half that step.
 
-    polygon: list of (x, y) vertices, in order around the shape.
+    When is_blocked is given, each row's span is additionally cut wherever
+    that callback reports an obstacle, so legs stop at the near edge of the
+    rock and pick up again on the far side. Nothing plans a waypoint inside an
+    obstacle; flying BETWEEN the pieces is left to Nav2, whose global costmap
+    now holds the obstacle and will route around it.
+
+    polygon:    list of (x, y) vertices, in order around the shape.
+    is_blocked: optional f(x, y) -> True if that world point is obstructed.
+    clearance:  metres to keep back from an obstacle edge.
+    min_leg:    drop any resulting piece shorter than this - not worth flying.
     Returns a flat list of (x, y) waypoints to visit in order.
     """
     if len(polygon) < 3 or spacing is None or spacing <= 0:
@@ -126,6 +137,42 @@ def make_sweep_polygon(polygon, spacing, sweep_angle=None):
                 spans.append((left, right))
         return spans
 
+    def clear_pieces(left, right, y):
+        """Cut one span into the stretches with no obstacle on them.
+
+        Walks the span in small steps asking is_blocked about each point.
+        Points are rotated back to world coordinates first, because the
+        scanline works in the rotated frame but the costmap does not.
+        """
+        if is_blocked is None:
+            return [(left, right)]
+
+        probe = max(0.1, step * 0.05)          # sample finer than a row step
+        n_probe = max(2, int((right - left) / probe) + 1)
+        c, s_ = math.cos(sweep_angle), math.sin(sweep_angle)
+
+        pieces, run_start = [], None
+        for k in range(n_probe + 1):
+            x = left + (right - left) * k / n_probe
+            wx, wy = x * c - y * s_, x * s_ + y * c      # back to world
+            if is_blocked(wx, wy):
+                if run_start is not None:
+                    pieces.append((run_start, x))
+                    run_start = None
+            elif run_start is None:
+                run_start = x
+        if run_start is not None:
+            pieces.append((run_start, right))
+
+        # Keep back from the rock, then drop anything too short to be worth it.
+        out = []
+        for a, b in pieces:
+            a2 = a + clearance if a > left + 1e-9 else a
+            b2 = b - clearance if b < right - 1e-9 else b
+            if b2 - a2 >= max(min_leg, 1e-6):
+                out.append((a2, b2))
+        return out
+
     waypoints = []
     flip = False
     for row in range(n_rows):
@@ -153,7 +200,15 @@ def make_sweep_polygon(polygon, spacing, sweep_angle=None):
         else:
             y, spans = y - nudge, below
 
+        # Split each span around obstacles, then visit the pieces in the
+        # travel direction of this row so the drone still snakes sensibly.
+        pieces = []
         for left, right in spans:
+            pieces.extend(clear_pieces(left, right, y))
+        if flip:
+            pieces.reverse()
+
+        for left, right in pieces:
             if flip:
                 waypoints.extend([(right, y), (left, y)])
             else:
@@ -201,6 +256,29 @@ class SearchNode(Node):
         # opening a gap of unseen ground between two legs.
         self.declare_parameter('overlap', 0.8)
 
+        # --- obstacle avoidance ------------------------------------------
+        # Nav2's global costmap, which now keeps what the lidar has seen, is
+        # read so the sweep is planned around obstacles instead of through
+        # them. Set avoid_obstacles false to go back to pure geometry.
+        self.declare_parameter('avoid_obstacles', True)
+        self.declare_parameter('costmap_topic', 'global_costmap/costmap')
+        # Cost at or above which a cell counts as blocked. Nav2 uses 254 for
+        # lethal and 253 for "inscribed" (the drone's body would touch it);
+        # 200 also catches the strongly inflated ring around an obstacle.
+        self.declare_parameter('obstacle_cost_threshold', 200)
+        # How far to stay back from an obstacle edge, on top of inflation.
+        self.declare_parameter('obstacle_clearance', 1.0)
+        # Pieces of a split leg shorter than this are not worth flying.
+        self.declare_parameter('min_leg_length', 1.5)
+        # Give up on a waypoint that has not been reached in this long. Without
+        # it, a goal inside an unreachable pocket (the hollow middle of a
+        # part-mapped mountain, say) keeps Nav2 planning longer and longer
+        # detours and the sweep stalls there indefinitely.
+        self.declare_parameter('goal_timeout', 90.0)   # seconds, 0 disables
+        # Drop waypoints the drone cannot actually get to, worked out by
+        # flooding outwards from its position across free costmap cells.
+        self.declare_parameter('drop_unreachable', True)
+
         # An arbitrary search polygon, as a flat list: [x1, y1, x2, y2, ...].
         # Leave it empty to use the min_x/max_x/min_y/max_y rectangle instead.
         # This is the STARTING area; the operator can redraw it at any time
@@ -227,6 +305,8 @@ class SearchNode(Node):
         self.points = []
         self.planned = False
         self.spacing = None
+        self.goal_started = None    # when the current goal was sent
+        self.timed_out = False      # set when we abandon one for taking too long
         self.home_index = None
 
         self.index = 0
@@ -349,6 +429,20 @@ class SearchNode(Node):
         self.create_subscription(
             CameraInfo, 'camera/camera_info', self._camera_info_callback, 1
         )
+
+        # Nav2's global costmap, read so the sweep can be planned AROUND
+        # obstacles rather than through them. It is a fixed, non-rolling map in
+        # the odom frame, so it keeps what the lidar has already seen - without
+        # that memory there would be nothing to plan against.
+        self.costmap = None
+        if self.get_parameter('avoid_obstacles').value:
+            costmap_qos = QoSProfile(
+                depth=1,
+                reliability=QoSReliabilityPolicy.RELIABLE,
+                durability=QoSDurabilityPolicy.TRANSIENT_LOCAL)
+            self.create_subscription(
+                OccupancyGrid, self.get_parameter('costmap_topic').value,
+                self._costmap_callback, costmap_qos)
 
         self.coverage_resolution = float(self.get_parameter('coverage_resolution').value)
 
@@ -516,6 +610,14 @@ class SearchNode(Node):
             inside ^= (((y1 > gy) != (y2 > gy))
                        & (gx < x1 + (gy - y1) / (y2 - y1) * (x2 - x1)))
 
+        # Drop blocked cells: the camera can never see through rock, so
+        # counting it would make a fully successful plan score below 100%.
+        if bool(self.get_parameter('avoid_obstacles').value) and self.costmap is not None:
+            for r in range(rows):
+                for c in range(cols):
+                    if inside[r, c] and self._is_blocked(gx[r, c], gy[r, c]):
+                        inside[r, c] = False
+
         total = int(inside.sum())
         if total == 0:
             return 0.0
@@ -548,6 +650,33 @@ class SearchNode(Node):
         if self.cam_fx is None:
             self.get_logger().info('Waiting for camera info before planning the sweep...')
             return False
+        avoiding = bool(self.get_parameter('avoid_obstacles').value)
+        if avoiding and self.costmap is None:
+            self.get_logger().info(
+                'Waiting for the costmap before planning - planning now would '
+                'route straight through anything out there...')
+            return False
+
+        # Passed to the planner so each sweep leg is cut around obstacles.
+        # "Blocked" means occupied OR walled off with no way in - a waypoint in
+        # the hollow middle of a mountain is not in the rock, but the drone
+        # still cannot get to it, and chasing it stalls the whole sweep.
+        reached = None
+        if avoiding and self.get_parameter('drop_unreachable').value:
+            here = self._lookup_robot_xy()
+            if here is not None:
+                reached = self._reachable_from(here)
+
+        if avoiding and reached is not None:
+            blocked = lambda x, y: (self._is_blocked(x, y)
+                                    or not self._is_reachable(x, y, reached))
+        elif avoiding:
+            blocked = self._is_blocked
+        else:
+            blocked = None
+        clearance = float(self.get_parameter('obstacle_clearance').value)
+        min_leg = float(self.get_parameter('min_leg_length').value)
+
         footprint = self._footprint_radius() * 2.0      # metres across on the ground
 
         # A positive 'spacing' parameter forces a fixed value. Otherwise the
@@ -559,7 +688,9 @@ class SearchNode(Node):
         if forced > 0.0:
             self.spacing = forced
             source = 'forced by the spacing parameter'
-            self.points = make_sweep_polygon(self.polygon, self.spacing)
+            self.points = make_sweep_polygon(
+                self.polygon, self.spacing, is_blocked=blocked,
+                clearance=clearance, min_leg=min_leg)
             predicted = self._predicted_coverage(self.points, self._footprint_radius())
         else:
             source = f'{footprint:.1f} m camera footprint x {overlap:.2f} overlap'
@@ -570,7 +701,9 @@ class SearchNode(Node):
             self.spacing = footprint * overlap
             radius = self._footprint_radius()
             for attempt in range(6):
-                self.points = make_sweep_polygon(self.polygon, self.spacing)
+                self.points = make_sweep_polygon(
+                    self.polygon, self.spacing, is_blocked=blocked,
+                    clearance=clearance, min_leg=min_leg)
                 predicted = self._predicted_coverage(self.points, radius)
                 if predicted >= 0.999:
                     break
@@ -580,6 +713,16 @@ class SearchNode(Node):
                     f'tightening.'
                 )
                 self.spacing *= 0.85
+
+        # Nothing left after cutting the obstacles out: the whole area is
+        # rock. Say so plainly rather than flying a meaningless path.
+        if not self.points:
+            self.get_logger().error(
+                'SEARCH AREA NOT SEARCHABLE: every part of it is either inside '
+                'an obstacle or walled off with no way in, so there is nothing '
+                'to fly. Draw an area that includes reachable open ground.')
+            self.planned = True          # stop retrying every tick
+            return True
 
         # (0, 0) in the odom frame is the spawn point (see map_frame comment
         # in __init__), so "return to spawn" is just one more waypoint tacked
@@ -604,10 +747,18 @@ class SearchNode(Node):
             f'Leg spacing {self.spacing:.1f} m ({source}): '
             f'{len(self.points) // 2} legs, {len(self.points)} waypoints.'
         )
+        if avoiding:
+            extra = (' Ground with no way in to it was dropped too.'
+                     if reached is not None else '')
+            self.get_logger().info(
+                'Obstacles from the costmap were cut out of the sweep; legs '
+                f'stop {clearance:.1f} m clear of them and Nav2 flies around '
+                f'between the pieces.{extra}')
         if predicted >= 0.999:
             self.get_logger().info(
                 f'Checked before take-off: this path covers '
-                f'{100 * predicted:.1f}% of the search area.'
+                f'{100 * predicted:.1f}% of the SEARCHABLE area '
+                f'(obstacles excluded).'
             )
         else:
             self.get_logger().warn(
@@ -621,6 +772,22 @@ class SearchNode(Node):
         if self.holding:
             return
         if self.busy: #goal is already in flight
+            # Abandon a waypoint that is taking far too long. A goal inside an
+            # unreachable pocket - the hollow middle of a part-mapped mountain,
+            # for instance - never fails outright: Nav2 keeps replanning longer
+            # and longer ways round and the sweep stalls there for good.
+            limit = float(self.get_parameter('goal_timeout').value)
+            if (limit > 0 and not self.holding and self.goal_started is not None
+                    and time.monotonic() - self.goal_started > limit):
+                self.get_logger().warn(
+                    f'Waypoint {self.index + 1}/{len(self.points)} not reached '
+                    f'in {limit:.0f} s - giving up on it and moving on. It is '
+                    f'probably unreachable (inside or behind an obstacle).')
+                self.timed_out = True
+                if self.goal_handle is not None:
+                    self.goal_handle.cancel_goal_async()
+                else:
+                    self.next_waypoint()
             return
         # Plan on the first tick that has camera data, not in __init__.
         if not self.planned and not self.plan_sweep():
@@ -650,6 +817,8 @@ class SearchNode(Node):
         goal.pose.pose.orientation.w = math.cos(yaw / 2.0)
 
         self.busy = True
+        self.goal_started = time.monotonic()
+        self.timed_out = False
         self.get_logger().info (
             f'Waypoint {self.index +1}/{len(self.points)}: flying to ({x:.1f}, {y:.1f})'
         )
@@ -682,6 +851,12 @@ class SearchNode(Node):
         """Stage 3: Nav2 has arrived, failed or given up"""
         self.goal_handle = None
         status = future.result().status
+        if self.timed_out:
+            # Cancelled by us for taking too long: skip it rather than re-fly.
+            self.timed_out = False
+            self.busy = False
+            self.next_waypoint()
+            return
         if self.holding or status == GoalStatus.STATUS_CANCELED:
             # Cancelled by a hold, or by the operator redrawing the search
             # area. Don't advance: on a hold, resuming re-flies the same
@@ -853,13 +1028,25 @@ class SearchNode(Node):
         return inside
 
     def _build_inside_mask(self):
-        """Boolean grid marking which coverage cells fall inside the polygon."""
+        """Boolean grid marking which coverage cells are worth searching.
+
+        Inside the polygon AND not blocked by an obstacle. Excluding the rock
+        matters: those cells can never be seen by the camera, so counting them
+        would hold the coverage percentage below 100% forever and make a
+        complete search look like a failed one.
+        """
+        avoiding = (bool(self.get_parameter('avoid_obstacles').value)
+                    and self.costmap is not None)
         mask = np.zeros((self.cov_rows, self.cov_cols), dtype=bool)
         for row in range(self.cov_rows):
             cell_y = self.cov_origin_y + (row + 0.5) * self.coverage_resolution
             for col in range(self.cov_cols):
                 cell_x = self.cov_origin_x + (col + 0.5) * self.coverage_resolution
-                mask[row, col] = self.point_in_polygon(cell_x, cell_y, self.polygon)
+                if not self.point_in_polygon(cell_x, cell_y, self.polygon):
+                    continue
+                if avoiding and self._is_blocked(cell_x, cell_y):
+                    continue
+                mask[row, col] = True
         return mask
 
     def _resolve_polygon(self):
@@ -931,6 +1118,92 @@ class SearchNode(Node):
                 f'Camera info received: {self.cam_width}x{self.cam_height}, '
                 f'FOV {math.degrees(hfov):.1f} x {math.degrees(vfov):.1f} degrees.'
             )
+
+    def _costmap_callback(self, msg):
+        """Keep the latest costmap so the planner can ask what is blocked."""
+        self.costmap = msg
+
+    def _is_blocked(self, x, y):
+        """True if (x, y) in the planning frame is obstructed.
+
+        Reads Nav2's costmap directly rather than keeping a second obstacle
+        map of our own: it is already in the odom frame we plan in, it already
+        inflates obstacles by the drone's size, and it is the same picture the
+        controller will use in flight, so the plan and the flying agree.
+
+        Anything outside the costmap is treated as clear - the costmap covers
+        the flyable area, and refusing to plan beyond it would be worse than
+        letting Nav2 handle whatever is out there.
+        """
+        m = self.costmap
+        if m is None:
+            return False
+        res = m.info.resolution
+        col = int((x - m.info.origin.position.x) / res)
+        row = int((y - m.info.origin.position.y) / res)
+        if not (0 <= col < m.info.width and 0 <= row < m.info.height):
+            return False
+        cost = m.data[row * m.info.width + col]
+        if cost < 0:                 # -1 = never observed, treat as clear
+            return False
+        return cost >= self.get_parameter('obstacle_cost_threshold').value
+
+    def _reachable_from(self, start_xy):
+        """Flood outwards from the drone across free costmap cells.
+
+        Answers "could the drone actually get there?", which is a different
+        question from "is that cell occupied?". The hollow middle of a mountain
+        reads as free - the lidar has only ever seen the near wall, and
+        unobserved ground is treated as free so Nav2 can plan at altitude - so
+        a waypoint can sit in a pocket with no way in. Only cells the flood
+        reaches are really reachable.
+
+        Returns a numpy bool grid matching the costmap, or None if there is no
+        costmap. Being honest about the limit: this only excludes a pocket once
+        its walls have actually been mapped all the way round. Seen from one
+        side the flood simply runs past the ends of the wall.
+        """
+        m = self.costmap
+        if m is None:
+            return None
+
+        w, h, res = m.info.width, m.info.height, m.info.resolution
+        ox, oy = m.info.origin.position.x, m.info.origin.position.y
+        thr = self.get_parameter('obstacle_cost_threshold').value
+
+        grid = np.asarray(m.data, dtype=np.int16).reshape(h, w)
+        free = (grid < thr) & (grid >= -1)        # -1 = unobserved, count as free
+
+        col = int((start_xy[0] - ox) / res)
+        row = int((start_xy[1] - oy) / res)
+        if not (0 <= col < w and 0 <= row < h) or not free[row, col]:
+            return None                            # drone off-map or in a wall
+
+        # Breadth-first flood. A deque of row ranges would be faster, but the
+        # grid is a few hundred thousand cells and this runs once per plan.
+        reached = np.zeros_like(free)
+        reached[row, col] = True
+        stack = [(row, col)]
+        while stack:
+            r, c = stack.pop()
+            for dr, dc in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                r2, c2 = r + dr, c + dc
+                if 0 <= r2 < h and 0 <= c2 < w and free[r2, c2] and not reached[r2, c2]:
+                    reached[r2, c2] = True
+                    stack.append((r2, c2))
+        return reached
+
+    def _is_reachable(self, x, y, reached):
+        """Look one point up in the grid from _reachable_from."""
+        if reached is None:
+            return True
+        m = self.costmap
+        res = m.info.resolution
+        col = int((x - m.info.origin.position.x) / res)
+        row = int((y - m.info.origin.position.y) / res)
+        if not (0 <= col < m.info.width and 0 <= row < m.info.height):
+            return True                            # outside the map: let Nav2 try
+        return bool(reached[row, col])
 
     def _camera_fov(self):
         """Return (horizontal, vertical) field of view in radians.
@@ -1051,4 +1324,4 @@ def main():
     rclpy.spin(node)
 
 if __name__ == '__main__':
-        main() 
+        main()
