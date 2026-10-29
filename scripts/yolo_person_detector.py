@@ -10,14 +10,27 @@ Setup (one-time, not a repo change - installed into your user site-packages
 so the rest of the ROS2/cv_bridge stack, which needs numpy 1.x, is
 untouched):
 
-    python3 -m pip install --user torch --index-url https://download.pytorch.org/whl/cpu
+    python3 -m pip install --user torch torchvision --index-url https://download.pytorch.org/whl/cpu
     python3 -m pip install --user ultralytics "opencv-python<5" "numpy<2"
+    python3 -m pip uninstall -y opencv-python
+    python3 -m pip install --user "opencv-python-headless<5" "numpy<2"
 
 (That exact numpy/opencv-python pinning matters: ultralytics pulls in
 numpy>=2 and a numpy2-only opencv-python by default, which silently breaks
 cv_bridge - it's compiled against the system's numpy 1.21. Pin both back
 down or every other script in this package that uses cv_bridge, including
-the dataset-capture scripts, breaks too, in the same Python environment.)
+the dataset-capture scripts, breaks too, in the same Python environment.
+
+The swap to the headless build matters too: opencv-python bundles its own
+Qt plugins, and they replace the system ones PyQt5 needs, so the ground
+station dies with 'Could not load the Qt platform plugin "xcb"'. Nothing
+here opens OpenCV windows, so headless loses nothing.
+
+torchvision has to come from the CPU index in the first command too. If
+ultralytics pulls it from PyPI instead, it is a CUDA build that does not
+match CPU torch, and the first frame fails with "operator torchvision::nms
+does not exist". Check with `python3 -m pip list --user | grep torch`: both
+should end in +cpu.)
 
 No GPU on this machine (checked earlier this session) - this runs on CPU.
 A "nano" model is the right choice for that, but still expect single-digit

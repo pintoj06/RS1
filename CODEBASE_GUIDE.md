@@ -176,7 +176,7 @@ simulation above is already running, and just start one extra Python node each.
 | File | Role |
 |---|---|
 | `simple_trees.sdf` | Small, minimal world — good for quick iteration/testing. |
-| `large_demo.sdf` | Bigger world; also contains four extra pre-placed demo models (`demo_animal`, `demo_tree_healthy`, `demo_tree_fire`, `demo_tree_burnt`) used by the dynamic-world example. |
+| `large_demo.sdf` | Bigger world: the Blue Mountains scenery, the AeroAid ute, `person1`, and two animals (`demo_animal`, a kangaroo, and `wombat1`). |
 
 ### `models/`
 | Folder | Role |
