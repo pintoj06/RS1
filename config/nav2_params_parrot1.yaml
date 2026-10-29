@@ -196,14 +196,19 @@ local_costmap:
         enabled: true
         observation_sources: scan
         scan:
-          topic: scan
+          # ABSOLUTE topic name. The costmap node sits in the namespace
+          # /parrot1/global_costmap (or /local_costmap), so a relative "scan"
+          # resolves to /parrot1/global_costmap/scan - a topic nothing
+          # publishes. The obstacle layer then silently receives nothing and
+          # the costmap stays empty no matter what the ranges are set to.
+          topic: /parrot1/scan
           max_obstacle_height: 30.0
           clearing: true
           marking: true
           data_type: LaserScan
-          raytrace_max_range: 20.0
+          raytrace_max_range: 40.0
           raytrace_min_range: 0.0
-          obstacle_max_range: 10.0
+          obstacle_max_range: 40.0
           obstacle_min_range: 0.0
       static_layer:
         plugin: nav2_costmap_2d::StaticLayer
@@ -220,14 +225,25 @@ global_costmap:
       global_frame: parrot1_odom
       robot_base_frame: parrot1_base_link
       use_sim_time: true
-      # A costmap that travels with the drone rather than being sized from a
-      # stored map. This is Nav2's standard outdoor/GPS configuration and it
-      # works at any altitude, with or without lidar returns.
-      rolling_window: true
-      width: 50
-      height: 50
+      # FIXED, not rolling. A rolling costmap slides along with the drone and
+      # forgets everything behind it, so an obstacle seen on one sweep leg was
+      # gone by the next - nothing could be planned around. This one covers the
+      # whole flyable area and keeps what the lidar has seen, which is what
+      # lets the search planner route around the mountain instead of into it.
+      #
+      # Sized in the odom frame, whose origin is the drone's spawn point. The
+      # terrain runs roughly x -22..51, y -12..39 in odom, so this covers it
+      # with margin. Nothing outside these bounds can be mapped or planned in.
+      rolling_window: false
+      origin_x: -30.0
+      origin_y: -25.0
+      width: 80
+      height: 80
       footprint: '[ [0.25, 0.25], [0.25, -0.25], [-0.25, -0.25], [-0.25, 0.25] ]'
-      resolution: 0.1
+      # 0.15 rather than 0.1: the fixed map covers 2.5x the area of the old
+      # rolling one, and this keeps the cell count (and so the publish load)
+      # about the same. Still far finer than the 0.25 m drone footprint.
+      resolution: 0.15
       # Treat never-observed cells as free. At survey altitude the lidar sees
       # nothing, so everything is unobserved; leaving this true stops the
       # planner from routing anywhere.
@@ -243,14 +259,19 @@ global_costmap:
         enabled: true
         observation_sources: scan
         scan:
-          topic: scan
+          # ABSOLUTE topic name. The costmap node sits in the namespace
+          # /parrot1/global_costmap (or /local_costmap), so a relative "scan"
+          # resolves to /parrot1/global_costmap/scan - a topic nothing
+          # publishes. The obstacle layer then silently receives nothing and
+          # the costmap stays empty no matter what the ranges are set to.
+          topic: /parrot1/scan
           max_obstacle_height: 30.0
           clearing: true
           marking: true
           data_type: LaserScan
-          raytrace_max_range: 20.0
+          raytrace_max_range: 40.0
           raytrace_min_range: 0.0
-          obstacle_max_range: 10.0
+          obstacle_max_range: 40.0
           obstacle_min_range: 0.0
       static_layer:
         plugin: nav2_costmap_2d::StaticLayer
