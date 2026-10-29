@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Start the whole AeroAid stack in the Blue Mountains (Three Sisters) world:
-# Gazebo + scout (parrot1) + courier (parrot2) + Nav2 + ground station UI.
+# Gazebo + scout (parrot1) + courier (parrot2) + Nav2 + ground station UI
+# + the scout's RGB person detector.
 #
 #   ./run_blue_mountains.sh          start everything
 #   ./run_blue_mountains.sh kill     stop everything and clean up strays
@@ -47,6 +48,7 @@ cleanup() {
     pkill -f parameter_bridge  2>/dev/null
     pkill -f ruby              2>/dev/null
     pkill -f ground_station    2>/dev/null
+    pkill -f yolo_person_detector 2>/dev/null
     pkill -f search_node       2>/dev/null
     pkill -f courier_node      2>/dev/null
     pkill -f rviz2             2>/dev/null
@@ -117,7 +119,7 @@ tab() {
     esac
 }
 
-echo "1/4  Simulation (Blue Mountains) + scout + courier + Nav2"
+echo "1/5  Simulation (Blue Mountains) + scout + courier + Nav2"
 tab "sim" "ros2 launch $PKG 41068_ignition.launch.py \
     world:=$WORLD parrot:=true courier:=true large_courier:=$LARGE_COURIER \
     husky:=false nav2:=true rviz:=false"
@@ -125,7 +127,7 @@ tab "sim" "ros2 launch $PKG 41068_ignition.launch.py \
 echo "     waiting ${SIM_WAIT}s for the simulation to come up..."
 sleep "$SIM_WAIT"
 
-echo "2/4  Ground station"
+echo "2/5  Ground station"
 tab "gui" "ros2 run $PKG ground_station.py --ros-args \
     -r __ns:=/$SCOUT -p robot_name:=$SCOUT -p aerial_map:=$AERIAL_MAP $TF_REMAP"
 
@@ -133,17 +135,27 @@ sleep 2
 
 # The scout idles until a search area is drawn in the ground station, and
 # both drones stay on the ute until LAUNCH is pressed there.
-echo "3/4  Scout search"
+# Confirms contacts: one is raised only when the thermal camera sees body
+# heat AND this detector sees a human there (see _check_detections in
+# UI/ground_station.py).
+# Needs ultralytics - see the top of scripts/yolo_person_detector.py.
+echo "3/5  Scout RGB person detector (YOLO)"
+tab "yolo" "ros2 run $PKG yolo_person_detector.py --ros-args \
+    -r __ns:=/$SCOUT -p robot_name:=$SCOUT -p use_sim_time:=true"
+
+sleep 2
+
+echo "4/5  Scout search"
 tab "scout" "ros2 launch $PKG 41068_search.launch.py robot:=$SCOUT"
 
 sleep 2
 
-echo "4/4  Courier"
+echo "5/5  Courier"
 tab "courier" "ros2 launch $PKG 41068_courier_demo.launch.py robot:=$COURIER"
 
 cat <<EOF
 
-All four stages started ($TERM_KIND).
+All five stages started ($TERM_KIND).
 
   Both drones are sitting on the ute. In the ground station:
     1. SET AREA, then drag a box on the map (the aerial photo is shown

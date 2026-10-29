@@ -45,6 +45,7 @@ from geometry_msgs.msg import Point32, PointStamped, PolygonStamped
 from nav_msgs.msg import OccupancyGrid
 from sensor_msgs.msg import Image
 from std_msgs.msg import Bool, String
+from vision_msgs.msg import Detection2DArray
 import tf2_ros
 
 from cv_bridge import CvBridge
@@ -132,9 +133,11 @@ class GroundStationNode(Node):
         self.thermal_min_k = float(self.get_parameter("thermal_min_k").value)
         self.thermal_max_k = float(self.get_parameter("thermal_max_k").value)
 
-        # Thermal person detection. Scenery sits at ambient (~288 K) and the
+        # Thermal body-heat check. Scenery sits at ambient (~288 K) and the
         # person at body heat (310 K), so a plain threshold is enough in sim.
-        # min_pixels is the hot area needed before a contact is raised. From
+        # Heat on its own never raises a contact (animals are warm too): it
+        # holds the search so the RGB detector can check - see
+        # MainWindow._check_detections. min_pixels is the hot area needed. From
         # the ~10 m survey altitude a whole person is roughly 1000 px, so 600
         # needs most of the body in frame instead of a sliver at the edge.
         self.declare_parameter("person_min_k", 305.0)
@@ -145,6 +148,22 @@ class GroundStationNode(Node):
         self.person_min_k = float(self.get_parameter("person_min_k").value)
         self.person_min_pixels = int(self.get_parameter("person_min_pixels").value)
         self.dismiss_cooldown_s = float(self.get_parameter("dismiss_cooldown_s").value)
+
+        # A contact needs heat AND an RGB (YOLO) human. When heat is seen, the
+        # search holds for up to rgb_check_s so the detector, single-digit
+        # FPS on CPU, gets several frames of the spot. One RGB sighting counts
+        # for rgb_fresh_s, since detector frames arrive slower than the GUI
+        # checks. detector_stale_s without any detections message (empty or
+        # not) means the detector is not running.
+        self.declare_parameter("rgb_check_s", 6.0)
+        self.declare_parameter("rgb_fresh_s", 1.5)
+        self.declare_parameter("detector_stale_s", 5.0)
+        self.rgb_check_s = float(self.get_parameter("rgb_check_s").value)
+        self.rgb_fresh_s = float(self.get_parameter("rgb_fresh_s").value)
+        self.detector_stale_s = float(self.get_parameter("detector_stale_s").value)
+        # (best confidence, monotonic time) of the latest frame with a human.
+        self.rgb_hit: Optional[Tuple[float, float]] = None
+        self._detections_time = 0.0
         # (peak kelvin, hot pixel count) for the latest frame, None if nothing.
         self.thermal_hit: Optional[Tuple[float, int]] = None
 
@@ -215,6 +234,10 @@ class GroundStationNode(Node):
         # 'annotated_topic' parameter (default below is that default).
         self.create_subscription(Image, "camera/person_detections_image",
                                  self._on_ai, qos_profile_sensor_data)
+        # Same node's structured output (its 'detections_topic'). This is
+        # what raises contacts; the image above is only for display.
+        self.create_subscription(Detection2DArray, "camera/person_detections",
+                                 self._on_detections, 10)
         self.create_subscription(OccupancyGrid, "map", self._on_map, map_qos)
 
         self.decision_pub = self.create_publisher(String, "operator/decision", 10)
@@ -298,6 +321,23 @@ class GroundStationNode(Node):
         except Exception as exc:
             self.get_logger().warn(f"AI detections decode failed: {exc}", once=True)
 
+    def _on_detections(self, msg: Detection2DArray):
+        now = time.monotonic()
+        self._detections_time = now
+        scores = [r.hypothesis.score for d in msg.detections for r in d.results]
+        if scores:
+            self.rgb_hit = (max(scores), now)
+
+    def fresh_rgb_hit(self) -> Optional[float]:
+        """Confidence of a human seen in the last rgb_fresh_s, else None."""
+        if self.rgb_hit is None:
+            return None
+        conf, seen = self.rgb_hit
+        return conf if time.monotonic() - seen < self.rgb_fresh_s else None
+
+    def detector_alive(self) -> bool:
+        return time.monotonic() - self._detections_time < self.detector_stale_s
+
     def _on_thermal(self, msg: Image):
         """Thermal may arrive 16-bit, 8-bit or colour depending on the xacro.
         Handle all three, and false-colour mono so heat reads instantly rather
@@ -325,7 +365,7 @@ class GroundStationNode(Node):
     def _detect_person(self, kelvin: np.ndarray,
                        frame: np.ndarray) -> Optional[Tuple[float, int]]:
         """Threshold for body heat. Boxes the hot region on the frame so a
-        frozen frame shows what triggered the contact."""
+        frozen frame shows what triggered the check."""
         hot = kelvin >= self.person_min_k
         count = int(np.count_nonzero(hot))
         if count < self.person_min_pixels:
@@ -909,6 +949,14 @@ class MainWindow(QMainWindow):
         self._blink = False
         self._select_newest = False
         self._no_check_until = 0.0
+        # Thermal check in progress (see _check_detections): when it gives
+        # up, where it started, the best heat seen and the IR frame at start.
+        self._check_until: Optional[float] = None
+        self._check_xy = (0.0, 0.0)
+        self._check_heat_conf = 0.0
+        self._check_ir_frame: Optional[np.ndarray] = None
+        # Heat the RGB check did not confirm as human; not checked again.
+        self.rejected_spots: List[Tuple[float, float]] = []
         self.page = PAGE_MAP
         # A confirmed person keeps the drone holding over them until the
         # operator explicitly resumes the search.
@@ -1029,6 +1077,12 @@ class MainWindow(QMainWindow):
         self.hold_label.setStyleSheet(f"color:{RED}; border:none; padding-left:24px;")
         row.addWidget(self.hold_label)
 
+        # RGB person detector (yolo_person_detector.py) running or not.
+        self.ai_label = QLabel("AI ---")
+        self.ai_label.setFont(QFont("DejaVu Sans Mono", 10))
+        self.ai_label.setStyleSheet(f"color:{RED}; border:none; padding-left:24px;")
+        row.addWidget(self.ai_label)
+
         self.link_label = QLabel("LINK ---")
         self.link_label.setFont(QFont("DejaVu Sans Mono", 10))
         self.link_label.setStyleSheet(f"color:{MUTED}; border:none; padding-left:24px;")
@@ -1141,10 +1195,12 @@ class MainWindow(QMainWindow):
         self._update_hold()
 
     def _update_hold(self):
-        """Hold while any contact is unruled, or after a confirm until the
-        operator presses RESUME. A dismiss on its own lets the search go on."""
+        """Hold while any contact is unruled, while the RGB camera checks a
+        thermal signature, or after a confirm until the operator presses
+        RESUME. A dismiss on its own lets the search go on."""
         pending = any(c.status == "UNCONFIRMED" for c in self.contacts)
-        self.node.set_hold(pending or self.hold_for_confirmed)
+        checking = self._check_until is not None
+        self.node.set_hold(pending or checking or self.hold_for_confirmed)
 
     def _resume_search(self):
         self.hold_for_confirmed = False
@@ -1159,35 +1215,86 @@ class MainWindow(QMainWindow):
         self._select_newest = True
         self._update_hold()
 
-    def _check_thermal(self):
-        """Turn a thermal hit into a contact and stop the drone.
+    def _check_detections(self):
+        """Raise a contact only when there is body heat AND the RGB detector
+        sees a human.
 
-        The contact goes at the drone's position; the camera looks down from
+        Thermal is a checkpoint, not a detection. Body heat in view holds
+        the search (up to rgb_check_s) and lets the RGB detector look; a
+        human seen in that time raises the contact. Nothing seen: the heat
+        was something else (e.g. an animal), so resume and don't hold for
+        heat within CONTACT_RADIUS of that spot again. An RGB sighting with
+        no heat (no check running, nothing hot in view) does nothing.
+
+        A rejected spot only stops the drone holding there again. Heat and a
+        human seen together there (e.g. on a later sweep row) still raise a
+        contact, so a person the detector missed once can still be found.
+
+        The contact goes at the drone's position; the cameras look down from
         close above, so that is within a few metres. No checks while a
         contact is waiting for a ruling (the drone is already holding), or for
         dismiss_cooldown_s after a dismiss. A hit near a confirmed contact is
         the same person and is ignored, so RESUME doesn't re-trigger on them.
         """
-        hit = self.node.thermal_hit
-        if hit is None:
-            return
         if any(c.status == "UNCONFIRMED" for c in self.contacts):
             return
-        if time.monotonic() < self._no_check_until:
+        now = time.monotonic()
+        if now < self._no_check_until:
             return
         x, y = self.node.drone_xy or (0.0, 0.0)
-        if any(c.status == "CONFIRMED" and
-               np.hypot(c.x - x, c.y - y) < self.CONTACT_RADIUS
-               for c in self.contacts):
+        if self._near(x, y, [(c.x, c.y) for c in self.contacts
+                             if c.status == "CONFIRMED"]):
             return
-        peak_k, count = hit
-        self.node.get_logger().warn(
-            f"Thermal contact: {count} px, peak {peak_k:.1f} K")
-        # Keep the triggering frame on the IR page as evidence.
-        self.ir_page.frozen = self.node.thermal_frame
-        self._raise_contact(
-            x, y, rgb_conf=0.0,
-            thermal_conf=min(1.0, count / (4.0 * self.node.person_min_pixels)))
+
+        heat = self.node.thermal_hit
+        if heat is not None:
+            peak_k, count = heat
+            heat_conf = min(1.0, count / (4.0 * self.node.person_min_pixels))
+        checking = self._check_until is not None
+        rgb_conf = self.node.fresh_rgb_hit()
+
+        # Heat now, or heat that started the check still running.
+        if rgb_conf is not None and (heat is not None or checking):
+            thermal_conf = heat_conf if heat is not None else 0.0
+            if checking:
+                thermal_conf = max(thermal_conf, self._check_heat_conf)
+            self.node.get_logger().warn(
+                f"Contact: thermal signature confirmed by RGB, "
+                f"human {rgb_conf:.0%}")
+            # Keep the frames that triggered the contact as evidence.
+            self.vis_page.frozen = self.node.display_frame
+            self.ir_page.frozen = (self.node.thermal_frame if heat is not None
+                                   else self._check_ir_frame)
+            self._check_until = None
+            self._raise_contact(x, y, rgb_conf=rgb_conf,
+                                thermal_conf=thermal_conf)
+            return
+
+        if self._check_until is not None:
+            if heat is not None:
+                self._check_heat_conf = max(self._check_heat_conf, heat_conf)
+            if now >= self._check_until:
+                self.node.get_logger().info(
+                    "Thermal signature not confirmed by RGB, resuming search.")
+                self.rejected_spots.append(self._check_xy)
+                self._check_until = None
+                self._update_hold()
+            return
+
+        if heat is not None and not self._near(x, y, self.rejected_spots):
+            self.node.get_logger().warn(
+                f"Thermal signature ({count} px, peak {peak_k:.1f} K), "
+                f"checking with the RGB camera")
+            self._check_until = now + self.node.rgb_check_s
+            self._check_xy = (x, y)
+            self._check_heat_conf = heat_conf
+            self._check_ir_frame = self.node.thermal_frame
+            self._update_hold()
+
+    def _near(self, x: float, y: float,
+              spots: List[Tuple[float, float]]) -> bool:
+        return any(np.hypot(sx - x, sy - y) < self.CONTACT_RADIUS
+                   for sx, sy in spots)
 
     def _simulate_contact(self):
         """Lets you build and test the whole interface before the detector
@@ -1203,7 +1310,7 @@ class MainWindow(QMainWindow):
         self._blink = not self._blink
 
     def refresh(self):
-        self._check_thermal()
+        self._check_detections()
         self.map_page.contacts = self.contacts
         self.contacts_page.refresh(self.contacts)
         if self._select_newest:
@@ -1223,7 +1330,16 @@ class MainWindow(QMainWindow):
         else:
             self.caution.setText("")
 
-        self.hold_label.setText("SEARCH HOLD" if self.node.holding else "")
+        if self._check_until is not None:
+            self.hold_label.setText("IR CHECK")
+        else:
+            self.hold_label.setText("SEARCH HOLD" if self.node.holding else "")
+
+        # Without the detector nothing can raise a contact, so say so.
+        ai = self.node.detector_alive()
+        self.ai_label.setText("AI OK" if ai else "AI ---")
+        self.ai_label.setStyleSheet(
+            f"color:{CONFIRM if ai else RED}; border:none; padding-left:24px;")
 
         live = self.node.drone_xy is not None
         self.link_label.setText("LINK OK" if live else "LINK ---")

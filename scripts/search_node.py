@@ -249,8 +249,8 @@ class SearchNode(Node):
         self.index = 0
         self.busy= False
         # Hold = stop sweeping and hover where we are. The ground station sets
-        # it when the thermal camera picks up a person, and clears it once the
-        # operator has ruled on the contact.
+        # it while the RGB camera checks a thermal signature and while a
+        # contact waits for the operator's ruling, and clears it after.
         self.holding = False
         self.goal_handle = None
         # Times in a row Nav2 has rejected the current waypoint (see goal_response).
