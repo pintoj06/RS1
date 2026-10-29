@@ -42,7 +42,7 @@ from rclpy.qos import (QoSDurabilityPolicy, QoSHistoryPolicy, QoSProfile,
                        QoSReliabilityPolicy, qos_profile_sensor_data)
 
 from geometry_msgs.msg import Point32, PointStamped, PolygonStamped
-from nav_msgs.msg import OccupancyGrid
+from nav_msgs.msg import OccupancyGrid, Path
 from sensor_msgs.msg import Image
 from std_msgs.msg import Bool, String
 import tf2_ros
@@ -82,6 +82,14 @@ DRONE  = "#FFFFFF"   # drone marker and flight trail
 MAP_UNKNOWN = (62, 38, 54)      # unscanned, plum-dark
 MAP_FREE    = (188, 188, 188)   # swept and clear — #BCBCBC
 MAP_WALL    = (18, 18, 18)      # obstacle — #121212
+# Ground the scout's camera has already swept. Deliberately low-contrast:
+# it is reassurance, not a thing demanding a decision, and must not compete
+# with a contact marker.
+COVERED     = (90, 225, 230, 70)   # RGBA, drawn over the map
+PLANNED     = "#00FF88"            # planned sweep route — bright green.
+                                   # Kept clear of ALERT's yellow-green so
+                                   # an unruled contact still reads as the
+                                   # one thing wanting a decision.
 
 PAGE_MAP, PAGE_VIS, PAGE_IR, PAGE_CONTACTS = range(4)
 
@@ -189,6 +197,15 @@ class GroundStationNode(Node):
         self.aerial_bounds: Optional[Tuple[float, float, float, float]] = None
         self._load_aerial(str(self.get_parameter("aerial_map").value))
 
+        # Coverage the scout has achieved, from its search_coverage grid.
+        # Pre-rendered to an RGBA image in the callback rather than in
+        # paintEvent, the same way the SLAM map is, so repaints stay cheap.
+        self.coverage_image: Optional[np.ndarray] = None      # RGBA
+        self.coverage_bounds: Optional[Tuple[float, float, float, float]] = None
+        self.coverage_percent: Optional[float] = None
+        # Planned sweep route, in the map frame once transformed.
+        self.search_path: List[Tuple[float, float]] = []
+
         self.drone_xy: Optional[Tuple[float, float]] = None
         self.drone_yaw = 0.0
         self.trail = deque(maxlen=3000)
@@ -216,6 +233,15 @@ class GroundStationNode(Node):
         self.create_subscription(Image, "camera/person_detections_image",
                                  self._on_ai, qos_profile_sensor_data)
         self.create_subscription(OccupancyGrid, "map", self._on_map, map_qos)
+        # The scout publishes this with default (volatile) QoS, so a plain
+        # subscription matches it.
+        self.create_subscription(OccupancyGrid, "search_coverage",
+                                 self._on_coverage, 10)
+        # Latched by the scout, so the route arrives even if this starts later.
+        path_qos = QoSProfile(depth=1,
+                              reliability=QoSReliabilityPolicy.RELIABLE,
+                              durability=QoSDurabilityPolicy.TRANSIENT_LOCAL)
+        self.create_subscription(Path, "search_path", self._on_path, path_qos)
 
         self.decision_pub = self.create_publisher(String, "operator/decision", 10)
 
@@ -361,6 +387,67 @@ class GroundStationNode(Node):
         self.map_origin = (msg.info.origin.position.x, msg.info.origin.position.y)
         self.map_frame = msg.header.frame_id
 
+    def _on_coverage(self, msg: OccupancyGrid):
+        """Turn the scout's coverage grid into a translucent overlay.
+
+        The grid is published in the scout's ODOM frame while this map is
+        drawn in its MAP frame. Those two differ by SLAM's running correction
+        - around a metre, and it moves during a flight - so the offset is
+        looked up from TF rather than assumed to be zero. If the lookup is not
+        available yet the overlay is simply held back; drawing it in the wrong
+        place would be worse than not drawing it.
+        """
+        w, h = msg.info.width, msg.info.height
+        if w == 0 or h == 0:
+            return
+
+        try:
+            tf = self.tf_buffer.lookup_transform(
+                self.map_frame, msg.header.frame_id,
+                rclpy.time.Time(), timeout=Duration(seconds=0.05))
+        except Exception:
+            return
+
+        grid = np.asarray(msg.data, dtype=np.int8).reshape(h, w)
+
+        rgba = np.zeros((h, w, 4), dtype=np.uint8)
+        rgba[grid > 0] = COVERED            # everything else stays transparent
+        # Row 0 of an OccupancyGrid is the bottom of the world, row 0 of an
+        # image is the top - same flip the SLAM map does.
+        self.coverage_image = np.flipud(rgba).copy()
+
+        res = msg.info.resolution
+        ox = msg.info.origin.position.x + tf.transform.translation.x
+        oy = msg.info.origin.position.y + tf.transform.translation.y
+        self.coverage_bounds = (ox, oy, ox + w * res, oy + h * res)
+
+        # Percentage of the cells the scout counts as searchable. It already
+        # leaves obstacles and unreachable ground out of its grid, so this is
+        # progress against what can actually be flown, not the whole box.
+        searched = int(np.count_nonzero(grid > 0))
+        total = int(np.count_nonzero(grid >= 0))
+        self.coverage_percent = (100.0 * searched / total) if total else None
+
+    def _on_path(self, msg: Path):
+        """Store the scout's planned sweep, shifted into this map's frame.
+
+        Same odom-to-map offset the coverage overlay needs; without it the
+        route would be drawn about a metre from where the drone actually flies.
+        """
+        if not msg.poses:
+            self.search_path = []
+            return
+        try:
+            tf = self.tf_buffer.lookup_transform(
+                self.map_frame, msg.header.frame_id,
+                rclpy.time.Time(), timeout=Duration(seconds=0.05))
+        except Exception:
+            return
+        dx = tf.transform.translation.x
+        dy = tf.transform.translation.y
+        self.search_path = [(p.pose.position.x + dx, p.pose.position.y + dy)
+                            for p in msg.poses]
+
     def _poll_pose(self):
         """Ask TF where the drone is, in the map's own frame.
 
@@ -377,16 +464,20 @@ class GroundStationNode(Node):
             y = tf.transform.translation.y
         except Exception:
             # No map frame until SLAM starts, which is after takeoff. Until
-            # then use odom, which is the Gazebo world frame, shifted by the
-            # spawn point into where the map frame will be.
+            # then use odom, which is what the view is already drawn in: the
+            # aerial photo was placed by subtracting the spawn point, so odom
+            # coordinates land in the right place as they are. Subtracting the
+            # spawn again would move the drone marker 2 m from where it
+            # actually is - odom's origin IS the spawn point, so a position
+            # looked up in odom is already relative to it.
             try:
                 tf = self.tf_buffer.lookup_transform(
                     self.odom_frame, self.base_frame, rclpy.time.Time(),
                     timeout=Duration(seconds=0.05))
             except Exception:
                 return  # normal at startup, before transforms flow
-            x = tf.transform.translation.x - self.spawn_xy[0]
-            y = tf.transform.translation.y - self.spawn_xy[1]
+            x = tf.transform.translation.x
+            y = tf.transform.translation.y
         self.drone_xy = (x, y)
 
         q = tf.transform.rotation
@@ -447,11 +538,17 @@ class GroundStationNode(Node):
             # Drawn on the aerial photo before SLAM has a map - usually while
             # the drones are still on the ute, and SLAM gets no lidar returns
             # at survey height, so the map frame may not exist for a while.
-            # Send it in odom instead, which is the Gazebo world frame: the
-            # same spawn shift the photo was placed with, the other way.
+            # Send it in odom, the only frame that definitely exists yet.
+            #
+            # The corners go as they are. _load_aerial already subtracted the
+            # spawn point when it placed the photo, so the view - and anything
+            # dragged on it - is ALREADY in this frame. Shifting by the spawn
+            # again would convert them back to Gazebo world coordinates while
+            # still labelling them odom, putting the search area 2 m from
+            # where the operator drew it. odom's origin is the drone's start
+            # point, not the world origin; those are only the same thing when
+            # a robot happens to spawn at (0, 0).
             msg.header.frame_id = self.odom_frame
-            sx, sy = self.spawn_xy
-            corners = [(x + sx, y + sy) for x, y in corners]
         else:
             msg.header.frame_id = self.map_frame
         for x, y in corners:
@@ -550,6 +647,8 @@ class MapPage(QWidget):
         self.node = node
         self.contacts: List[Contact] = []
         self.show_trail = True
+        self.show_coverage = True
+        self.show_path = True
         self.show_contacts = True
         self.zoom = 1.0
         self.show_aerial = node.aerial_image is not None
@@ -709,6 +808,30 @@ class MapPage(QWidget):
             p.drawPixmap(self._rect_for(*self._slam_bounds()),
                          QPixmap.fromImage(qimg), QRectF(0, 0, w, h))
 
+        # Searched ground, under everything else. Drawn straight from the
+        # pre-rendered RGBA image; the transparent cells let the map and the
+        # aerial photo show through where nothing has been swept yet.
+        if (self.show_coverage and self.node.coverage_image is not None
+                and self.node.coverage_bounds is not None):
+            cov = self.node.coverage_image
+            ch, cw, _ = cov.shape
+            cimg = QImage(cov.data, cw, ch, 4 * cw, QImage.Format_RGBA8888).copy()
+            p.drawPixmap(self._rect_for(*self.node.coverage_bounds),
+                         QPixmap.fromImage(cimg), QRectF(0, 0, cw, ch))
+
+        # The planned sweep, under the trail so the line the drone actually
+        # flew reads on top of the one it meant to. Where the route jumps
+        # around an obstacle the gap is visible, which is the point.
+        if self.show_path and len(self.node.search_path) > 1:
+            pts = [self._world_to_widget(x, y) for x, y in self.node.search_path]
+            p.setPen(QPen(QColor(PLANNED), 2, Qt.DashLine))
+            for a, b in zip(pts, pts[1:]):
+                p.drawLine(a, b)
+            p.setPen(QPen(QColor(PLANNED), 1))
+            p.setBrush(QColor(PLANNED))
+            for q in pts:
+                p.drawEllipse(q, 3, 3)
+
         # Under the trail and contacts, so it reads as ground marking rather
         # than another overlay competing with the things that need a decision.
         self._draw_area(p)
@@ -740,6 +863,15 @@ class MapPage(QWidget):
             p.setPen(QPen(QColor(TEXT), 1))
             p.drawPolygon(QPointF(12, 0), QPointF(-7, 7), QPointF(-7, -7))
             p.restore()
+
+        # How much of the searchable ground has been swept. The one number
+        # that answers "is this area done?", so it stays on screen rather than
+        # living only in the search node's terminal.
+        if self.show_coverage and self.node.coverage_percent is not None:
+            p.setPen(QColor(CONFIRM if self.node.coverage_percent >= 99.5 else TEXT))
+            p.setFont(QFont("DejaVu Sans Mono", 10, QFont.Bold))
+            p.drawText(18, self.height() - 18,
+                       f"SEARCHED  {self.node.coverage_percent:5.1f}%")
 
         if self.draw_mode and self._drag_a is None:
             p.setPen(QColor(ALERT))
