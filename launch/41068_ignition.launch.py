@@ -58,6 +58,7 @@ def add_robot(
     spawn_delay=0.0,
     takeoff_altitude=None,
     care_package=None,
+    cameras=True,
 ):
     """Add one robot instance to the launch description.
 
@@ -71,6 +72,9 @@ def add_robot(
     care_package:=true, and the package is spawned as its own Gazebo model,
     <gz_model_name>_care_package, at the drone's spawn pose. See
     urdf_parrot/care_package.urdf.xacro.
+
+    cameras=False leaves the thermal and RGB-D cameras off a Parrot (see
+    parrot.gazebo.xacro), for a drone whose images nothing reads.
 
     Convention used here:
       - ROS nodes/topics are under /<namespace>/...
@@ -90,6 +94,8 @@ def add_robot(
             'gz_model_name:=', gz_model_name,
             ' ',
             'care_package:=', 'false' if care_package is None else 'true',
+            ' ',
+            'cameras:=', 'true' if cameras else 'false',
         ]),
         value_type=str,
     )
@@ -526,6 +532,9 @@ def generate_launch_description():
         # The courier carries the care package and drops it on the
         # confirmed contact (courier_node.py).
         care_package=PythonExpression(["'large' if ", large_courier, " else 'standard'"]),
+        # The courier flies to coordinates; only the scout's images are used
+        # (ground station), so its cameras would be rendering for nobody.
+        cameras=False,
     )
 
     add_navigation_instance(

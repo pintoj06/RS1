@@ -12,6 +12,7 @@
 #
 # Overridable from the environment, e.g.
 #   SIM_WAIT=45 LARGE_COURIER=false ./run_blue_mountains.sh
+#   HEADLESS=true ./run_blue_mountains.sh     no Gazebo window, faster
 
 set -u
 
@@ -37,6 +38,11 @@ LARGE_COURIER=${LARGE_COURIER:-true}
 # Blue Mountains is a much heavier world than simple_trees; give Gazebo,
 # SLAM and Nav2 longer to come up before anything tries to plan.
 SIM_WAIT=${SIM_WAIT:-30}
+
+# HEADLESS=true runs Gazebo without its 3D window. The ground station still
+# shows the map and both camera feeds; drawing the Blue Mountains scene a
+# second time for the window is a big share of the load on a laptop.
+HEADLESS=${HEADLESS:-false}
 
 # Every node that does a TF lookup needs these: this package pushes TF into
 # each robot's namespace instead of the global /tf.
@@ -122,7 +128,7 @@ tab() {
 echo "1/5  Simulation (Blue Mountains) + scout + courier + Nav2"
 tab "sim" "ros2 launch $PKG 41068_ignition.launch.py \
     world:=$WORLD parrot:=true courier:=true large_courier:=$LARGE_COURIER \
-    husky:=false nav2:=true rviz:=false"
+    husky:=false nav2:=true rviz:=false headless:=$HEADLESS"
 
 echo "     waiting ${SIM_WAIT}s for the simulation to come up..."
 sleep "$SIM_WAIT"
