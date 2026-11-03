@@ -76,9 +76,15 @@ class TestIsBlocked:
         # Regression: the default was once 200, on Nav2's raw 0-254 scale.
         # The published grid tops out at 100, so nothing was ever blocked and
         # the sweep was planned straight through the mountain.
-        import inspect
-        source = inspect.getsource(search_node.SearchNode.__init__)
-        default = int(source.split("'obstacle_cost_threshold',")[1].split(')')[0])
+        # Read from the whole module rather than from __init__: the
+        # declarations are grouped into _declare_* methods, and a test that
+        # knows WHICH method holds a parameter breaks every time they move.
+        import inspect, re
+        source = inspect.getsource(search_node)
+        m = re.search(r"declare_parameter\(\s*'obstacle_cost_threshold'\s*,\s*(-?\d+)",
+                      source)
+        assert m, 'obstacle_cost_threshold is no longer declared'
+        default = int(m.group(1))
         fake_search.get_parameter.values['obstacle_cost_threshold'] = default
         grid = make_costmap(4, 1)
         set_cell(grid, 0, 0, LETHAL)
@@ -851,8 +857,11 @@ def planning_node(search_node):
                       '_build_inside_mask', '_refresh_searchable',
                       '_predicted_coverage', '_already_searched',
                       '_camera_fov', '_camera_altitude', '_footprint_radius',
-                      'plan_sweep', '_review_map', '_publish_coverage',
-                      '_maybe_return_home', '_coverage_summary'):
+                      'plan_sweep', '_blocked_test', '_skip_searched_ground',
+                      '_choose_spacing', '_nothing_to_sweep', '_finish_plan',
+                      '_log_plan', '_review_map', '_publish_coverage',
+                      '_maybe_return_home', '_after_last_waypoint',
+                      '_start_pass', '_fly_home', '_coverage_summary'):
             locals()[_name] = getattr(SearchNode, _name)
         del _name
         # Still a staticmethod here, or self would be passed as its first

@@ -279,163 +279,11 @@ class SearchNode(Node):
 
     def __init__(self):
         super().__init__('search_node')
-
-        # Things that can be changed without editing the code
-        self.declare_parameter('robot_name', 'parrot1')
-        self.declare_parameter('min_x', -4.0)
-        self.declare_parameter('max_x', 4.0)
-        self.declare_parameter('min_y', -4.0)
-        self.declare_parameter('max_y', 4.0)
-        self.declare_parameter('return_to_spawn', True)
-
-        # Leg spacing is normally worked out from the live camera footprint, so
-        # it does not need setting by hand. Set this to a positive number only
-        # to FORCE a fixed spacing, which is useful for testing.
-        self.declare_parameter('spacing', 0.0)
-
-        # How much neighbouring camera passes overlap. 0.8 means each leg sits
-        # 80% of a footprint width from the last, so consecutive passes share a
-        # 20% strip. That margin is what stops small position errors from
-        # opening a gap of unseen ground between two legs.
-        self.declare_parameter('overlap', 0.8)
-
-        # --- obstacle avoidance ------------------------------------------
-        # Nav2's global costmap, which now keeps what the lidar has seen, is
-        # read so the sweep is planned around obstacles instead of through
-        # them. Set avoid_obstacles false to go back to pure geometry.
-        self.declare_parameter('avoid_obstacles', True)
-        self.declare_parameter('costmap_topic', 'global_costmap/costmap')
-        # Cost at or above which a cell counts as blocked. This is on the
-        # PUBLISHED OccupancyGrid scale, not Nav2's raw 0-254 costs: the
-        # costmap publisher translates lethal 254 -> 100, inscribed 253 -> 99
-        # and 1..252 -> 1..98. 77 is raw 200 on that scale, which also
-        # catches the strongly inflated ring around an obstacle. (The old
-        # default of 200 could never be reached, so nothing was ever blocked.)
-        self.declare_parameter('obstacle_cost_threshold', 77)
-        # How far to stay back from an obstacle edge, on top of inflation.
-        self.declare_parameter('obstacle_clearance', 1.0)
-        # Pieces of a split leg shorter than this are not worth flying.
-        self.declare_parameter('min_leg_length', 1.5)
-        # Give up on a waypoint only once the drone has stopped GETTING CLOSER
-        # to it for this long. An earlier version used a flat time limit from
-        # when the goal was sent, which was wrong: a sweep leg can be 30 m and
-        # the drone makes about 0.3 m/s, so a perfectly healthy leg took far
-        # longer than the limit and got abandoned a third of the way along.
-        # Measuring progress instead tells a slow leg apart from a stuck one.
-        self.declare_parameter('goal_stall_timeout', 60.0)  # seconds, 0 disables
-        # Getting this much closer counts as progress and resets the clock.
-        # Deliberately not a token amount: a drone bouncing off a mountain face
-        # edges a little nearer now and then, and too small a threshold lets
-        # that count as progress forever. Even the slowest honest leg seen here
-        # (0.06 m/s) closes 3.6 m in the 60 s window, so 2 m is safe for real
-        # flying while ruling out a drone that is only jostling.
-        self.declare_parameter('goal_progress_threshold', 2.0)   # metres
-        # When a waypoint turns out to be unreachable, replan the rest of the
-        # sweep against the costmap as it now stands instead of just skipping
-        # it. By the time the drone has been stopped by the side of a mountain
-        # it has mapped far more of that mountain than it had when the sweep
-        # was first planned, so a second attempt can route around what the
-        # first one did not know was there.
-        self.declare_parameter('replan_on_obstacle', True)
-        # A cap, so a genuinely impossible area cannot replan forever.
-        self.declare_parameter('max_replans', 5)
-        # Hard backstop on one waypoint, as a multiple of how long the leg
-        # should take at this speed. Needed because the progress check above
-        # can be defeated by oscillation: a drone bouncing off a mountain face
-        # creeps a little closer now and then, which keeps resetting the
-        # progress clock while it gets nowhere.
-        self.declare_parameter('goal_time_factor', 4.0)
-        self.declare_parameter('assumed_speed', 0.3)        # m/s, measured
-        # --- staying honest about what is reachable ----------------------
-        # "Unreachable" is not a fact about the world. It is a belief about
-        # where the drone has so far been able to LOOK, so it gets re-derived
-        # from the live map on this interval rather than remembered.
-        #
-        # What this replaced: a no-go disc of fixed radius around every
-        # waypoint that failed. That was wrong twice over. Wrong size - the
-        # rock in this world is 15-49 m across, so a 6 m disc blanked out less
-        # than half of one summit and the next sweep leg, 6.2 m away, landed
-        # straight back inside it. And permanent - ground written off on the
-        # approach stayed written off for the whole flight, even after the
-        # drone had flown round and could plainly see it was open.
-        self.declare_parameter('map_review_period', 2.0)    # seconds, 0 disables
-        # Replan only once the reachable part of the area has changed by at
-        # least this fraction of what the operator drew. A threshold rather
-        # than any change at all is what stops a replan on every flicker of
-        # the costmap, and it guarantees each replan makes real progress.
-        self.declare_parameter('map_review_fraction', 0.02)  # 2%
-        # Map-driven replans are normal operation rather than a failure, so
-        # they get their own generous cap, separate from max_replans.
-        self.declare_parameter('max_map_replans', 20)
-        # The lidar fires 360 rays over 360 degrees, so they fan out: the gap
-        # between neighbouring rays is 0.17 m at 10 m and 0.70 m at the 40 m
-        # limit, against a 0.15 m costmap cell. Past about 9 m a single scan
-        # therefore leaves unobserved wedges BETWEEN the rays, and "ground the
-        # lidar has seen to be clear" comes out as a thin fan rather than a
-        # solid area - measured at 24 of 96 probe points on open grass 12 m
-        # out. Gaps narrower than this, with observed-clear ground all round
-        # them, are closed up before the flood runs. Cells the costmap calls
-        # blocked are never filled in this way, so it cannot invent a way
-        # through rock; it only stops a ray gap from reading as a wall.
-        self.declare_parameter('observation_gap_fill', 0.75)   # metres
-        # How far the lidar can see, from the sensor's own <max> in the xacro.
-        # Used to rule out flying to a vantage point from which the ground in
-        # question would still be out of range - the drone would arrive having
-        # learned nothing.
-        self.declare_parameter('sensor_range', 40.0)        # metres
-        # Vantage points this close to one already used count as the same
-        # spot. Without this the drone ping-pongs between two neighbouring
-        # cells on the frontier for ever: the interior of a rock stays
-        # unverified no matter how long you look at it from outside, so there
-        # has to be something that stops the drone trying.
-        self.declare_parameter('vantage_min_separation', 3.0)   # metres
-        # Give up looking after this many trips in a row that taught us
-        # nothing. A sight line is only blocked by MAPPED obstacle - not
-        # having looked somewhere is the whole reason to go and look - so a
-        # rock whose face is only partly mapped still appears to have a way of
-        # seeing into it, and the drone would keep trying vantage points round
-        # it. Measured: a box drawn wholly inside a rock went on circling it.
-        # Judging the trips by whether they actually resolve any ground is the
-        # same progress-based test used for a stalled waypoint, and it stops
-        # after a few hops instead of running the replan budget down.
-        #
-        # 5 is measured, not guessed. Working round this world's rock ridge
-        # takes three or four trips that resolve nothing before the one that
-        # breaks through, so 3 gave up just before the payoff and searched
-        # only 43.6% of a box reaching past the ridge; 5 searched 100%. Going
-        # higher does not improve that and only adds wasted flying on an area
-        # that really is hopeless (a box drawn wholly inside a rock costs
-        # 40 m at 5, and 91 m at 10).
-        self.declare_parameter('vantage_patience', 5)
-        # Keep vantage points this far clear of mapped obstacle. A frontier
-        # cell is clear when picked but sits at the edge of what has been
-        # seen, so the next scan often fills in rock beside it and inflation
-        # swallows it - and arriving at a waypoint that has turned
-        # unreachable spends one of the FAILURE replan budget.
-        self.declare_parameter('vantage_obstacle_margin', 2.0)   # metres
-        # How much unverified ground one trip has to resolve to count as
-        # progress, as a fraction of the area the operator drew.
-        self.declare_parameter('vantage_progress_fraction', 0.02)
-        # How often to re-check that the waypoint being flown to is still
-        # reachable. The cheap "is it in an obstacle" test runs every tick;
-        # the flood fill covers the whole costmap, so it runs on this interval
-        # instead. It used to be 3 s because the flood was a 1.7 s Python
-        # loop; at 19 ms via scipy it can run every tick.
-        self.declare_parameter('goal_recheck_period', 1.0)  # seconds
-        # Drop waypoints the drone cannot actually get to, worked out by
-        # flooding outwards from its position across free costmap cells.
-        self.declare_parameter('drop_unreachable', True)
-
-        # An arbitrary search polygon, as a flat list: [x1, y1, x2, y2, ...].
-        # Leave it empty to use the min_x/max_x/min_y/max_y rectangle instead.
-        # This is the STARTING area; the operator can redraw it at any time
-        # from the ground station (see on_area_request).
-        self.declare_parameter('polygon', [0.0])
-
-        # True: hover at spawn and do nothing until the operator draws a search
-        # area in the ground station. False: start sweeping the launch-parameter
-        # area (polygon or min/max rectangle) straight away, as before.
-        self.declare_parameter('wait_for_area', True)
+        # Declared in groups rather than in one 330-line run here;
+        # __init__ was 415 lines and almost all of it was this.
+        self._declare_search_parameters()
+        self._declare_obstacle_parameters()
+        self._declare_reachability_parameters()
 
         robot_name= self.get_parameter('robot_name').value
         # Goals are stamped in the frame Nav2 plans in. That is now the odom
@@ -463,8 +311,9 @@ class SearchNode(Node):
         # where the camera has reported itself. That is also where the
         # return-to-spawn waypoint gets appended (see plan_sweep) - doing it
         # here would just be overwritten once plan_sweep() replaces self.points.
-        self.points = []
-        self.planned = False
+        # The waypoint sequence itself is set up by the one method that owns
+        # it, so startup state and reset state cannot drift apart.
+        self._start_pass()
         self.spacing = None
         # The two reachability pictures, refreshed by _review_map() and at
         # every plan. 'confirmed' is what the drone can demonstrably get to
@@ -484,10 +333,6 @@ class SearchNode(Node):
         # world, so it cannot go stale in the way "that ground is
         # unreachable" did.
         self.looked_from = []
-        # Which waypoint (if any) is a go-and-look trip rather than a sweep
-        # leg, so the operator can be told which one the drone is flying.
-        self.vantage_index = None
-        self.returning = False
         # Coverage cells written off as impossible to check: unverified, with
         # no vantage point anywhere that can see them. Kept out of the
         # coverage total, or the percentage would stall short of 100% for ever
@@ -497,23 +342,11 @@ class SearchNode(Node):
         self.unverified_at_vantage = None
         self.fruitless_vantages = 0
         self.replans = 0            # replans used on the current search area
-        self.replanning = False     # True while rebuilding after an obstacle
         self.goal_best_dist = None  # closest the drone has got to this goal
         self.goal_progress_at = None  # when it last got closer (seconds, node clock)
         self.goal_sent_at = None    # when the current goal went out
         self.last_recheck = 0.0     # when the goal was last re-validated
         self.goal_leg_length = None  # how far it was when sent
-        self.timed_out = False      # set when we abandon one as stuck
-        # Set when a replan has been asked for and we are waiting on the
-        # current goal to cancel. Initialised here, not left to a getattr
-        # default: _review_map reads it every couple of seconds to avoid
-        # asking for the same replan twice, and an attribute that only came
-        # into existence on the first abandoned waypoint crashed the node.
-        self._replan_wanted = False
-        self.home_index = None
-
-        self.index = 0
-        self.busy= False
         # Hold = stop sweeping and hover where we are. The ground station sets
         # it while the RGB camera checks a thermal signature and while a
         # contact waits for the operator's ruling, and clears it after.
@@ -592,29 +425,11 @@ class SearchNode(Node):
         self.trail_timer = self.create_timer(0.5, self.record_trail)
         self.area_timer = self.create_timer(1.0, self.publish_search_area)
 
-        # ------------------------------------------------------------------
         # COVERAGE MAP - which ground the camera has actually looked at.
-        #
-        # The camera points straight down with a 60 degree horizontal field of
-        # view (1.0472 rad, set in parrot.gazebo.xacro) and a 720x480 image,
-        # which gives roughly a 42 degree vertical field of view. So at
-        # altitude h the ground patch in view is about:
-        #
-        #     width  = 2h * tan(30 deg) = 1.155 * h
-        #     height = 2h * tan(21 deg) = 0.770 * h
-        #
-        # Rather than track a rotating rectangle, we mark a CIRCLE whose radius
-        # is half the SHORTER side. That is independent of which way the drone
-        # is facing, and it under-claims coverage rather than over-claiming it,
-        # which is the honest direction to be wrong in.
-        # ------------------------------------------------------------------
-        # Nothing about the camera is hardcoded. The lens properties come from
-        # the camera itself over CameraInfo, and the altitude comes from TF.
-        # Change the drone's spawn height, move the camera, or swap the lens,
-        # and the coverage maths follows automatically.
-        #
-        # The parameters below are only FALLBACKS, used in the first moments
-        # before CameraInfo/TF have arrived. They match the current xacro.
+        # The footprint is derived live from CameraInfo and the altitude (see
+        # _footprint_radius), so nothing here is hardcoded: the parameters
+        # below are only FALLBACKS for the first moments before CameraInfo
+        # arrives, and they match the current xacro.
         self.declare_parameter('fallback_camera_hfov', 1.0472)   # radians
         self.declare_parameter('fallback_image_width', 720)
         self.declare_parameter('fallback_image_height', 480)
@@ -708,6 +523,157 @@ class SearchNode(Node):
         self.create_subscription(
             PolygonStamped, 'search_area_request', self.on_area_request, area_qos)
 
+
+    def _declare_search_parameters(self):
+        """The search area, the camera, and how the sweep is flown."""
+
+        # Things that can be changed without editing the code
+        self.declare_parameter('robot_name', 'parrot1')
+        self.declare_parameter('min_x', -4.0)
+        self.declare_parameter('max_x', 4.0)
+        self.declare_parameter('min_y', -4.0)
+        self.declare_parameter('max_y', 4.0)
+        self.declare_parameter('return_to_spawn', True)
+
+        # Leg spacing is normally worked out from the live camera footprint, so
+        # it does not need setting by hand. Set this to a positive number only
+        # to FORCE a fixed spacing, which is useful for testing.
+        self.declare_parameter('spacing', 0.0)
+
+        # How much neighbouring camera passes overlap. 0.8 means each leg sits
+        # 80% of a footprint width from the last, so consecutive passes share a
+        # 20% strip. That margin is what stops small position errors from
+        # opening a gap of unseen ground between two legs.
+        self.declare_parameter('overlap', 0.8)
+
+
+
+    def _declare_obstacle_parameters(self):
+        """Reading the costmap, and giving up on a waypoint."""
+        # --- obstacle avoidance ------------------------------------------
+        # Nav2's global costmap, which now keeps what the lidar has seen, is
+        # read so the sweep is planned around obstacles instead of through
+        # them. Set avoid_obstacles false to go back to pure geometry.
+        self.declare_parameter('avoid_obstacles', True)
+        self.declare_parameter('costmap_topic', 'global_costmap/costmap')
+        # Cost at or above which a cell counts as blocked. This is on the
+        # PUBLISHED OccupancyGrid scale, not Nav2's raw 0-254 costs: the
+        # costmap publisher translates lethal 254 -> 100, inscribed 253 -> 99
+        # and 1..252 -> 1..98. 77 is raw 200 on that scale, which also
+        # catches the strongly inflated ring around an obstacle. (The old
+        # default of 200 could never be reached, so nothing was ever blocked.)
+        self.declare_parameter('obstacle_cost_threshold', 77)
+        # How far to stay back from an obstacle edge, on top of inflation.
+        self.declare_parameter('obstacle_clearance', 1.0)
+        # Pieces of a split leg shorter than this are not worth flying.
+        self.declare_parameter('min_leg_length', 1.5)
+        # Give up on a waypoint only once the drone has stopped GETTING CLOSER
+        # to it for this long. An earlier version used a flat time limit from
+        # when the goal was sent, which was wrong: a sweep leg can be 30 m and
+        # the drone makes about 0.3 m/s, so a perfectly healthy leg took far
+        # longer than the limit and got abandoned a third of the way along.
+        # Measuring progress instead tells a slow leg apart from a stuck one.
+        self.declare_parameter('goal_stall_timeout', 60.0)  # seconds, 0 disables
+        # Getting this much closer counts as progress and resets the clock.
+        # Deliberately not a token amount: a drone bouncing off a mountain face
+        # edges a little nearer now and then, and too small a threshold lets
+        # that count as progress forever. Even the slowest honest leg seen here
+        # (0.06 m/s) closes 3.6 m in the 60 s window, so 2 m is safe for real
+        # flying while ruling out a drone that is only jostling.
+        self.declare_parameter('goal_progress_threshold', 2.0)   # metres
+        # When a waypoint turns out to be unreachable, replan the rest of the
+        # sweep against the costmap as it now stands instead of just skipping
+        # it. By the time the drone has been stopped by the side of a mountain
+        # it has mapped far more of that mountain than it had when the sweep
+        # was first planned, so a second attempt can route around what the
+        # first one did not know was there.
+        self.declare_parameter('replan_on_obstacle', True)
+        # A cap, so a genuinely impossible area cannot replan forever.
+        self.declare_parameter('max_replans', 5)
+        # Hard backstop on one waypoint, as a multiple of how long the leg
+        # should take at this speed. Needed because the progress check above
+        # can be defeated by oscillation: a drone bouncing off a mountain face
+        # creeps a little closer now and then, which keeps resetting the
+        # progress clock while it gets nowhere.
+        self.declare_parameter('goal_time_factor', 4.0)
+        self.declare_parameter('assumed_speed', 0.3)        # m/s, measured
+
+
+    def _declare_reachability_parameters(self):
+        """Telling "never looked at" from "cannot be reached"."""
+        # --- staying honest about what is reachable ----------------------
+        # "Unreachable" is not a fact about the world. It is a belief about
+        # where the drone has so far been able to LOOK, so it gets re-derived
+        # from the live map on this interval rather than remembered.
+        #
+        # What this replaced: a no-go disc of fixed radius around every
+        # waypoint that failed. That was wrong twice over. Wrong size - the
+        # rock in this world is 15-49 m across, so a 6 m disc blanked out less
+        # than half of one summit and the next sweep leg, 6.2 m away, landed
+        # straight back inside it. And permanent - ground written off on the
+        # approach stayed written off for the whole flight, even after the
+        # drone had flown round and could plainly see it was open.
+        self.declare_parameter('map_review_period', 2.0)    # seconds, 0 disables
+        # Replan only once the reachable part of the area has changed by at
+        # least this fraction of what the operator drew. A threshold rather
+        # than any change at all is what stops a replan on every flicker of
+        # the costmap, and it guarantees each replan makes real progress.
+        self.declare_parameter('map_review_fraction', 0.02)  # 2%
+        # Map-driven replans are normal operation rather than a failure, so
+        # they get their own generous cap, separate from max_replans.
+        self.declare_parameter('max_map_replans', 20)
+        # The lidar's 360 rays fan out, so past about 9 m a single scan
+        # leaves unobserved wedges BETWEEN them (0.70 m at the 40 m limit,
+        # against 0.15 m cells). Gaps narrower than this, with observed-clear
+        # ground all round, are closed up before the flood runs - never over
+        # a cell the costmap calls blocked, so it cannot invent a way through
+        # rock. See _confirmed_from.
+        self.declare_parameter('observation_gap_fill', 0.75)   # metres
+        # How far the lidar can see, from the sensor's own <max> in the xacro.
+        # Used to rule out flying to a vantage point from which the ground in
+        # question would still be out of range - the drone would arrive having
+        # learned nothing.
+        self.declare_parameter('sensor_range', 40.0)        # metres
+        # Vantage points this close to one already used count as the same
+        # spot, or the drone ping-pongs between two neighbouring frontier
+        # cells for ever - a rock's interior is never resolved from outside.
+        self.declare_parameter('vantage_min_separation', 3.0)   # metres
+        # Give up looking after this many trips in a row that resolve
+        # nothing. Needed because unknown ground does not block a sight line,
+        # so a rock whose face is only partly mapped always looks as though
+        # something might see into it. 5 is measured: working round this
+        # world's ridge takes three or four fruitless trips before the one
+        # that breaks through, so 3 gave up just short (43.6% of the area
+        # searched) where 5 reached 100%.
+        self.declare_parameter('vantage_patience', 5)
+        # Keep vantage points this far clear of mapped obstacle: a frontier
+        # cell is clear when picked but the next scan often fills in rock
+        # beside it, and arriving at a dead waypoint costs a failure replan.
+        self.declare_parameter('vantage_obstacle_margin', 2.0)   # metres
+        # How much unverified ground one trip has to resolve to count as
+        # progress, as a fraction of the area the operator drew.
+        self.declare_parameter('vantage_progress_fraction', 0.02)
+        # How often to re-check that the waypoint being flown to is still
+        # reachable. The cheap "is it in an obstacle" test runs every tick;
+        # the flood fill covers the whole costmap, so it runs on this interval
+        # instead. It used to be 3 s because the flood was a 1.7 s Python
+        # loop; at 19 ms via scipy it can run every tick.
+        self.declare_parameter('goal_recheck_period', 1.0)  # seconds
+        # Drop waypoints the drone cannot actually get to, worked out by
+        # flooding outwards from its position across free costmap cells.
+        self.declare_parameter('drop_unreachable', True)
+
+        # An arbitrary search polygon, as a flat list: [x1, y1, x2, y2, ...].
+        # Leave it empty to use the min_x/max_x/min_y/max_y rectangle instead.
+        # This is the STARTING area; the operator can redraw it at any time
+        # from the ground station (see on_area_request).
+        self.declare_parameter('polygon', [0.0])
+
+        # True: hover at spawn and do nothing until the operator draws a search
+        # area in the ground station. False: start sweeping the launch-parameter
+        # area (polygon or min/max rectangle) straight away, as before.
+        self.declare_parameter('wait_for_area', True)
+
     def on_area_request(self, msg):
         """Operator drew a new search area in the ground station.
 
@@ -757,17 +723,14 @@ class SearchNode(Node):
         # finishing a waypoint from the old area is wasted flying.
         if self.goal_handle is not None:
             self.goal_handle.cancel_goal_async()
-        self.busy = False
-        self.index = 0
-        self.home_index = None
-        self.planned = False
+        self._start_pass()
+        # Everything the node LEARNED about the old area goes too. Kept apart
+        # from _start_pass because a replan resets the sequence but must keep
+        # all of this - the coverage it has built up, the vantage points it
+        # has already used, the ground it has written off.
         self.replans = 0
-        self.replanning = False
-        # A new area starts with a clean slate.
         self.plan_reachable_cells = None
         self.map_replans = 0
-        self.returning = False
-        self.vantage_index = None
         self.looked_from = []
         self.unverifiable = None
         self.unverified_at_vantage = None
@@ -968,12 +931,15 @@ class SearchNode(Node):
 
         This is the point of the whole search pattern: the drone should never
         have to be told how far apart to fly its legs. It can see how wide a
-        strip of ground its own camera covers, so it works the spacing out from
-        that and gaps become impossible by construction rather than something
-        we check for afterwards.
+        strip of ground its own camera covers, so it works the spacing out
+        from that, and gaps become impossible by construction rather than
+        something we check for afterwards.
 
         Called from tick() rather than __init__ because it needs live sensor
-        data. Returns True once the path has been built.
+        data. Returns True once the path has been built, False to be retried
+        on the next tick.
+
+        The work is in the four steps below; this is just their order.
         """
         if self.cam_fx is None:
             self.get_logger().info('Waiting for camera info before planning the sweep...')
@@ -985,25 +951,37 @@ class SearchNode(Node):
                 'route straight through anything out there...')
             return False
 
-        # Two different questions get asked of the same map, and the gap
-        # between the answers is the whole point:
+        blocked = self._blocked_test(avoiding)
+        chosen = self._choose_spacing(blocked)
+        if chosen is None:               # no legs: a different question
+            return self._nothing_to_sweep()
+        predicted, footprint, source = chosen
+        self._finish_plan()
+        self._log_plan(avoiding, predicted, footprint, source)
+        return True
+
+    def _blocked_test(self, avoiding):
+        """Build the "is this point off limits?" test the sweep is cut by.
+
+        Returns a callable, or None when obstacle avoidance is off. Also
+        refreshes self.confirmed and self.possible, which the rest of the
+        plan and the overlay both read.
+        """
+        # Two questions of the same map, and the gap between the answers is
+        # the whole point:
         #
-        #   confirmed - flood outwards over ground the lidar has actually SEEN
-        #               to be clear. Unobserved ground counts as WALL.
-        #   possible  - the same flood, but unobserved ground counts as FLOOR.
+        #   confirmed - flood over ground the lidar has SEEN to be clear;
+        #               unobserved ground counts as WALL
+        #   possible  - the same, but unobserved ground counts as FLOOR
         #
-        # In both           -> the drone can demonstrably get there. Plan legs.
-        # possible only     -> unverified. It might be the far side of the
-        #                      mountain or the inside of it; from here there
-        #                      is no way to tell, so do not fly at it yet.
-        # in neither        -> walled in with no way through.
+        # in both       -> demonstrably reachable. Plan legs here.
+        # possible only -> unverified: could be the far side of a rock or the
+        #                  inside of it. Do not fly at it yet.
+        # in neither    -> walled in with no way through.
         #
-        # Planning over CONFIRMED ground only is what stops waypoints being
-        # planted in solid rock. The single flood this replaced counted
-        # unobserved cells as clear, so the hollow middle of a mountain read
-        # as open ground AND the flood reached it by running round the ends of
-        # the mapped near face - both tests passed, and a waypoint went
-        # straight into the rock.
+        # Planning over CONFIRMED ground only is what keeps waypoints out of
+        # solid rock: a single flood counting unobserved cells as clear let
+        # both obstacle tests pass for a point in the middle of a mountain.
         self.confirmed = None
         self.possible = None
         if avoiding and self.get_parameter('drop_unreachable').value:
@@ -1021,17 +999,30 @@ class SearchNode(Node):
         else:
             blocked = None
 
-        # On a REPLAN, ground the camera has already swept counts as done, so
-        # the new sweep only covers what is left. Without this the drone would
-        # start the whole area again from one end every time it met an
-        # obstacle, re-flying everything it had already searched.
+        return self._skip_searched_ground(blocked)
 
+    def _skip_searched_ground(self, blocked):
+        """On a REPLAN, add "the camera has already been here" to the test.
+
+        The new sweep then only covers what is left. Without it the drone
+        starts the whole area again from one end every time it meets an
+        obstacle, re-flying everything it had already searched.
+        """
         if self.replanning:
             geometric = blocked
             if geometric is None:
-                blocked = self._already_searched
-            else:
-                blocked = lambda x, y: geometric(x, y) or self._already_searched(x, y)
+                return self._already_searched
+            return lambda x, y: (geometric(x, y)
+                                 or self._already_searched(x, y))
+        return blocked
+
+    def _choose_spacing(self, blocked):
+        """Set self.spacing and self.points, checking the result covers the area.
+
+        Returns (predicted coverage, footprint width, how the spacing was
+        arrived at), or None if the sweep came out empty - which is a
+        different situation entirely, handled by _nothing_to_sweep.
+        """
         clearance = float(self.get_parameter('obstacle_clearance').value)
         min_leg = float(self.get_parameter('min_leg_length').value)
 
@@ -1074,6 +1065,16 @@ class SearchNode(Node):
 
         # Nothing left after cutting the obstacles out: the whole area is
         # rock. Say so plainly rather than flying a meaningless path.
+        if not self.points:
+            return None
+        # Returned rather than stashed on self: the log line is the only other
+        # thing that wants them, and this node already has too much state
+        # shared between methods.
+        return predicted, footprint, source
+
+    def _nothing_to_sweep(self):
+        """No legs. Either the area really is unflyable, or we have not looked
+        at it yet, or everything reachable is already done."""
         # Nothing to sweep. That has two very different causes - the area
         # really is all rock, or we have not looked at it yet - and only the
         # first is a reason to give up.
@@ -1084,7 +1085,7 @@ class SearchNode(Node):
         # for ever. If there is ground we have not judged, fall through to the
         # go-and-look block below instead: flying to one vantage point IS the
         # plan, and it is what produces the better view.
-        if not self.points and self._unverified_cells() == 0:
+        if self._unverified_cells() == 0:
             if self.replanning:
                 self.get_logger().info(
                     'Replan found nothing left to fly: everything reachable '
@@ -1104,6 +1105,13 @@ class SearchNode(Node):
             self.replanning = False
             return True
 
+        self._finish_plan()
+        self._log_plan(bool(self.get_parameter('avoid_obstacles').value),
+                       1.0, self._footprint_radius() * 2.0, 'nothing to sweep')
+        return True
+
+    def _finish_plan(self):
+        """Tack on the end of the pass: a look-around trip, or the way home."""
         # (0, 0) in the odom frame is the spawn point (see map_frame comment
         # in __init__), so "return to spawn" is just one more waypoint tacked
         # onto the end of the sweep - no separate flight mode needed. Done
@@ -1180,6 +1188,10 @@ class SearchNode(Node):
         self.replanning = False
         self._publish_path()
 
+
+    def _log_plan(self, avoiding, predicted, footprint, source):
+        """Tell the operator what was planned and why."""
+        clearance = float(self.get_parameter('obstacle_clearance').value)
         sweep_deg = math.degrees(best_sweep_angle(self.polygon))
         self.get_logger().info(
             f'Search area: {len(self.polygon)}-sided polygon, sweeping along '
@@ -1239,15 +1251,11 @@ class SearchNode(Node):
         if self.busy: #goal is already in flight
             self._check_stalled()
             return
-        # Carry out a replan that has been asked for. This has to live here,
-        # not only in the goal-result callback, because not every path through
-        # that callback runs: a goal Nav2 REJECTS clears busy and returns
-        # without ever producing a result, so a replan requested while it was
-        # in flight was never carried out. _review_map suppresses itself while
-        # one is pending, so it then never asked again either, and the drone
-        # sat parked at a vantage point for 213 s of sim time with nothing
-        # commanding it. Doing it from the tick makes the state self-healing
-        # whatever became of the goal.
+        # Carry out a replan that has been asked for. It has to happen here
+        # and not only in the goal-result callback: a goal Nav2 REJECTS
+        # returns without ever producing a result, so a replan requested
+        # while it was in flight would be dropped and _review_map, which
+        # suppresses itself while one is pending, would never ask again.
         if self._replan_wanted:
             self._after_abandoned_goal()
             return
@@ -1264,63 +1272,80 @@ class SearchNode(Node):
             return
         self.send_goal(self.points[self.index])
 
-    def _maybe_return_home(self):
-        """Fly back to base once the search is genuinely finished.
+    def _start_pass(self, *, replanning=False, returning=False):
+        """Reset the waypoint sequence. The ONLY place that may do so.
 
-        A pass that ends on a go-and-look trip deliberately gets no home
-        waypoint, because the run is meant to carry on after the look. But if
-        coverage completes DURING that trip nothing ever planned again, so the
-        drone was left parked wherever the last look took it - out by the
-        rock, no path drawn, nothing commanding it. That reads as a crash, and
-        it is the state the operator was left staring at.
+        Four methods used to set these eleven fields themselves, each in its
+        own order, and every deadlock in this node came from one of them
+        forgetting one. One owner makes that class of bug impossible rather
+        than merely fixed.
+
+        Leaves planned False on purpose: a pass is not planned until
+        plan_sweep says so, on tick()'s next turn.
         """
-        if self.returning or not self.get_parameter('return_to_spawn').value:
-            if self.status_state not in (ST_COMPLETE, ST_RETURNING):
-                self._set_status(ST_COMPLETE, self._coverage_summary())
+        self.points = []
+        self.index = 0
+        self.home_index = None
+        self.vantage_index = None
+        self.busy = False
+        self.timed_out = False
+        self._replan_wanted = False
+        self.replanning = replanning
+        self.returning = returning
+        self.planned = False
+
+    def _fly_home(self):
+        """Make going home an ordinary one-waypoint pass."""
+        self._start_pass(returning=True)
+        self.points = [(0.0, 0.0)]
+        self.home_index = 0
+        self.planned = True
+        self._publish_path()
+        self._set_status(ST_RETURNING,
+                         f'search finished - {self._coverage_summary()}')
+        self.get_logger().info(
+            f'Search finished ({self._coverage_summary()}). Flying back to base.')
+
+    def _after_last_waypoint(self):
+        """The plan is flown out. Decide, in one place, what happens next.
+
+        This decision used to be spread over tick(), the tail of plan_sweep()
+        and _maybe_return_home(), each guessing at it - which is how the drone
+        came to sit still three separate times today with no error anywhere.
+        The order of these branches is the whole logic, so they are listed in
+        the order they must be asked.
+        """
+        # 1. Already on the way home, or home: the run is over.
+        if self.returning:
+            self._set_status(ST_COMPLETE, self._coverage_summary())
             return
-        # Somewhere left to look is checked FIRST, before whether the drone
-        # happens to be near base. The other way round, a pass that ended on a
-        # vantage point close to home declared the search COMPLETE and stopped
-        # with ground still unresolved.
-        # Still somewhere worth looking? Then plan the NEXT pass rather than
-        # going home - flying home now would abandon ground that is about to
-        # become reachable.
-        #
-        # It has to plan, not just decline to go home. The plan is already
-        # flown out, so returning without acting leaves nothing to move the
-        # drone: measured in flight, parked 0.7 m from its vantage point,
-        # status stuck on LOOKING, no goal, nothing commanding it. The map
-        # review only replans when reachability CHANGES, and a look that
-        # resolved nothing changes nothing - so it never fired.
+
+        # 2. Somewhere left worth looking? Fly another pass. This must come
+        #    BEFORE the "near base" test below: a pass that happened to end on
+        #    a vantage point close to home used to declare the search complete
+        #    with ground still unresolved.
         if (self.get_parameter('avoid_obstacles').value
                 and self.get_parameter('drop_unreachable').value
                 and self._frontier_goal() is not None):
             self._refresh_searchable()
-            self.replanning = True       # keeps ground already searched out
-            self.planned = False
-            self.index = 0
-            self.home_index = None
-            self.vantage_index = None
-            self.busy = False
+            self._start_pass(replanning=True)   # keeps searched ground out
             return
 
+        # 3. Nothing left to resolve. Go home, unless we are there or the
+        #    operator has turned that off.
+        if not self.get_parameter('return_to_spawn').value:
+            self._set_status(ST_COMPLETE, self._coverage_summary())
+            return
         here = self._lookup_robot_xy()
         if here is not None and math.hypot(here[0], here[1]) <= 2.0:
+            self.returning = True               # nothing to fly
             self._set_status(ST_COMPLETE, self._coverage_summary())
-            self.returning = True        # home already; nothing to fly
             return
+        self._fly_home()
 
-        self.returning = True
-        self.points = [(0.0, 0.0)]
-        self.index = 0
-        self.home_index = 0
-        self.vantage_index = None
-        self.planned = True
-        self.busy = False
-        self._publish_path()
-        self._set_status(ST_RETURNING, f'search finished - {self._coverage_summary()}')
-        self.get_logger().info(
-            f'Search finished ({self._coverage_summary()}). Flying back to base.')
+    def _maybe_return_home(self):
+        """Kept as the name tick() calls; see _after_last_waypoint."""
+        self._after_last_waypoint()
 
     def _coverage_summary(self):
         """One short phrase for the operator: progress and any gap."""
@@ -1488,13 +1513,7 @@ class SearchNode(Node):
         # this the percentage would stall short of 100% forever and there
         # would be no way to tell a mountain from a genuine gap.
         self._refresh_searchable()
-        self.replanning = True
-        self.planned = False
-        self.index = 0
-        self.home_index = None
-        self.vantage_index = None
-        self.returning = False       # the search is open again
-        self.busy = False
+        self._start_pass(replanning=True)
 
     def send_goal (self, point):
         """Send one waypoint to Nav2."""
@@ -1944,20 +1963,12 @@ class SearchNode(Node):
     def _check_unknown_tracking(self, msg):
         """Complain once if the costmap cannot express "never observed".
 
-        Everything about not flying at ground the drone has no way to reach
-        rests on telling "never looked at" apart from "looked at and found
-        clear". Nav2 only marks the first as unknown (-1) when
-        track_unknown_space is true on BOTH the global costmap and its
-        obstacle layer. With it off the two are both stored as 0, the
-        confirmed and possible floods come out byte-for-byte identical, the
-        inside of a rock reads as open ground, and the sweep plants waypoints
-        in it.
-
-        That is not hypothetical: it is what the costmap was doing, and the
-        feature degraded to nothing without a word. Measured on a live map,
-        the footprint of one summit came back 78.8% "clear" and 0% unknown.
-        So this is an error, not a debug line - a silent misconfiguration here
-        undoes the whole thing.
+        Not flying at unreachable ground rests entirely on telling "never
+        looked at" apart from "looked at and clear". Nav2 only marks the
+        first as -1 when track_unknown_space is true on BOTH the global
+        costmap and its obstacle layer; with it off both read 0, the two
+        floods come out identical and the sweep plants waypoints inside rock.
+        Logged as an ERROR because it degrades the whole feature silently.
         """
         if self._unknown_checked:
             return
@@ -2014,22 +2025,16 @@ class SearchNode(Node):
     def _flood(self, passable, row, col, seed_radius=0):
         """Which passable cells join up with the one the drone is standing on?
 
-        One scipy labelling pass rather than a Python breadth-first search:
-        the same 4-connected answer, about 90x faster on a full costmap (19 ms
-        against 1.7 s), which is what lets reachability be re-derived every
-        couple of seconds instead of once per plan.
+        scipy labelling rather than a Python flood: same 4-connected answer,
+        19 ms against 1.7 s on a full costmap, which is what lets this run
+        every couple of seconds instead of once per plan.
 
-        When the drone's own cell is not passable, seed_radius lets the flood
-        start from the NEAREST passable cell within that many cells instead of
-        giving up. Both cases happen in normal flight: on the pad the cell
-        under the drone can read unobserved, and at altitude the drone can sit
-        inside an obstacle's inflation ring, which reads as blocked.
-
-        Deliberately the nearest single cell, not every passable cell in a
-        window: a window straddling a wall would seed both sides at once and
-        quietly declare a sealed pocket reachable from outside it.
-
-        Returns None if there is no passable cell near enough to start from.
+        seed_radius starts from the NEAREST passable cell when the drone's own
+        is not passable - routine, since on the pad its cell reads unobserved
+        and at altitude it can sit inside an inflation ring. The nearest
+        single cell, not a window: a window straddling a wall would seed both
+        sides and call a sealed pocket reachable. None if nothing is near
+        enough to start from.
         """
         h, w = passable.shape
         if not passable[row, col]:
