@@ -202,6 +202,25 @@ local_costmap:
           # publishes. The obstacle layer then silently receives nothing and
           # the costmap stays empty no matter what the ranges are set to.
           topic: /parrot1/scan
+          # Treat an infinite reading as "clear all the way out", not as no
+          # reading at all.
+          #
+          # This is the difference between the costmap knowing where the open
+          # ground is and not knowing. Measured on a live scan at survey
+          # altitude: 276 of 360 rays (76.7%) come back inf, because over open
+          # ground there is nothing within 40 m to hit. With this false - the
+          # default - Nav2 DISCARDS those readings: no obstacle marked, and no
+          # raytrace clearing along the ray either. So three rays in four
+          # contribute nothing and the ground under them stays unknown for
+          # ever. Only the 23% that hit something cleared their own paths,
+          # which left the confirmed-reachable region about 600 m2 (a 14 m
+          # equivalent radius) out of a 40 m sensor, and the sweep could only
+          # plan legs in whichever corner of the search area that fan reached.
+          #
+          # With it true an inf reading clears out to range_max and marks
+          # nothing, which is exactly right for a downward drone over open
+          # ground.
+          inf_is_valid: true
           max_obstacle_height: 30.0
           clearing: true
           marking: true
@@ -286,6 +305,25 @@ global_costmap:
           # publishes. The obstacle layer then silently receives nothing and
           # the costmap stays empty no matter what the ranges are set to.
           topic: /parrot1/scan
+          # Treat an infinite reading as "clear all the way out", not as no
+          # reading at all.
+          #
+          # This is the difference between the costmap knowing where the open
+          # ground is and not knowing. Measured on a live scan at survey
+          # altitude: 276 of 360 rays (76.7%) come back inf, because over open
+          # ground there is nothing within 40 m to hit. With this false - the
+          # default - Nav2 DISCARDS those readings: no obstacle marked, and no
+          # raytrace clearing along the ray either. So three rays in four
+          # contribute nothing and the ground under them stays unknown for
+          # ever. Only the 23% that hit something cleared their own paths,
+          # which left the confirmed-reachable region about 600 m2 (a 14 m
+          # equivalent radius) out of a 40 m sensor, and the sweep could only
+          # plan legs in whichever corner of the search area that fan reached.
+          #
+          # With it true an inf reading clears out to range_max and marks
+          # nothing, which is exactly right for a downward drone over open
+          # ground.
+          inf_is_valid: true
           max_obstacle_height: 30.0
           clearing: true
           marking: true
