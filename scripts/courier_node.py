@@ -15,10 +15,11 @@ from rclpy.action import ActionClient
 # Duration is used to put a time limit on TF lookups so they can't block.
 from rclpy.duration import Duration
 from rclpy.node import Node
-from rclpy.qos import QoSDurabilityPolicy, QoSProfile
+from rclpy.qos import QoSDurabilityPolicy, QoSProfile, QoSReliabilityPolicy
 # ColorRGBA lets us colour the target marker.
 # Empty is a message with no content: publishing one releases the care package.
-from std_msgs.msg import ColorRGBA, Empty
+# Bool carries the ground station's E-Stop state.
+from std_msgs.msg import Bool, ColorRGBA, Empty
 # TFMessage is what /<robot>/tf carries; used to read the scout's TF tree.
 from tf2_msgs.msg import TFMessage
 # tf2_ros answers "where is the drone right now?" by reading the transform tree.
@@ -74,6 +75,10 @@ class CourierNode(Node):
         self.target = None  # (x, y) in this robot's own odom frame, once confirmed
         self.sent = False   # set True once the delivery goal has been sent
         self.busy = False
+        # E-Stop from the ground station: cancel the flight and hover until
+        # RESUME, then fly the same delivery again.
+        self.estopped = False
+        self.goal_handle = None
 
         self.nav_client = ActionClient(self, NavigateToPose, 'navigate_to_pose')
 
@@ -91,6 +96,12 @@ class CourierNode(Node):
             self.on_confirmed_point,
             latched_qos,
         )
+        # Absolute, and the same latched QoS the ground station publishes it
+        # with, so a courier that starts late still sees a STOP already on.
+        estop_qos = QoSProfile(depth=1,
+                               reliability=QoSReliabilityPolicy.RELIABLE,
+                               durability=QoSDurabilityPolicy.TRANSIENT_LOCAL)
+        self.create_subscription(Bool, '/aeroaid/estop', self.on_estop, estop_qos)
 
         self.timer = self.create_timer(1.0, self.tick)  # runs once a second
 
@@ -171,6 +182,18 @@ class CourierNode(Node):
         )
         self.pending_contact = msg
 
+    def on_estop(self, msg):
+        if msg.data == self.estopped:
+            return
+        self.estopped = msg.data
+        if self.estopped:
+            self.get_logger().warn('E-STOP: hovering until the operator presses RESUME.')
+            if self.goal_handle is not None:
+                self.goal_handle.cancel_goal_async()
+        else:
+            self.get_logger().info('E-Stop released.')
+            self.tick()
+
     def contact_to_own_frame(self, msg):
         """Return the contact as (x, y) in this robot's odom frame, or None if
         the scout's TF isn't available yet.
@@ -201,6 +224,8 @@ class CourierNode(Node):
 
     def tick(self):
         """Called every second; sends the delivery goal once, once a contact is confirmed."""
+        if self.estopped:
+            return
         if self.sent:  # already sent (or in flight/finished) - nothing more to do
             return
         if self.target is None and self.pending_contact is not None:
@@ -261,18 +286,29 @@ class CourierNode(Node):
             self.sent = False  # allow tick() to retry
             return
 
+        self.goal_handle = goal_handle
+        if self.estopped:
+            # E-Stop arrived while this goal was still being accepted.
+            goal_handle.cancel_goal_async()
+
         # Stage 3: ask to be told when its finished flying.
         result_future = goal_handle.get_result_async()
         result_future.add_done_callback(self.goal_finished)
 
     def goal_finished(self, future):
         """Stage 3: Nav2 has arrived, failed or given up"""
+        self.goal_handle = None
+        self.busy = False
+        if self.estopped:
+            # Cancelled by the E-Stop: not delivered, so fly it again on
+            # RESUME instead of giving up. The package stays on board.
+            self.sent = False
+            return
         if future.result().status == GoalStatus.STATUS_SUCCEEDED:
             self.release_pub.publish(Empty())
             self.get_logger().info('Arrived. Care package released.')
         else:
             self.get_logger().warn('Could not reach the delivery point.')
-        self.busy = False
 
     # ----------------------------------------------------------------------
     # VISUALISATION METHODS

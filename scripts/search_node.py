@@ -268,10 +268,13 @@ class SearchNode(Node):
         # them. Set avoid_obstacles false to go back to pure geometry.
         self.declare_parameter('avoid_obstacles', True)
         self.declare_parameter('costmap_topic', 'global_costmap/costmap')
-        # Cost at or above which a cell counts as blocked. Nav2 uses 254 for
-        # lethal and 253 for "inscribed" (the drone's body would touch it);
-        # 200 also catches the strongly inflated ring around an obstacle.
-        self.declare_parameter('obstacle_cost_threshold', 200)
+        # Cost at or above which a cell counts as blocked. This is on the
+        # PUBLISHED OccupancyGrid scale, not Nav2's raw 0-254 costs: the
+        # costmap publisher translates lethal 254 -> 100, inscribed 253 -> 99
+        # and 1..252 -> 1..98. 77 is raw 200 on that scale, which also
+        # catches the strongly inflated ring around an obstacle. (The old
+        # default of 200 could never be reached, so nothing was ever blocked.)
+        self.declare_parameter('obstacle_cost_threshold', 77)
         # How far to stay back from an obstacle edge, on top of inflation.
         self.declare_parameter('obstacle_clearance', 1.0)
         # Pieces of a split leg shorter than this are not worth flying.
@@ -340,6 +343,11 @@ class SearchNode(Node):
         # it while the RGB camera checks a thermal signature and while a
         # contact waits for the operator's ruling, and clears it after.
         self.holding = False
+        # E-Stop = the operator's STOP button on the ground station. Same
+        # effect as a hold, but kept separate so nothing that releases a hold
+        # (a ruling, RESUME on the contacts page, an IR check timing out) can
+        # release it - only the E-Stop's own RESUME does.
+        self.estopped = False
         self.goal_handle = None
         # Times in a row Nav2 has rejected the current waypoint (see goal_response).
         self.rejections = 0
@@ -361,6 +369,8 @@ class SearchNode(Node):
                               reliability=QoSReliabilityPolicy.RELIABLE,
                               durability=QoSDurabilityPolicy.TRANSIENT_LOCAL)
         self.create_subscription(Bool, 'search/hold', self.on_hold, hold_qos)
+        # Absolute: one E-Stop stops every drone.
+        self.create_subscription(Bool, '/aeroaid/estop', self.on_estop, hold_qos)
 
         # ------------------------------------------------------------------
         # VISUALISATION - everything below is only for RViz. It does not
@@ -605,6 +615,12 @@ class SearchNode(Node):
             return
         if not self.planned:
             return
+        if self.estopped:
+            self.get_logger().warn(
+                f'STILL E-STOPPED at waypoint {self.index + 1}/{len(self.points)} '
+                f'- hovering until the operator presses RESUME.'
+            )
+            return
         if self.holding:
             self.get_logger().warn(
                 f'STILL ON HOLD at waypoint {self.index + 1}/{len(self.points)} '
@@ -825,7 +841,7 @@ class SearchNode(Node):
             self.on_area_request(self.pending_area)
         if not self.area_set:  # nothing to search until the operator draws it
             return
-        if self.holding:
+        if self.paused():
             return
         if self.busy: #goal is already in flight
             self._check_stalled()
@@ -856,7 +872,7 @@ class SearchNode(Node):
         a stuck one.
         """
         limit = float(self.get_parameter('goal_stall_timeout').value)
-        if limit <= 0 or self.holding or self.index >= len(self.points):
+        if limit <= 0 or self.paused() or self.index >= len(self.points):
             return
         here = self._lookup_robot_xy()
         if here is None:
@@ -938,8 +954,8 @@ class SearchNode(Node):
 
         self.rejections = 0
         self.goal_handle = goal_handle
-        if self.holding:
-            # Hold arrived while this goal was still being accepted.
+        if self.paused():
+            # Hold or E-Stop arrived while this goal was still being accepted.
             goal_handle.cancel_goal_async()
 
         #Stage 3: ask to be told when its finished flying.
@@ -956,9 +972,9 @@ class SearchNode(Node):
             self.busy = False
             self.next_waypoint()
             return
-        if self.holding or status == GoalStatus.STATUS_CANCELED:
-            # Cancelled by a hold, or by the operator redrawing the search
-            # area. Don't advance: on a hold, resuming re-flies the same
+        if self.paused() or status == GoalStatus.STATUS_CANCELED:
+            # Cancelled by a hold or E-Stop, or by the operator redrawing the
+            # search area. Don't advance: on a hold, resuming re-flies the same
             # waypoint instead of skipping it, and on a redraw the index has
             # already been reset to the start of the new pattern.
             self.busy = False
@@ -968,6 +984,25 @@ class SearchNode(Node):
         else:
             self.get_logger().warn('Could not reach that one. Skipping it. ')
         self.next_waypoint()
+
+    def paused(self):
+        """True while the sweep must not fly: a contact hold or an E-Stop."""
+        return self.holding or self.estopped
+
+    def on_estop(self, msg):
+        if msg.data == self.estopped:
+            return
+        self.estopped = msg.data
+        if self.estopped:
+            self.get_logger().warn(
+                f'E-STOP: stopping at waypoint {self.index + 1}/'
+                f'{len(self.points)}. Hovering until the operator presses RESUME.'
+            )
+            if self.goal_handle is not None:
+                self.goal_handle.cancel_goal_async()
+        else:
+            self.get_logger().info('E-Stop released.')
+            self.tick()        # stays put if a contact hold is still on
 
     def on_hold(self, msg):
         if msg.data == self.holding:
@@ -988,6 +1023,7 @@ class SearchNode(Node):
             )
             # Don't wait up to a second for the timer; the ground station only
             # gives the drone a short window to move before it checks again.
+            # tick() itself stays put if an E-Stop is still on.
             self.tick()
 
     def next_waypoint(self):
