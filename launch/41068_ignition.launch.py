@@ -390,6 +390,15 @@ def generate_launch_description():
     )
     ld.add_action(world_launch_arg)
 
+    # A full path to load instead of worlds/<world>.sdf, e.g. a copy of
+    # large_demo.sdf with person1 moved (see run_blue_mountains.sh).
+    world_file_launch_arg = DeclareLaunchArgument(
+        'world_file',
+        default_value='',
+        description='Path to a world SDF that overrides world:= (empty = use world:=)',
+    )
+    ld.add_action(world_file_launch_arg)
+
     headless_launch_arg = DeclareLaunchArgument(
         'headless',
         default_value='False',
@@ -438,10 +447,14 @@ def generate_launch_description():
         ),
         launch_arguments={
             'ign_args': [
-                PathJoinSubstitution([
-                    pkg_path,
-                    'worlds',
-                    [LaunchConfiguration('world'), '.sdf'],
+                PythonExpression([
+                    "'", LaunchConfiguration('world_file'), "' or '",
+                    PathJoinSubstitution([
+                        pkg_path,
+                        'worlds',
+                        [LaunchConfiguration('world'), '.sdf'],
+                    ]),
+                    "'",
                 ]),
                 ' -r',
                 headless_flag,

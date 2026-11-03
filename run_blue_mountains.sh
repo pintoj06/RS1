@@ -13,6 +13,7 @@
 # Overridable from the environment, e.g.
 #   SIM_WAIT=45 LARGE_COURIER=false ./run_blue_mountains.sh
 #   HEADLESS=true ./run_blue_mountains.sh     no Gazebo window, faster
+#   PERSON_SPOT=3 ./run_blue_mountains.sh     casualty at a fixed spot
 
 set -u
 
@@ -43,6 +44,27 @@ SIM_WAIT=${SIM_WAIT:-30}
 # shows the map and both camera feeds; drawing the Blue Mountains scene a
 # second time for the window is a big share of the load on a laptop.
 HEADLESS=${HEADLESS:-false}
+
+# Where the casualty (person1) stands. One of these is picked at random each
+# run, with a random yaw, so the search is not always solving the same
+# problem. The first is person1's pose in worlds/large_demo.sdf. z is the
+# terrain height there. PERSON_SPOT=0..5 picks one instead of random.
+PERSON_SPOTS=(
+    "-6.36 -3.07 0.08"
+    "-6.36 18.12 0.63"
+    "-3.7 34.25 5.45"
+    "11.46 34.25 9.69"
+    "42.37 20.97 0.23"
+    "36.2 1.04 -1.12"
+)
+PERSON_SPOT=${PERSON_SPOT:-$((RANDOM % ${#PERSON_SPOTS[@]}))}
+read -r PERSON_X PERSON_Y PERSON_Z <<< "${PERSON_SPOTS[$PERSON_SPOT]}"
+PERSON_YAW=$(awk -v seed="$RANDOM" \
+    'BEGIN { srand(seed); printf "%.3f", rand() * 2 * 3.14159265 }')
+
+# The world Gazebo loads: a copy of large_demo.sdf with person1's pose
+# swapped in, so the person is already there when the world appears.
+WORLD_FILE=${TMPDIR:-/tmp}/aeroaid_${WORLD}.sdf
 
 # Every node that does a TF lookup needs these: this package pushes TF into
 # each robot's namespace instead of the global /tf.
@@ -125,10 +147,21 @@ tab() {
     esac
 }
 
+echo "     casualty at spot $PERSON_SPOT:" \
+     "($PERSON_X, $PERSON_Y, $PERSON_Z), yaw $PERSON_YAW rad"
+# The <pose> straight after <model name="person1"> is person1's own.
+sed "/<model name=\"person1\">/{n;s|<pose>.*</pose>|<pose>$PERSON_X $PERSON_Y $PERSON_Z 0 0 $PERSON_YAW</pose>|}" \
+    "$HERE/worlds/$WORLD.sdf" > "$WORLD_FILE"
+if ! grep -q "<pose>$PERSON_X $PERSON_Y $PERSON_Z 0 0 $PERSON_YAW</pose>" "$WORLD_FILE"; then
+    echo "Could not set person1's pose in $WORLD_FILE - has the world file changed?" >&2
+    exit 1
+fi
+
 echo "1/5  Simulation (Blue Mountains) + scout + courier + Nav2"
 tab "sim" "ros2 launch $PKG 41068_ignition.launch.py \
-    world:=$WORLD parrot:=true courier:=true large_courier:=$LARGE_COURIER \
-    husky:=false nav2:=true rviz:=false headless:=$HEADLESS"
+    world:=$WORLD world_file:=$WORLD_FILE parrot:=true courier:=true \
+    large_courier:=$LARGE_COURIER husky:=false nav2:=true rviz:=false \
+    headless:=$HEADLESS"
 
 echo "     waiting ${SIM_WAIT}s for the simulation to come up..."
 sleep "$SIM_WAIT"
@@ -157,7 +190,8 @@ tab "scout" "ros2 launch $PKG 41068_search.launch.py robot:=$SCOUT"
 sleep 2
 
 echo "5/5  Courier"
-tab "courier" "ros2 launch $PKG 41068_courier_demo.launch.py robot:=$COURIER"
+tab "courier" "ros2 launch $PKG 41068_courier_demo.launch.py robot:=$COURIER \
+    target_world_x:=$PERSON_X target_world_y:=$PERSON_Y"
 
 cat <<EOF
 
