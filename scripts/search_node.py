@@ -650,6 +650,13 @@ class SearchNode(Node):
         # cell is clear when picked but the next scan often fills in rock
         # beside it, and arriving at a dead waypoint costs a failure replan.
         self.declare_parameter('vantage_obstacle_margin', 2.0)   # metres
+        # Do not fly anywhere to resolve less unverified ground than this. The
+        # camera covers about 98 m2 in one go, so a trip for a square metre
+        # costs far more than the ground is worth - and with a patch that
+        # small the answer flickers as the costmap updates, which had the
+        # drone lapping between "something left to look at" and "no there
+        # isn't" for several seconds at the end of a run, commanding nothing.
+        self.declare_parameter('min_unverified_area', 2.0)      # m2
         # How much unverified ground one trip has to resolve to count as
         # progress, as a fraction of the area the operator drew.
         self.declare_parameter('vantage_progress_fraction', 0.02)
@@ -1085,7 +1092,7 @@ class SearchNode(Node):
         # for ever. If there is ground we have not judged, fall through to the
         # go-and-look block below instead: flying to one vantage point IS the
         # plan, and it is what produces the better view.
-        if self._unverified_cells() == 0:
+        if not self._worth_looking():
             if self.replanning:
                 self.get_logger().info(
                     'Replan found nothing left to fly: everything reachable '
@@ -1101,6 +1108,15 @@ class SearchNode(Node):
                     'inside an obstacle or walled off with no way in, so there '
                     'is nothing to fly. Draw an area that includes reachable '
                     'open ground.')
+            # Report any remainder and stop counting it, so the percentage
+            # is honest and nothing comes back to chase it.
+            if self._unverified_cells():
+                area = self._unverified_cells() * self.coverage_resolution ** 2
+                self.get_logger().info(
+                    f'{area:.1f} m2 of the area was never verified - too '
+                    f'little to be worth flying anywhere to see. Leaving it '
+                    f'out of the coverage total.')
+                self._write_off_unverified()
             self.planned = True          # stop retrying every tick
             self.replanning = False
             return True
@@ -1126,7 +1142,8 @@ class SearchNode(Node):
         # to go and look at. See _frontier_goal.
         vantage = None
         if (self.get_parameter('avoid_obstacles').value
-                and self.get_parameter('drop_unreachable').value):
+                and self.get_parameter('drop_unreachable').value
+                and self._worth_looking()):
             vantage = self._frontier_goal()
         if vantage is not None:
             # Are these trips actually resolving anything? If the last few
@@ -1326,6 +1343,7 @@ class SearchNode(Node):
         #    with ground still unresolved.
         if (self.get_parameter('avoid_obstacles').value
                 and self.get_parameter('drop_unreachable').value
+                and self._worth_looking()
                 and self._frontier_goal() is not None):
             self._refresh_searchable()
             self._start_pass(replanning=True)   # keeps searched ground out
@@ -2361,6 +2379,19 @@ class SearchNode(Node):
         else:
             self.unverifiable = self.unverifiable | gone
         self._refresh_searchable()
+
+    def _worth_looking(self):
+        """Is the unresolved ground big enough to be worth a trip?
+
+        Below min_unverified_area the honest answer is no: it is reported to
+        the operator and written off instead, which is both cheaper and
+        steadier than chasing a patch whose size flickers cell by cell.
+        """
+        cells = self._unverified_cells()
+        if not cells:
+            return False            # nothing outstanding at all
+        area = cells * self.coverage_resolution ** 2
+        return area >= float(self.get_parameter('min_unverified_area').value)
 
     def _unverified_cells(self):
         """Coverage cells inside the area that cannot yet be called either way.

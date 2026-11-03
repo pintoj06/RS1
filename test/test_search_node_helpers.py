@@ -622,6 +622,7 @@ def fake_frontier(search_node):
                 sensor_range=40.0,
                 vantage_min_separation=3.0,
                 vantage_obstacle_margin=0.0,
+                min_unverified_area=0.0,
             )
 
         def _lookup_robot_xy(self):
@@ -853,7 +854,8 @@ def planning_node(search_node):
         for _name in ('_is_blocked', '_costmap_grid', '_flood', '_reachable_from',
                       '_confirmed_from', '_is_reachable', '_project',
                       '_polygon_mask_costmap', '_line_of_sight', '_frontier_goal',
-                      '_unverified_cells', '_write_off_unverified',
+                      '_unverified_cells', '_worth_looking',
+                      '_write_off_unverified',
                       '_build_inside_mask', '_refresh_searchable',
                       '_predicted_coverage', '_already_searched',
                       '_camera_fov', '_camera_altitude', '_footprint_radius',
@@ -916,6 +918,7 @@ def planning_node(search_node):
                 sensor_range=40.0,
                 vantage_min_separation=3.0,
                 vantage_obstacle_margin=0.0,
+                min_unverified_area=0.0,
                 vantage_patience=5,
                 vantage_progress_fraction=0.02,
                 spacing=0.0,
@@ -1812,3 +1815,66 @@ class TestLookingDoesNotDeadEnd:
         node._maybe_return_home()
         assert not node.returning
         assert not node.planned                 # a new pass is queued instead
+
+
+class TestTinyRemaindersAreNotChased:
+    """Seen at the end of a real run: 1 m2 left unverified, and the drone sat
+    still for several seconds before heading home.
+
+    It was willing to fly a whole vantage trip to resolve a square metre -
+    when the camera covers about 98 m2 in one go - and with a patch that small
+    the answer flickered as the costmap updated, so it lapped between "there
+    is something left to look at" and "no there isn't", commanding nothing in
+    between.
+    """
+
+    @pytest.fixture
+    def node(self, planning_node):
+        import numpy as np
+        grid = make_costmap(60, 60, resolution=0.5, origin=(-5.0, -5.0))
+        n = planning_node([(0.0, 0.0), (20.0, 0.0), (20.0, 20.0), (0.0, 20.0)],
+                          grid)
+        n.get_parameter.values['min_unverified_area'] = 2.0
+        n.possible = np.ones((60, 60), dtype=bool)
+        n.confirmed = np.ones((60, 60), dtype=bool)
+        return n
+
+    def unverified_cells(self, node, n):
+        """Leave exactly n coverage cells unverified."""
+        import numpy as np
+        node.confirmed = np.ones((60, 60), dtype=bool)
+        # each coverage cell is 0.5 m, the costmap 0.5 m here, so 1:1
+        rows, cols = np.nonzero(node.inside_mask)
+        for r, c in zip(rows[:n], cols[:n]):
+            x = node.cov_origin_x + (c + 0.5) * node.coverage_resolution
+            y = node.cov_origin_y + (r + 0.5) * node.coverage_resolution
+            cc = int((x + 5.0) / 0.5)
+            rr = int((y + 5.0) / 0.5)
+            node.confirmed[rr, cc] = False
+
+    def test_a_square_metre_is_not_worth_a_trip(self, node):
+        self.unverified_cells(node, 4)          # 4 cells x 0.25 = 1 m2
+        assert node._unverified_cells() == 4
+        assert not node._worth_looking()
+
+    def test_a_real_gap_still_is(self, node):
+        self.unverified_cells(node, 40)         # 10 m2
+        assert node._worth_looking()
+
+    def test_nothing_outstanding_is_never_worth_a_trip(self, node):
+        """area >= 0.0 was true for zero area, so a threshold of 0 meant
+        "chase nothing at all" instead of "chase anything"."""
+        node.get_parameter.values['min_unverified_area'] = 0.0
+        assert node._unverified_cells() == 0
+        assert not node._worth_looking()
+
+    def test_the_remainder_is_reported_and_written_off(self, node):
+        """It must not vanish silently - the operator is told the area and it
+        stops dragging the percentage down."""
+        self.unverified_cells(node, 4)
+        node.replanning = True
+        node.coverage[:, :] = 100
+        node.points = []
+        node._nothing_to_sweep()
+        assert any('never verified' in m for m in node.logged), node.logged[-3:]
+        assert node.unverifiable is not None
