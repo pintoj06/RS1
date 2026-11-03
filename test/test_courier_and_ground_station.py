@@ -67,7 +67,8 @@ class TestContactToOwnFrame:
 
 @pytest.fixture
 def detect(ground_station):
-    station = SimpleNamespace(person_min_k=305.0, person_min_pixels=600)
+    station = SimpleNamespace(person_min_k=305.0, person_min_pixels=600,
+                              tracker=ground_station.GroundTracker(2.0, 10.0))
     return lambda kelvin, frame: \
         ground_station.GroundStationNode._detect_person(station, kelvin, frame)
 
