@@ -10,7 +10,8 @@
                            spawned as <gz_model_name>_care_package): a white
                            first-aid case with green crosses and orange straps.
                            It has gravity and collision, so once released it
-                           falls and lands.
+                           falls and lands. Its collision box is taller than
+                           the case so it cannot fall through the terrain.
 
      Release: publish ignition.msgs.Empty on
      /model/<gz_model_name>/care_package/detach (courier_node.py does this, via
@@ -105,9 +106,16 @@
     <xacro:property name="t" value="${0.002 * s}"/>  <!-- decal / strap thickness -->
     <!-- Case centre, in the drone's base_link frame. -->
     <xacro:property name="cz" value="${top_z - plate - H / 2}"/>
-    <!-- The collision box leaves off the top of the case so it never touches
-         the large courier's collision box (bottom at z -0.153) while attached. -->
-    <xacro:property name="trim" value="${0.02 * s}"/>
+    <!-- Height of the collision box. Much taller than the case so the case
+         cannot pass through the terrain meshes in one physics step: falling
+         from 8 m it moves up to ~0.14 m per 10 ms step, and the hills and rocks
+         are zero-thickness triangle meshes. Its bottom matches the case's
+         bottom (so the case still rests on the ute pad and lands flush); the
+         extra height is all above, inside the drone. That overlap with the
+         large courier's collision box is harmless: the attached case does not
+         collide with the drone, and it falls clear on release. 0.25 m was the
+         lowest height with no fall-throughs over a 136-point drop grid. -->
+    <xacro:property name="collision_h" value="0.25"/>
     <xacro:property name="arm" value="${0.6 * W}"/>  <!-- first-aid cross arm length -->
     <xacro:property name="bar" value="${0.2 * W}"/>  <!-- first-aid cross arm width -->
 
@@ -122,8 +130,8 @@
       </inertial>
 
       <collision name="case">
-        <origin xyz="${x} 0 ${cz - trim / 2}" rpy="0 0 0"/>
-        <geometry><box size="${L} ${W} ${H - trim}"/></geometry>
+        <origin xyz="${x} 0 ${cz - H / 2 + collision_h / 2}" rpy="0 0 0"/>
+        <geometry><box size="${L} ${W} ${collision_h}"/></geometry>
       </collision>
 
       <visual name="case">
