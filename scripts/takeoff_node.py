@@ -64,6 +64,10 @@ class TakeoffNode(Node):
                                 durability=QoSDurabilityPolicy.TRANSIENT_LOCAL)
         self.create_subscription(Bool, self.get_parameter('launch_topic').value,
                                  self.on_launch, launch_qos)
+        # The ground station's E-Stop: stop climbing and hover where we are
+        # until RESUME. Absolute, like the launch topic.
+        self.estopped = False
+        self.create_subscription(Bool, '/aeroaid/estop', self.on_estop, launch_qos)
 
         self.timer = self.create_timer(0.05, self.tick)  # 20 Hz
 
@@ -82,10 +86,27 @@ class TakeoffNode(Node):
             self.launched = True
             self.get_logger().info('LAUNCH received.')
 
+    def on_estop(self, msg):
+        if msg.data == self.estopped:
+            return
+        self.estopped = msg.data
+        if self.estopped:
+            self.get_logger().warn('E-STOP: climb stopped, hovering until RESUME.')
+            # VelocityControl keeps applying the last command, so it has to
+            # be told to stop - same as finish().
+            for _ in range(5):
+                self.cmd_pub.publish(Twist())
+        else:
+            self.get_logger().info('E-Stop released, carrying on with the climb.')
+            # Restart the timeout: time spent stopped is not a stuck climb.
+            self.start_time = None
+
     def tick(self):
         # Sending nothing while on the pad is enough to keep the drone there:
         # VelocityControl holds it at zero velocity until told otherwise.
         if self.done or not self.launched or self.altitude is None:
+            return
+        if self.estopped:
             return
 
         now = self.get_clock().now()

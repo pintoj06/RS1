@@ -5,6 +5,13 @@
   <xacro:arg name="imu_visual"    default="false"/>
   <xacro:arg name="gz_model_name" default="parrot"/>
   <xacro:property name="gz_model_name" value="$(arg gz_model_name)"/>
+  <!-- Thermal and RGB-D cameras. Every camera frame is a full render of the
+       scene, the most expensive thing in the sim, so a drone nothing watches
+       (the courier) leaves them off. -->
+  <xacro:arg name="cameras"       default="true"/>
+  <!-- 20 Hz keeps the ground station's IR view smooth for a third less
+       rendering than the old 30 Hz. Drop it to 10 on a slow machine. -->
+  <xacro:arg name="thermal_rate"  default="20"/>
 
   
 
@@ -145,6 +152,8 @@
       <always_on>true</always_on>
     </sensor>
   </gazebo>
+
+  <xacro:if value="$(arg cameras)">
   <gazebo reference="${prefix}camera_link">
   <turnGravityOff>true</turnGravityOff>
   <sensor name="thermal_camera" type="thermal">
@@ -160,7 +169,7 @@
       </clip>
     </camera>
     <always_on>1</always_on>
-    <update_rate>30</update_rate>
+    <update_rate>$(arg thermal_rate)</update_rate>
     <visualize>true</visualize>
     <topic>/model/${gz_model_name}/thermal_camera</topic>
     <gz_frame_id>${prefix}camera_link</gz_frame_id>
@@ -214,5 +223,6 @@
       <gz_frame_id>${prefix}camera_link</gz_frame_id>
     </sensor>
   </gazebo>
+  </xacro:if>
 
 </robot>

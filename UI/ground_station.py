@@ -14,9 +14,13 @@ Slot allocation is deliberate and fixed:
     right column   actions for the current page
     bottom row     contact ruling  always available, because a decision on a
                    possible person should never be more than one press away
+    E-STOP         bottom right, on every page. Stops every drone where it is;
+                   only its own RESUME restarts them
 
 Keyboard equivalents: 1-4 left, F1-F6 right, Q/W/R bottom, Esc cancels an
-area drag. E raises a fake contact for testing the interface.
+area drag, Space E-Stops (stop only - resuming takes a click on RESUME, so a
+stray key can never set the drones moving). E raises a fake contact for
+testing the interface.
 
 The drones wait on their pads on the ute until LAUNCH is pressed. A search
 area can be drawn on the aerial photo before then; the scout flies it once
@@ -295,6 +299,14 @@ class GroundStationNode(Node):
         self.launch_pub = self.create_publisher(Bool, "/aeroaid/launch", hold_qos)
         self.launched = False
 
+        # E-Stop for every drone (search_node, courier_node, takeoff_node).
+        # Absolute and transient local, like the launch topic, so a node that
+        # starts while it is on still stops. Separate from search/hold, which
+        # the contact logic releases on its own.
+        self.estop_pub = self.create_publisher(Bool, "/aeroaid/estop", hold_qos)
+        self.estopped = False
+        self.estop_pub.publish(Bool(data=False))
+
         self.create_timer(0.1, self._poll_pose)
 
         self.get_logger().info(f"Ground station up for {self.robot_name}")
@@ -535,6 +547,16 @@ class GroundStationNode(Node):
         self.hold_pub.publish(Bool(data=hold))
         self.get_logger().info("Search HOLD" if hold else "Search resumed")
 
+    def set_estop(self, stop: bool):
+        if stop == self.estopped:
+            return
+        self.estopped = stop
+        self.estop_pub.publish(Bool(data=stop))
+        if stop:
+            self.get_logger().warn("E-STOP: all drones stopping")
+        else:
+            self.get_logger().info("E-Stop released: drones resuming")
+
     def launch(self):
         if self.launched:
             return
@@ -628,6 +650,10 @@ class BezelButton(QPushButton):
         self._tone = MUTED
         self.setFixedSize(86, 58)
         self.setCursor(Qt.PointingHandCursor)
+        # No keyboard focus: a focused button takes Space as a click, which
+        # would turn the Space E-Stop into a press of RESUME (or whatever
+        # was clicked last). Every button already has its own key.
+        self.setFocusPolicy(Qt.NoFocus)
         font = QFont("DejaVu Sans Mono", 9)
         font.setBold(True)
         self.setFont(font)
@@ -976,7 +1002,8 @@ class MapPage(QWidget):
 
 
 class VideoPage(QWidget):
-    """Full-bleed camera feed with a frozen-frame option."""
+    """Full-bleed camera feed. Shows a held frame instead while a contact is
+    awaiting a ruling, so the evidence for it stays up (see MainWindow)."""
 
     def __init__(self, node: GroundStationNode, source: str, empty_text: str):
         super().__init__()
@@ -990,13 +1017,6 @@ class VideoPage(QWidget):
         if self.frozen is not None:
             return self.frozen
         return getattr(self.node, f"{self.source}_frame")
-
-    def toggle_freeze(self):
-        """Freezing matters operationally: the drone keeps flying while the
-        operator studies a frame, and without this the evidence is gone by the
-        time they have looked at it."""
-        frame = getattr(self.node, f"{self.source}_frame")
-        self.frozen = None if self.frozen is not None else frame
 
     def paintEvent(self, _):
         p = QPainter(self)
@@ -1172,6 +1192,13 @@ class MainWindow(QMainWindow):
         self.bottom_buttons[0].clicked.connect(lambda: self._rule("CONFIRMED"))
         self.bottom_buttons[1].clicked.connect(lambda: self._rule("DISMISSED"))
         self.bottom_buttons[2].clicked.connect(self.node.launch)
+        bottom.addSpacing(40)
+        # Wider than the bezels and set apart from them, so it is the easiest
+        # thing on the screen to hit and hard to hit by mistake for another.
+        self.estop_button = BezelButton("ESTOP")
+        self.estop_button.setFixedSize(150, 58)
+        self.estop_button.clicked.connect(self._press_estop)
+        bottom.addWidget(self.estop_button)
         grid.addLayout(bottom, 2, 1)
 
         grid.setColumnStretch(1, 1)
@@ -1230,6 +1257,7 @@ class MainWindow(QMainWindow):
         QShortcut(QKeySequence("Q"), self, lambda: self._rule("CONFIRMED"))
         QShortcut(QKeySequence("W"), self, lambda: self._rule("DISMISSED"))
         QShortcut(QKeySequence("R"), self, self.node.launch)
+        QShortcut(QKeySequence("Space"), self, lambda: self.node.set_estop(True))
         # Fake contact for testing the interface; keyboard only.
         QShortcut(QKeySequence("E"), self, self._simulate_contact)
         # Escape stands down an armed area draw without setting one.
@@ -1262,10 +1290,6 @@ class MainWindow(QMainWindow):
                 ("AERIAL", lambda: setattr(m, "show_aerial", not m.show_aerial),
                  m.show_aerial) if self.node.aerial_image is not None else blank,
             ]
-        if self.page in (PAGE_VIS, PAGE_IR):
-            v = self.vis_page if self.page == PAGE_VIS else self.ir_page
-            return ([("FREEZE", v.toggle_freeze, v.frozen is not None)]
-                    + [blank] * (RIGHT_SLOTS - 1))
         if self.page == PAGE_CONTACTS:
             return [("RESUME", self._resume_search, False)] + [blank] * (RIGHT_SLOTS - 1)
         return [blank] * RIGHT_SLOTS
@@ -1308,6 +1332,15 @@ class MainWindow(QMainWindow):
         else:
             self.bottom_buttons[2].configure("LAUNCH", CONFIRM, boxed=True)
 
+        # Names the action the next press performs, like every other slot.
+        if self.node.estopped:
+            self.estop_button.configure("RESUME", CONFIRM, boxed=True)
+        else:
+            self.estop_button.configure("E-STOP", RED, boxed=True)
+
+    def _press_estop(self):
+        self.node.set_estop(not self.node.estopped)
+
     # -- behaviour ---------------------------------------------------------
     def _selected(self) -> Optional[Contact]:
         i = self.contacts_page.selected_index()
@@ -1319,6 +1352,9 @@ class MainWindow(QMainWindow):
             return
         c.status = decision
         self.node.send_decision(c.id, decision)
+        # The evidence frames were held for this ruling; back to live video.
+        self.vis_page.frozen = None
+        self.ir_page.frozen = None
         if decision == "CONFIRMED":
             self.node.publish_confirmed_point(c.x, c.y)
             self.hold_for_confirmed = True
@@ -1462,7 +1498,9 @@ class MainWindow(QMainWindow):
         else:
             self.caution.setText("")
 
-        if self._check_until is not None:
+        if self.node.estopped:
+            self.hold_label.setText("E-STOP")
+        elif self._check_until is not None:
             self.hold_label.setText("IR CHECK")
         else:
             self.hold_label.setText("SEARCH HOLD" if self.node.holding else "")
