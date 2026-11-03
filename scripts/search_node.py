@@ -43,6 +43,23 @@ import tf2_ros
 # Marker = one drawing in RViz. MarkerArray = several sent together.
 from visualization_msgs.msg import Marker, MarkerArray
 
+# Values published on the search_coverage grid. An OccupancyGrid is int8 and
+# RViz reads 0-100 as occupancy, so these double as sensible colours there.
+#
+# The point of having four rather than two: "I searched it", "I could not
+# reach it" and "I never worked out WHETHER I could reach it" are different
+# facts, and the operator most needs to know the third. Collapsing all of
+# them to -1 drew unknown ground exactly like empty space off the edge of the
+# map. Measured on one flight, of 619 unpainted cells inside the area, 478
+# (77%) were unknown rather than obstacle - so the biggest category was the
+# one being hidden.
+COVER_OUTSIDE = -1      # not part of the search area at all; say nothing
+COVER_TO_DO = 0         # in the area, reachable, not swept yet
+COVER_UNVERIFIED = 25   # in the area, never confirmed reachable: UNKNOWN
+COVER_BLOCKED = 50      # in the area, obstacle or walled off with no way in
+COVER_SEARCHED = 100    # the camera has been over it
+
+
 def rotate_points(points, angle):
     """Rotate a list of (x, y) points about the origin by angle radians."""
     c, s = math.cos(angle), math.sin(angle)
@@ -1651,6 +1668,11 @@ class SearchNode(Node):
                     and self.costmap is not None)
         possible = self.possible if avoiding else None
         mask = np.zeros((self.cov_rows, self.cov_cols), dtype=bool)
+        # Kept alongside the searchable mask so the overlay can say WHY a cell
+        # is not being searched instead of just leaving it blank. Accounting
+        # and display only - planning reads the costmap directly.
+        in_shape_mask = np.zeros_like(mask)
+        blocked_mask = np.zeros_like(mask)
         # Cells inside the shape the operator drew, obstacles included. Kept so
         # the operator can be told how much of what they drew is actually
         # flyable - "100% of the searchable area" reads like the whole box was
@@ -1663,15 +1685,37 @@ class SearchNode(Node):
                 if not self.point_in_polygon(cell_x, cell_y, self.polygon):
                     continue
                 in_shape += 1
+                in_shape_mask[row, col] = True
                 if avoiding and self._is_blocked(cell_x, cell_y):
+                    blocked_mask[row, col] = True
                     continue
                 if possible is not None and not self._is_reachable(
                         cell_x, cell_y, possible):
+                    blocked_mask[row, col] = True      # walled off, no way in
                     continue
                 if self.unverifiable is not None and self.unverifiable[row, col]:
                     continue
                 mask[row, col] = True
+
+        # A coverage cell is 0.5 m but the costmap is 0.15 m, and the cell is
+        # judged by its CENTRE - so one inflated costmap cell landing on a
+        # centre carves a whole 0.25 m2 square out of the search area. That
+        # produced single-cell holes in the overlay and fragmented the
+        # percentage. Specks of one or two cells are dropped: at this
+        # resolution they are an artefact of sampling, not an obstacle. The
+        # planner is unaffected, it reads the costmap itself.
+        if blocked_mask.any():
+            labels, count = ndimage.label(blocked_mask)
+            if count:
+                sizes = np.bincount(labels.ravel())
+                speck = np.isin(labels, np.nonzero(sizes <= 2)[0]) & blocked_mask
+                if speck.any():
+                    blocked_mask &= ~speck
+                    mask |= speck & in_shape_mask
+
         self.cells_in_shape = in_shape
+        self.in_shape_mask = in_shape_mask
+        self.blocked_mask = blocked_mask
         return mask
 
     def _resolve_polygon(self):
@@ -2415,10 +2459,29 @@ class SearchNode(Node):
         # 5 m beyond the shape, so that difference is most of the edge. Anyone
         # measuring progress from this message would read far too low a figure.
         #
-        # -1 = not searchable (outside the shape, or blocked by an obstacle)
-        #  0 = inside the area, still to do
-        # 100 = swept
-        published = np.where(self.inside_mask, self.coverage, -1).astype(np.int8)
+        # See the COVER_* constants at the top of the file. Precedence
+        # matters: ground the camera HAS been over stays marked searched even
+        # if the costmap later calls it blocked, because we did look at it.
+        published = np.full((self.cov_rows, self.cov_cols), COVER_OUTSIDE,
+                            dtype=np.int8)
+        in_shape = getattr(self, 'in_shape_mask', None)
+        if in_shape is None:
+            in_shape = self.inside_mask
+        blocked = getattr(self, 'blocked_mask', None)
+        if blocked is None:
+            blocked = np.zeros_like(in_shape)
+
+        # Inside the area and not confirmed reachable: the honest "unknown".
+        unverified = in_shape & ~blocked & ~self.inside_mask
+        if self.confirmed is not None:
+            unverified |= (in_shape & ~blocked
+                           & ~self._project(self.confirmed))
+
+        published[in_shape] = COVER_UNVERIFIED
+        published[in_shape & ~unverified] = COVER_TO_DO
+        published[blocked] = COVER_BLOCKED
+        published[in_shape & (self.coverage > 0)] = COVER_SEARCHED
+        published = published.astype(np.int8)
         # OccupancyGrid data is a flat row-major list, same order as the array.
         grid.data = published.flatten().tolist()
         self.coverage_pub.publish(grid)

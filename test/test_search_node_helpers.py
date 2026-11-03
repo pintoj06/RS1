@@ -847,7 +847,7 @@ def planning_node(search_node):
                       '_build_inside_mask', '_refresh_searchable',
                       '_predicted_coverage', '_already_searched',
                       '_camera_fov', '_camera_altitude', '_footprint_radius',
-                      'plan_sweep', '_review_map'):
+                      'plan_sweep', '_review_map', '_publish_coverage'):
             locals()[_name] = getattr(SearchNode, _name)
         del _name
         # Still a staticmethod here, or self would be passed as its first
@@ -884,6 +884,11 @@ def planning_node(search_node):
             self.cov_rows = int((max(ys) + 2.0 - self.cov_origin_y) / 0.5) + 1
             self.coverage = np.zeros((self.cov_rows, self.cov_cols), dtype=np.int8)
             self.cells_in_shape = 0
+            self.map_frame = 'parrot1_odom'
+            self.last_coverage_log = 0.0
+            from builtin_interfaces.msg import Time as _T
+            self.get_clock = lambda: SimpleNamespace(
+                now=lambda: SimpleNamespace(to_msg=lambda: _T()))
             self.get_parameter = FakeParams(
                 obstacle_cost_threshold=INSCRIBED,
                 avoid_obstacles=True,
@@ -1454,3 +1459,110 @@ class TestVantageKeepsClearOfRock:
         fake_frontier.get_parameter.values['vantage_obstacle_margin'] = 500.0
         fake_frontier.flood()
         assert fake_frontier._frontier_goal() is not None
+
+
+class TestFourStateCoverage:
+    """The overlay has to say WHY ground is unpainted.
+
+    Everything used to collapse to -1, so "searched", "could not reach" and
+    "never worked out whether I could reach it" drew as blue, blank, blank.
+    Measured on one flight: of 619 unpainted cells inside the area, 478 (77%)
+    were unknown rather than obstacle - so the category the operator most
+    needs was the one being hidden.
+    """
+
+    @pytest.fixture
+    def node(self, planning_node):
+        import numpy as np
+        grid = make_costmap(60, 60, resolution=0.5, origin=(-5.0, -5.0))
+        n = planning_node([(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)],
+                          grid)
+        n.sent = []
+        n.coverage_pub = SimpleNamespace(publish=n.sent.append)
+        n.last_coverage_log = 0.0
+        return n
+
+    def values(self, node):
+        import numpy as np
+        node._publish_coverage()
+        m = node.sent[-1]
+        return np.asarray(m.data, dtype=np.int8).reshape(
+            m.info.height, m.info.width)
+
+    def test_the_four_states_are_distinguishable(self, search_node, node):
+        import numpy as np
+        sn = search_node
+        node.coverage[:, :] = 0
+        # mark a strip as swept
+        node.coverage[node.in_shape_mask.any(axis=1), :] = 0
+        swept = node.in_shape_mask.copy()
+        swept[:, 10:] = False
+        node.coverage[swept] = 100
+        g = self.values(node)
+        assert (g == sn.COVER_OUTSIDE).any(), 'nothing marked outside the area'
+        assert (g == sn.COVER_SEARCHED).any(), 'nothing marked searched'
+        assert (g == sn.COVER_TO_DO).any(), 'nothing marked still-to-do'
+        # every in-shape cell must carry one of the in-area values
+        inside = g[node.in_shape_mask]
+        assert set(np.unique(inside)) <= {sn.COVER_TO_DO, sn.COVER_UNVERIFIED,
+                                          sn.COVER_BLOCKED, sn.COVER_SEARCHED}
+
+    def test_outside_the_area_says_nothing(self, search_node, node):
+        g = self.values(node)
+        assert (g[~node.in_shape_mask] == search_node.COVER_OUTSIDE).all()
+
+    def test_searched_wins_over_blocked(self, search_node, node):
+        """Ground the camera HAS been over stays marked searched even if the
+        costmap later calls it rock - we did look at it."""
+        import numpy as np
+        rows, cols = np.nonzero(node.in_shape_mask)
+        r, c = rows[0], cols[0]
+        node.blocked_mask[r, c] = True
+        node.coverage[r, c] = 100
+        assert self.values(node)[r, c] == search_node.COVER_SEARCHED
+
+    def test_blocked_ground_is_marked_blocked_not_blank(self, search_node, node):
+        import numpy as np
+        rows, cols = np.nonzero(node.in_shape_mask)
+        # a block big enough to survive the speckle filter
+        for r, c in zip(rows[:9], cols[:9]):
+            node.blocked_mask[r, c] = True
+        g = self.values(node)
+        assert (g == search_node.COVER_BLOCKED).any()
+
+    def test_unverified_ground_is_marked_unverified(self, search_node, node):
+        """The important one: not confirmed reachable is its own state, not
+        the same as empty space off the edge of the map."""
+        import numpy as np
+        node.confirmed = np.zeros((60, 60), dtype=bool)   # nothing confirmed
+        g = self.values(node)
+        assert (g == search_node.COVER_UNVERIFIED).any()
+        assert (g[node.in_shape_mask] != search_node.COVER_OUTSIDE).all()
+
+
+class TestSpeckleFilter:
+    """A coverage cell is 0.5 m, the costmap 0.15 m, and the cell is judged by
+    its CENTRE - so one inflated costmap cell carved a whole 0.25 m2 square
+    out of the search area. Nine holes were measured in one overlay, four of
+    them one to four cells.
+    """
+
+    def box(self):
+        return [(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)]
+
+    def test_a_single_inflated_cell_does_not_punch_a_hole(self, planning_node):
+        grid = make_costmap(200, 200, resolution=0.15, origin=(-5.0, -5.0))
+        # one lethal costmap cell, right on a coverage cell centre
+        set_cell(grid, int((5.25 + 5.0) / 0.15), int((5.25 + 5.0) / 0.15), LETHAL)
+        node = planning_node(self.box(), grid)
+        assert not node.blocked_mask.any(), 'a 0.25 m2 speck was treated as obstacle'
+
+    def test_a_real_obstacle_is_still_excluded(self, planning_node):
+        """It must not become a blanket amnesty for small obstacles."""
+        grid = make_costmap(200, 200, resolution=0.15, origin=(-5.0, -5.0))
+        lo = int((3.0 + 5.0) / 0.15)
+        hi = int((6.0 + 5.0) / 0.15)
+        fill_rect(grid, lo, hi, lo, hi, LETHAL)       # a 3 x 3 m rock
+        node = planning_node(self.box(), grid)
+        assert node.blocked_mask.sum() > 20, 'a real obstacle was filtered away'
+        assert not node.inside_mask[node.blocked_mask].any()
