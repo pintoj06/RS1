@@ -1189,3 +1189,62 @@ class TestRealNode:
         for _ in range(6):
             node._review_map()
         assert node.map_replans == before, 'replanned on a map that did not change'
+
+
+class TestUnknownTrackingGuard:
+    """The misconfiguration that silently undid the whole feature.
+
+    With track_unknown_space off, Nav2 stores "never observed" and "observed
+    and clear" both as 0. The confirmed and possible floods then come out
+    identical, the inside of a rock reads as open ground, and waypoints get
+    planned in it - with nothing in the log to say why. Measured on a live
+    costmap: one summit's footprint was 78.8% "clear" and 0% unknown.
+    """
+
+    @pytest.fixture
+    def node(self, search_node):
+        SearchNode = search_node.SearchNode
+
+        class N:
+            _check_unknown_tracking = SearchNode._check_unknown_tracking
+
+            def __init__(self):
+                self._unknown_checked = False
+                self.errors = []
+
+            def get_logger(self):
+                node = self
+
+                class L:
+                    def error(self, msg):
+                        node.errors.append(msg)
+
+                    def __getattr__(self, _):
+                        return lambda *a, **k: None
+                return L()
+
+        return N()
+
+    def test_complains_when_nothing_is_unknown(self, node):
+        grid = make_costmap(10, 10, fill=0)
+        set_cell(grid, 5, 5, LETHAL)          # something has been mapped
+        node._check_unknown_tracking(grid)
+        assert node.errors and 'UNKNOWN' in node.errors[0]
+
+    def test_silent_when_unknown_is_tracked(self, node):
+        grid = make_costmap(10, 10, fill=-1)
+        set_cell(grid, 5, 5, LETHAL)
+        node._check_unknown_tracking(grid)
+        assert not node.errors
+
+    def test_an_empty_costmap_is_not_a_misconfiguration(self, node):
+        """All zeros early on just means nothing has been mapped yet."""
+        node._check_unknown_tracking(make_costmap(10, 10, fill=0))
+        assert not node.errors
+
+    def test_says_it_once_only(self, node):
+        grid = make_costmap(10, 10, fill=0)
+        set_cell(grid, 5, 5, LETHAL)
+        for _ in range(5):
+            node._check_unknown_tracking(grid)
+        assert len(node.errors) == 1

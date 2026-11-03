@@ -606,6 +606,8 @@ class SearchNode(Node):
         # the odom frame, so it keeps what the lidar has already seen - without
         # that memory there would be nothing to plan against.
         self.costmap = None
+        # One-shot guard, see _check_unknown_tracking.
+        self._unknown_checked = False
         if self.get_parameter('avoid_obstacles').value:
             costmap_qos = QoSProfile(
                 depth=1,
@@ -1703,6 +1705,43 @@ class SearchNode(Node):
     def _costmap_callback(self, msg):
         """Keep the latest costmap so the planner can ask what is blocked."""
         self.costmap = msg
+        self._check_unknown_tracking(msg)
+
+    def _check_unknown_tracking(self, msg):
+        """Complain once if the costmap cannot express "never observed".
+
+        Everything about not flying at ground the drone has no way to reach
+        rests on telling "never looked at" apart from "looked at and found
+        clear". Nav2 only marks the first as unknown (-1) when
+        track_unknown_space is true on BOTH the global costmap and its
+        obstacle layer. With it off the two are both stored as 0, the
+        confirmed and possible floods come out byte-for-byte identical, the
+        inside of a rock reads as open ground, and the sweep plants waypoints
+        in it.
+
+        That is not hypothetical: it is what the costmap was doing, and the
+        feature degraded to nothing without a word. Measured on a live map,
+        the footprint of one summit came back 78.8% "clear" and 0% unknown.
+        So this is an error, not a debug line - a silent misconfiguration here
+        undoes the whole thing.
+        """
+        if self._unknown_checked:
+            return
+        data = np.asarray(msg.data, dtype=np.int16)
+        if np.any(data < 0):
+            self._unknown_checked = True          # configured correctly
+            return
+        # All zeros is a costmap that has not been filled in yet, not a
+        # misconfigured one. Wait until something has actually been mapped.
+        if not np.any(data > 0):
+            return
+        self._unknown_checked = True
+        self.get_logger().error(
+            'COSTMAP MARKS NOTHING AS UNKNOWN: "never observed" and '
+            '"observed and clear" are both 0, so they cannot be told apart. '
+            'The inside of an obstacle will read as open ground and the sweep '
+            'will plan waypoints in it. Fix: track_unknown_space: true on '
+            'BOTH global_costmap and its obstacle_layer in the nav2 params.')
 
     def _is_blocked(self, x, y):
         """True if (x, y) in the planning frame is obstructed.
