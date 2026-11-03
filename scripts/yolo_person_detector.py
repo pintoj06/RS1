@@ -50,7 +50,17 @@ one default instead of silently matching neither (an exact match against
 class, which is the wrong kind of wrong - it can't tell you it guessed).
 If `target_class_name` still doesn't match any class the model actually
 has, this logs a warning once and falls back to accepting every detection
-regardless of class.
+that isn't an ignored class.
+
+Ignored classes: the current weights have four classes, {0: 'Human',
+1: 'Human1', 2: 'Kangaroo', 3: 'Wombat'}. Animals are warm, so the thermal
+camera flags them the same as a person; the model seeing them is how the
+system knows a heat signature is not one. Classes matching
+`ignore_class_names` (default 'kangaroo,wombat') are boxed in amber on the
+annotated image and published on `ignored_detections_topic`
+(camera/animal_detections), never on `detections_topic`, so they can
+never raise a contact. The ground station uses them only to skip or cut
+short the search hold for an animal's heat signature.
 
 Example (weights_path defaults to weights/best.pt in this repo, so it
 doesn't need to be passed explicitly unless you're using different
@@ -114,7 +124,23 @@ class YoloPersonDetector(Node):
         # match neither and silently fall back to accepting every class;
         # 'human' as a substring correctly catches both.
         self.declare_parameter('target_class_name', 'human')
+        # Classes the model knows but that must never raise a contact. They
+        # are still boxed on the annotated image (in a different colour) so
+        # the operator can see what the camera is looking at, and published
+        # on their own topic, never on detections_topic, which is the only
+        # one the ground station raises contacts from. Comma-separated,
+        # case-insensitive substring match, same as target_class_name.
+        self.declare_parameter('ignore_class_names', 'kangaroo,wombat')
+        self.declare_parameter('ignored_detections_topic', 'camera/animal_detections')
         self.declare_parameter('confidence_threshold', 0.5)
+        # A human only counts once the box is fully in the frame: this far in
+        # from every edge, as a fraction of the image size. A box touching
+        # the edge is a person half in view, which makes for evidence the
+        # operator can't judge, so it is drawn as "entering" and not
+        # published. Safe for the thermal check: the thermal camera's 60 deg
+        # view sits inside the RGB camera's 80 deg one, ~15% in from each
+        # edge, so anything that triggered the check is already well inside.
+        self.declare_parameter('edge_margin_frac', 0.05)
         self.declare_parameter('device', 'cpu')
         self.declare_parameter('publish_annotated', True)
         self.declare_parameter('annotated_topic', 'camera/person_detections_image')
@@ -134,6 +160,7 @@ class YoloPersonDetector(Node):
         weights_path = os.path.expanduser(str(self.get_parameter('weights_path').value))
         self.target_class_name = str(self.get_parameter('target_class_name').value).lower()
         self.confidence_threshold = float(self.get_parameter('confidence_threshold').value)
+        self.edge_margin_frac = float(self.get_parameter('edge_margin_frac').value)
         self.device = str(self.get_parameter('device').value)
         self.publish_annotated = bool(self.get_parameter('publish_annotated').value)
         cpu_threads = int(self.get_parameter('cpu_threads').value)
@@ -159,14 +186,18 @@ class YoloPersonDetector(Node):
         self.model = YOLO(weights_path)
         self.get_logger().info(f'Loaded. Model classes: {self.model.names}')
 
-        self.target_class_ids = {
-            int(class_id) for class_id, name in self.model.names.items()
-            if self.target_class_name in str(name).lower()
-        }
+        ignore_names = [
+            n.strip().lower()
+            for n in str(self.get_parameter('ignore_class_names').value).split(',')
+            if n.strip()
+        ]
+        self.target_class_ids, self.ignored_class_ids = classify_class_ids(
+            self.model.names, self.target_class_name, ignore_names)
         if not self.target_class_ids:
             self.get_logger().warning(
                 f'No class name containing "{self.target_class_name}" in this model '
-                f'(classes: {self.model.names}) - accepting detections of any class instead.'
+                f'(classes: {self.model.names}) - accepting detections of any class '
+                f'except the ignored ones instead.'
             )
 
         self.bridge = CvBridge()
@@ -176,6 +207,9 @@ class YoloPersonDetector(Node):
         )
         self.detections_pub = self.create_publisher(
             Detection2DArray, self.get_parameter('detections_topic').value, 10
+        )
+        self.ignored_pub = self.create_publisher(
+            Detection2DArray, self.get_parameter('ignored_detections_topic').value, 10
         )
         self.annotated_pub = None
         if self.publish_annotated:
@@ -187,30 +221,16 @@ class YoloPersonDetector(Node):
             f'yolo_person_detector started for "{self.robot_name}": '
             f'watching {self.image_sub.topic_name}, target class name contains '
             f'"{self.target_class_name}" (matched ids={sorted(self.target_class_ids)}), '
+            f'ignoring ids={sorted(self.ignored_class_ids)} (shown, never a contact), '
             f'confidence >= {self.confidence_threshold}.'
         )
 
-    def _image_callback(self, msg: Image) -> None:
-        frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
-
-        results = self.model(frame, device=self.device, verbose=False)[0]
-
+    def _to_array(self, header, matches) -> Detection2DArray:
         detections = Detection2DArray()
-        detections.header = msg.header
-
-        matches = []
-        for box in results.boxes:
-            cls_id = int(box.cls[0])
-            conf = float(box.conf[0])
-            if conf < self.confidence_threshold:
-                continue
-            if self.target_class_ids and cls_id not in self.target_class_ids:
-                continue
-            matches.append((cls_id, conf, box.xyxy[0].tolist()))
-
+        detections.header = header
         for cls_id, conf, (x1, y1, x2, y2) in matches:
             det = Detection2D()
-            det.header = msg.header
+            det.header = header
             det.bbox.center.position.x = (x1 + x2) / 2.0
             det.bbox.center.position.y = (y1 + y2) / 2.0
             det.bbox.size_x = x2 - x1
@@ -220,25 +240,99 @@ class YoloPersonDetector(Node):
             hypothesis.hypothesis.score = conf
             det.results.append(hypothesis)
             detections.detections.append(det)
+        return detections
 
-        self.detections_pub.publish(detections)
+    def _image_callback(self, msg: Image) -> None:
+        frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+
+        results = self.model(frame, device=self.device, verbose=False)[0]
+
+        boxes = [
+            (int(box.cls[0]), float(box.conf[0]), box.xyxy[0].tolist())
+            for box in results.boxes
+        ]
+        matches, ignored = split_detections(
+            boxes, self.confidence_threshold,
+            self.target_class_ids, self.ignored_class_ids)
+        height, width = frame.shape[:2]
+        entering = [m for m in matches
+                    if not fully_in_frame(m[2], width, height, self.edge_margin_frac)]
+        matches = [m for m in matches if m not in entering]
+
+        # Always published, empty or not: the ground station treats a silent
+        # topic as the detector being down.
+        self.detections_pub.publish(self._to_array(msg.header, matches))
+        self.ignored_pub.publish(self._to_array(msg.header, ignored))
         if matches:
             conf_str = ', '.join(f'{c:.2f}' for _, c, _ in matches)
             self.get_logger().info(f'{len(matches)} detection(s), confidence: {conf_str}')
+        if ignored:
+            seen = ', '.join(f'{self.model.names[i]} {c:.2f}' for i, c, _ in ignored)
+            self.get_logger().info(f'Ignored (not a contact): {seen}')
 
         if self.annotated_pub is not None:
             annotated = frame.copy()
-            for cls_id, conf, (x1, y1, x2, y2) in matches:
-                p1, p2 = (int(x1), int(y1)), (int(x2), int(y2))
-                cv2.rectangle(annotated, p1, p2, (0, 255, 0), 2)
-                label = f'{self.model.names[cls_id]} {conf:.2f}'
-                cv2.putText(
-                    annotated, label, (p1[0], max(p1[1] - 6, 0)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1, cv2.LINE_AA,
-                )
+            # Humans green; ignored classes amber and humans still at the
+            # frame edge yellow, each labelled, so the operator can tell at
+            # a glance which boxes count.
+            for colour, suffix, group in (((0, 191, 255), ' (ignored)', ignored),
+                                          ((0, 255, 255), ' (entering)', entering),
+                                          ((0, 255, 0), '', matches)):
+                for cls_id, conf, (x1, y1, x2, y2) in group:
+                    p1, p2 = (int(x1), int(y1)), (int(x2), int(y2))
+                    cv2.rectangle(annotated, p1, p2, colour, 2)
+                    label = f'{self.model.names[cls_id]} {conf:.2f}{suffix}'
+                    cv2.putText(
+                        annotated, label, (p1[0], max(p1[1] - 6, 0)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, colour, 1, cv2.LINE_AA,
+                    )
             out_msg = self.bridge.cv2_to_imgmsg(annotated, encoding='bgr8')
             out_msg.header = msg.header
             self.annotated_pub.publish(out_msg)
+
+
+def classify_class_ids(names, target_name, ignore_names):
+    """Split the model's class ids into (target ids, ignored ids).
+
+    Both are case-insensitive substring matches on the class name. A class
+    that matches an ignore name is never a target, even if it also matches
+    target_name, so an ignored class can never raise a contact.
+    """
+    ignored = {
+        int(i) for i, n in names.items()
+        if any(ig in str(n).lower() for ig in ignore_names)
+    }
+    target = {
+        int(i) for i, n in names.items()
+        if target_name in str(n).lower() and int(i) not in ignored
+    }
+    return target, ignored
+
+
+def fully_in_frame(xyxy, width, height, margin_frac):
+    """True if the box is at least margin_frac of the image size in from
+    every edge, i.e. the whole object is in view, not cut off by the frame."""
+    x1, y1, x2, y2 = xyxy
+    mx, my = margin_frac * width, margin_frac * height
+    return x1 >= mx and y1 >= my and x2 <= width - mx and y2 <= height - my
+
+
+def split_detections(boxes, threshold, target_ids, ignored_ids):
+    """Sort (cls_id, conf, xyxy) boxes into (matches, ignored).
+
+    Below-threshold boxes are dropped from both. With no target ids (the
+    model has no class matching target_class_name) every class that is not
+    ignored counts as a match. Classes that are neither are dropped.
+    """
+    matches, ignored = [], []
+    for cls_id, conf, xyxy in boxes:
+        if conf < threshold:
+            continue
+        if cls_id in ignored_ids:
+            ignored.append((cls_id, conf, xyxy))
+        elif not target_ids or cls_id in target_ids:
+            matches.append((cls_id, conf, xyxy))
+    return matches, ignored
 
 
 def main(args=None):

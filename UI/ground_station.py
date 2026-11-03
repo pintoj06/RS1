@@ -46,7 +46,7 @@ from rclpy.qos import (QoSDurabilityPolicy, QoSHistoryPolicy, QoSProfile,
                        QoSReliabilityPolicy, qos_profile_sensor_data)
 
 from geometry_msgs.msg import Point32, PointStamped, PolygonStamped
-from nav_msgs.msg import OccupancyGrid, Path
+from nav_msgs.msg import Odometry, OccupancyGrid, Path
 from sensor_msgs.msg import Image
 from std_msgs.msg import Bool, String
 from vision_msgs.msg import Detection2DArray
@@ -126,6 +126,123 @@ class Contact:
     rgb_confidence: float
     thermal_confidence: float
     status: str = "UNCONFIRMED"
+    # Where the detected object itself is on the ground (projected from the
+    # YOLO box), as opposed to x, y, the drone's position when raised.
+    obj_x: Optional[float] = None
+    obj_y: Optional[float] = None
+    # The GroundTracker track of the human that raised it. Dismissing the
+    # contact dismisses the track, so the same person can't raise it again.
+    track_id: Optional[int] = None
+
+
+def match_one_to_one(points, anchors, gate: float) -> dict:
+    """Pair points with anchors, closest pairs first, each used at most once,
+    pairs gate metres or further apart never. Returns {point index: anchor
+    index}. One-to-one is what lets the gate be wide without swallowing a
+    second person: with two people beside one anchor, only one can take it.
+    None points (not projectable) are never matched."""
+    pairs = sorted(
+        (np.hypot(p[0] - a[0], p[1] - a[1]), i, j)
+        for i, p in enumerate(points) if p is not None
+        for j, a in enumerate(anchors))
+    matched, used = {}, set()
+    for dist, i, j in pairs:
+        if dist >= gate:
+            break
+        if i not in matched and j not in used:
+            matched[i] = j
+            used.add(j)
+    return matched
+
+
+@dataclass
+class Track:
+    id: int
+    x: float
+    y: float
+    last_seen: float
+    dismissed: bool = False
+
+
+class GroundTracker:
+    """Follows each YOLO human from frame to frame by ground position.
+
+    Projecting a box to the ground is only good to ~1-1.5 m while the drone
+    moves (measured on the live sim), too loose to recognise a dismissed
+    person by a fixed radius. Frame to frame, though, the same person moves
+    little, so each detection joins the nearest track from the frames before
+    (within gate, one-to-one) and the track follows it. A dismissed track
+    keeps following its person however far the projection drifts, and is
+    never dropped, so the person is still recognised on a later sweep row.
+    Tracks not dismissed are dropped after timeout_s unseen.
+    """
+
+    def __init__(self, gate: float, timeout_s: float):
+        self.gate = gate
+        self.timeout_s = timeout_s
+        self.tracks: List[Track] = []
+        self._next_id = 1
+
+    def update(self, points, now: float) -> List[Optional[Track]]:
+        """One frame's projected detections in, the track of each out (None
+        for a point that could not be projected)."""
+        self.tracks = [t for t in self.tracks
+                       if t.dismissed or now - t.last_seen < self.timeout_s]
+        matched = match_one_to_one(
+            points, [(t.x, t.y) for t in self.tracks], self.gate)
+        out: List[Optional[Track]] = []
+        for i, p in enumerate(points):
+            if p is None:
+                out.append(None)
+                continue
+            if i in matched:
+                track = self.tracks[matched[i]]
+            else:
+                track = Track(self._next_id, p[0], p[1], now)
+                self._next_id += 1
+                self.tracks.append(track)
+            track.x, track.y, track.last_seen = p[0], p[1], now
+            out.append(track)
+        return out
+
+    def get(self, track_id: Optional[int]) -> Optional[Track]:
+        return next((t for t in self.tracks if t.id == track_id), None)
+
+    def dismiss(self, track_id: Optional[int],
+                fallback_xy: Optional[Tuple[float, float]] = None,
+                now: float = 0.0) -> Optional[Track]:
+        """Mark a track dismissed. If it is gone (or there never was one) but
+        the object's position is known, start a dismissed track there."""
+        track = self.get(track_id)
+        if track is None and fallback_xy is not None:
+            track = Track(self._next_id, fallback_xy[0], fallback_xy[1], now)
+            self._next_id += 1
+            self.tracks.append(track)
+        if track is not None:
+            track.dismissed = True
+        return track
+
+    def dismissed(self) -> List[Track]:
+        return [t for t in self.tracks if t.dismissed]
+
+
+def pixel_to_ground(u: float, v: float, width: int, height: int, hfov: float,
+                    altitude: float, x: float, y: float,
+                    yaw: float) -> Tuple[float, float]:
+    """Ground position seen at pixel (u, v) of a camera looking straight
+    down from (x, y) at `altitude` above flat ground, heading `yaw`.
+
+    The cameras are pitched 90 deg down (camera_joint in parrot.urdf.xacro),
+    so the top of the image is the drone's forward and the right of the
+    image is its right. Checked on the live thermal feed against the known
+    positions of person1, the kangaroo and the wombat: within ~0.3 m.
+    """
+    metres_per_px = 2.0 * altitude * np.tan(hfov / 2.0) / width
+    forward = (height / 2.0 - v) * metres_per_px
+    left = (width / 2.0 - u) * metres_per_px
+    c, s = np.cos(yaw), np.sin(yaw)
+    return (float(x + forward * c - left * s),
+            float(y + forward * s + left * c))
 
 
 # ---------------------------------------------------------------------------
@@ -166,6 +283,25 @@ class GroundStationNode(Node):
         # After a dismiss, let the drone fly on this long before checking
         # again, so it can move off the heat source it was holding over.
         self.declare_parameter("dismiss_cooldown_s", 2.0)
+        # Every YOLO human is tracked frame to frame by its position on the
+        # ground (GroundTracker), and a dismissed contact dismisses its track,
+        # so the same person can't raise it again: not while the drone holds
+        # over them, flies on, or comes back on a later row. track_gate is how
+        # far a detection may be from a track's last position and still join
+        # it (projection drifts up to ~1.6 m while moving, measured live).
+        # Projection needs the cameras' fields of view (parrot.gazebo.xacro)
+        # and height above ground, from odometry z once it arrives.
+        self.declare_parameter("track_gate", 2.0)
+        self.declare_parameter("track_timeout_s", 10.0)
+        self.declare_parameter("rgb_hfov", 1.4)
+        self.declare_parameter("thermal_hfov", 1.0472)
+        self.declare_parameter("flight_altitude", 10.0)
+        self.tracker = GroundTracker(
+            float(self.get_parameter("track_gate").value),
+            float(self.get_parameter("track_timeout_s").value))
+        self.rgb_hfov = float(self.get_parameter("rgb_hfov").value)
+        self.thermal_hfov = float(self.get_parameter("thermal_hfov").value)
+        self.drone_alt = float(self.get_parameter("flight_altitude").value)
         self.person_min_k = float(self.get_parameter("person_min_k").value)
         self.person_min_pixels = int(self.get_parameter("person_min_pixels").value)
         self.dismiss_cooldown_s = float(self.get_parameter("dismiss_cooldown_s").value)
@@ -184,6 +320,13 @@ class GroundStationNode(Node):
         self.detector_stale_s = float(self.get_parameter("detector_stale_s").value)
         # (best confidence, monotonic time) of the latest frame with a human.
         self.rgb_hit: Optional[Tuple[float, float]] = None
+        # Ground position and track of the human in rgb_hit, if projected.
+        self.rgb_hit_xy: Optional[Tuple[float, float]] = None
+        self.rgb_hit_track: Optional[int] = None
+        # (class name, monotonic time) of the latest frame with an ignored
+        # class (kangaroo, wombat) in it. Never raises a contact; only lets
+        # an animal's heat signature skip or end the RGB check early.
+        self.animal_hit: Optional[Tuple[str, float]] = None
         self._detections_time = 0.0
         # (peak kelvin, hot pixel count) for the latest frame, None if nothing.
         self.thermal_hit: Optional[Tuple[float, int]] = None
@@ -279,6 +422,14 @@ class GroundStationNode(Node):
         # what raises contacts; the image above is only for display.
         self.create_subscription(Detection2DArray, "camera/person_detections",
                                  self._on_detections, 10)
+        # Same node's ignored classes (its 'ignored_detections_topic'):
+        # animals the model recognises. Display-only on the image above;
+        # here they only stop an animal's body heat holding the search.
+        self.create_subscription(Detection2DArray, "camera/animal_detections",
+                                 self._on_animal_detections, 10)
+        # Only for height above ground: TF z is always 0 (the EKF is 2D),
+        # odometry z is the real height (ground in large_demo is at z ~ 0).
+        self.create_subscription(Odometry, "odometry", self._on_odometry, 10)
         self.create_subscription(OccupancyGrid, "map", self._on_map, map_qos)
         # The scout publishes this with default (volatile) QoS, so a plain
         # subscription matches it.
@@ -380,12 +531,60 @@ class GroundStationNode(Node):
         except Exception as exc:
             self.get_logger().warn(f"AI detections decode failed: {exc}", once=True)
 
+    def _on_odometry(self, msg: Odometry):
+        self.drone_alt = msg.pose.pose.position.z
+
+    def _pose_at(self, stamp) -> Optional[Tuple[float, float, float]]:
+        """(x, y, yaw) of the drone when an image was taken, from TF history.
+        Detector frames arrive up to a second late and the drone may be
+        flying, so the pose at processing time would put the object in the
+        wrong place. Falls back to the latest pose."""
+        for frame in (self.map_frame, self.odom_frame):
+            try:
+                tf = self.tf_buffer.lookup_transform(
+                    frame, self.base_frame, rclpy.time.Time.from_msg(stamp))
+            except Exception:
+                continue
+            q = tf.transform.rotation
+            yaw = np.arctan2(2.0 * (q.w * q.z + q.x * q.y),
+                             1.0 - 2.0 * (q.y ** 2 + q.z ** 2))
+            return tf.transform.translation.x, tf.transform.translation.y, yaw
+        if self.drone_xy is None:
+            return None
+        return self.drone_xy[0], self.drone_xy[1], self.drone_yaw
+
+    def ground_point(self, u: float, v: float, width: int, height: int,
+                     hfov: float, stamp) -> Optional[Tuple[float, float]]:
+        pose = self._pose_at(stamp)
+        if pose is None:
+            return None
+        return pixel_to_ground(u, v, width, height, hfov, self.drone_alt, *pose)
+
     def _on_detections(self, msg: Detection2DArray):
         now = time.monotonic()
         self._detections_time = now
-        scores = [r.hypothesis.score for d in msg.detections for r in d.results]
-        if scores:
-            self.rgb_hit = (max(scores), now)
+        if self.rgb_frame is not None:
+            height, width = self.rgb_frame.shape[:2]
+        else:
+            width, height = 720, 480      # parrot.gazebo.xacro rgbd_camera
+        points = [self.ground_point(d.bbox.center.position.x,
+                                    d.bbox.center.position.y,
+                                    width, height, self.rgb_hfov,
+                                    msg.header.stamp)
+                  for d in msg.detections]
+        tracks = self.tracker.update(points, now)
+        best = None
+        for d, xy, track in zip(msg.detections, points, tracks):
+            if track is not None and track.dismissed:
+                continue      # the operator already ruled this one out
+            for r in d.results:
+                if best is None or r.hypothesis.score > best[0]:
+                    best = (r.hypothesis.score, xy,
+                            track.id if track is not None else None)
+        if best is not None:
+            self.rgb_hit = (best[0], now)
+            self.rgb_hit_xy = best[1]
+            self.rgb_hit_track = best[2]
 
     def fresh_rgb_hit(self) -> Optional[float]:
         """Confidence of a human seen in the last rgb_fresh_s, else None."""
@@ -393,6 +592,21 @@ class GroundStationNode(Node):
             return None
         conf, seen = self.rgb_hit
         return conf if time.monotonic() - seen < self.rgb_fresh_s else None
+
+    def _on_animal_detections(self, msg: Detection2DArray):
+        best = max(((r.hypothesis.score, r.hypothesis.class_id)
+                    for d in msg.detections for r in d.results), default=None)
+        if best is not None:
+            self.animal_hit = (best[1], time.monotonic())
+
+    def fresh_animal_only(self) -> Optional[str]:
+        """Class name of an animal seen in the last rgb_fresh_s with no human
+        seen in that time, else None. A human always wins: an animal next to
+        a person must never stop the person being checked."""
+        if self.animal_hit is None or self.fresh_rgb_hit() is not None:
+            return None
+        name, seen = self.animal_hit
+        return name if time.monotonic() - seen < self.rgb_fresh_s else None
 
     def detector_alive(self) -> bool:
         return time.monotonic() - self._detections_time < self.detector_stale_s
@@ -411,7 +625,8 @@ class GroundStationNode(Node):
                 scaled = (kelvin - self.thermal_min_k) * (255.0 / span)
                 mono = np.clip(scaled, 0, 255).astype(np.uint8)
                 frame = cv2.applyColorMap(mono, cv2.COLORMAP_INFERNO)
-                self.thermal_hit = self._detect_person(kelvin, frame)
+                self.thermal_hit = self._detect_person(kelvin, frame,
+                                                       msg.header.stamp)
                 self.thermal_frame = frame
             elif msg.encoding in ("mono8", "8UC1"):
                 mono = self.bridge.imgmsg_to_cv2(msg, "mono8")
@@ -421,11 +636,28 @@ class GroundStationNode(Node):
         except Exception as exc:
             self.get_logger().warn(f"Thermal decode failed: {exc}", once=True)
 
-    def _detect_person(self, kelvin: np.ndarray,
-                       frame: np.ndarray) -> Optional[Tuple[float, int]]:
+    def _detect_person(self, kelvin: np.ndarray, frame: np.ndarray,
+                       stamp=None) -> Optional[Tuple[float, int]]:
         """Threshold for body heat. Boxes the hot region on the frame so a
-        frozen frame shows what triggered the check."""
+        frozen frame shows what triggered the check.
+
+        Each dismissed track claims the one hot blob nearest it (within the
+        track gate) and that blob is left out, so the heat of a person the
+        operator already ruled out doesn't hold the search again, while
+        anyone else's heat still counts."""
         hot = kelvin >= self.person_min_k
+        dismissed = self.tracker.dismissed()
+        if dismissed and stamp is not None and hot.any():
+            n, labels, _, centroids = cv2.connectedComponentsWithStats(
+                hot.astype(np.uint8))
+            h, w = hot.shape
+            blobs = [self.ground_point(centroids[i][0], centroids[i][1],
+                                       w, h, self.thermal_hfov, stamp)
+                     for i in range(1, n)]
+            claimed = match_one_to_one(
+                blobs, [(t.x, t.y) for t in dismissed], self.tracker.gate)
+            for i in claimed:
+                hot[labels == i + 1] = False
         count = int(np.count_nonzero(hot))
         if count < self.person_min_pixels:
             return None
@@ -1463,6 +1695,15 @@ class MainWindow(QMainWindow):
             self.hold_for_confirmed = True
         else:
             self._no_check_until = time.monotonic() + self.node.dismiss_cooldown_s
+            # Remember the person, not just the moment: their track stays
+            # ruled out however the drone comes back over them.
+            fallback = (c.obj_x, c.obj_y) if c.obj_x is not None else None
+            track = self.node.tracker.dismiss(c.track_id, fallback,
+                                              time.monotonic())
+            if track is not None:
+                self.node.get_logger().info(
+                    f"Contact {c.id} dismissed: ignoring track {track.id} "
+                    f"(now at {track.x:.1f}, {track.y:.1f}) from now on.")
         self._update_hold()
 
     def _update_hold(self):
@@ -1479,9 +1720,11 @@ class MainWindow(QMainWindow):
 
     def _raise_contact(self, x: float, y: float, rgb_conf: float,
                        thermal_conf: float):
+        obj = self.node.rgb_hit_xy or (None, None)
         self.contacts.insert(0, Contact(
             id=self._next_id, x=x, y=y,
-            rgb_confidence=rgb_conf, thermal_confidence=thermal_conf))
+            rgb_confidence=rgb_conf, thermal_confidence=thermal_conf,
+            obj_x=obj[0], obj_y=obj[1], track_id=self.node.rgb_hit_track))
         self._next_id += 1
         self._select_newest = True
         self._update_hold()
@@ -1496,6 +1739,12 @@ class MainWindow(QMainWindow):
         was something else (e.g. an animal), so resume and don't hold for
         heat within CONTACT_RADIUS of that spot again. An RGB sighting with
         no heat (no check running, nothing hot in view) does nothing.
+
+        Animals (kangaroo, wombat) are as warm as a person. When the detector
+        names one and sees no human, the heat is treated as already checked:
+        no hold if it is seen before the check starts, and a running check
+        ends at once instead of waiting out rgb_check_s. They never raise a
+        contact themselves.
 
         A rejected spot only stops the drone holding there again. Heat and a
         human seen together there (e.g. on a later sweep row) still raise a
@@ -1529,9 +1778,11 @@ class MainWindow(QMainWindow):
             thermal_conf = heat_conf if heat is not None else 0.0
             if checking:
                 thermal_conf = max(thermal_conf, self._check_heat_conf)
+            obj = self.node.rgb_hit_xy
+            where = f" at ({obj[0]:.1f}, {obj[1]:.1f})" if obj else ""
             self.node.get_logger().warn(
                 f"Contact: thermal signature confirmed by RGB, "
-                f"human {rgb_conf:.0%}")
+                f"human {rgb_conf:.0%}, track {self.node.rgb_hit_track}{where}")
             # Keep the frames that triggered the contact as evidence.
             self.vis_page.frozen = self.node.display_frame
             self.ir_page.frozen = (self.node.thermal_frame if heat is not None
@@ -1541,9 +1792,20 @@ class MainWindow(QMainWindow):
                                 thermal_conf=thermal_conf)
             return
 
+        animal = self.node.fresh_animal_only()
+
         if self._check_until is not None:
             if heat is not None:
                 self._check_heat_conf = max(self._check_heat_conf, heat_conf)
+            if animal is not None:
+                # The detector has named the heat source and it is not a
+                # person: no need to hold out the rest of rgb_check_s.
+                self.node.get_logger().info(
+                    f"Thermal signature is a {animal}, resuming search.")
+                self.rejected_spots.append(self._check_xy)
+                self._check_until = None
+                self._update_hold()
+                return
             if now >= self._check_until:
                 self.node.get_logger().info(
                     "Thermal signature not confirmed by RGB, resuming search.")
@@ -1553,6 +1815,12 @@ class MainWindow(QMainWindow):
             return
 
         if heat is not None and not self._near(x, y, self.rejected_spots):
+            if animal is not None:
+                # Already identified as an animal: don't stop the scout.
+                self.node.get_logger().info(
+                    f"Thermal signature is a {animal}, not holding.")
+                self.rejected_spots.append((x, y))
+                return
             self.node.get_logger().warn(
                 f"Thermal signature ({count} px, peak {peak_k:.1f} K), "
                 f"checking with the RGB camera")
