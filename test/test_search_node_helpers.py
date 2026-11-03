@@ -611,6 +611,7 @@ def fake_frontier(search_node):
                 observation_gap_fill=0.0,
                 sensor_range=40.0,
                 vantage_min_separation=3.0,
+                vantage_obstacle_margin=0.0,
             )
 
         def _lookup_robot_xy(self):
@@ -890,6 +891,7 @@ def planning_node(search_node):
                 observation_gap_fill=0.0,
                 sensor_range=40.0,
                 vantage_min_separation=3.0,
+                vantage_obstacle_margin=0.0,
                 vantage_patience=5,
                 vantage_progress_fraction=0.02,
                 spacing=0.0,
@@ -1352,3 +1354,103 @@ class TestPendingReplanAlwaysRuns:
         search._replan_wanted = True
         search.tick()
         assert search.replanned == 1
+
+
+class TestReplanSelfCheck:
+    """The spiral seen in flight at 88% coverage.
+
+    On a replan the sweep only covers what is LEFT, but the self-check was
+    still marking it against the whole area. With almost everything already
+    searched it scored near zero, so the retry loop tightened the spacing six
+    times - 8.98 m down to 3.4 m - and then warned "100.0% will NOT be
+    searched" on a search that was nearly finished.
+    """
+
+    def box(self):
+        return [(0.0, 0.0), (20.0, 0.0), (20.0, 20.0), (0.0, 20.0)]
+
+    def test_no_tightening_when_the_area_is_nearly_done(self, planning_node):
+        grid = make_costmap(60, 60, resolution=0.5, origin=(-5.0, -5.0))
+        node = planning_node(self.box(), grid)
+        node.plan_sweep()
+        node.logged.clear()
+        node.coverage[:, :] = 100          # the camera has been everywhere
+        node.replanning = True
+        node.planned = False
+        node.points = []
+        node.plan_sweep()
+        assert not any('tightening' in m for m in node.logged), \
+            'tightened the spacing with nothing left to cover'
+        assert not any('will NOT be searched' in m for m in node.logged)
+
+    def test_nothing_outstanding_counts_as_covered(self, planning_node):
+        """0.0 was the wrong answer for "no ground outstanding" - that is
+        what set the retry loop off."""
+        grid = make_costmap(60, 60, resolution=0.5, origin=(-5.0, -5.0))
+        node = planning_node(self.box(), grid)
+        node.plan_sweep()
+        node.coverage[:, :] = 100
+        node.replanning = True
+        assert node._predicted_coverage([], node._footprint_radius()) == 1.0
+
+    def test_still_measures_a_real_gap_on_a_replan(self, planning_node):
+        """It must not become a rubber stamp: with half the area unsearched
+        and a path that covers none of it, the score has to be low."""
+        grid = make_costmap(60, 60, resolution=0.5, origin=(-5.0, -5.0))
+        node = planning_node(self.box(), grid)
+        node.plan_sweep()
+        node.coverage[:node.cov_rows // 2, :] = 100     # bottom half done
+        node.replanning = True
+        covered = node._predicted_coverage([(0.0, 1.0), (1.0, 1.0)],
+                                           node._footprint_radius())
+        assert covered < 0.5, f'scored {covered:.2f} for covering almost none of it'
+
+
+class TestVantageKeepsClearOfRock:
+    """Three of five failure replans went on this in one flight.
+
+    A frontier cell is clear when it is picked, but it sits at the edge of
+    what has been seen - so the next scan fills in rock beside it, inflation
+    swallows it, and the drone arrives at a waypoint that has turned
+    unreachable. That counts as a FAILED waypoint, so it spends one of the
+    failure-replan budget rather than the map-replan one.
+    """
+
+    UNKNOWN = -1
+
+    def rock_at_the_frontier(self):
+        """Observed ground up to row 5, rock along row 5, unknown beyond."""
+        grid = make_costmap(30, 30, resolution=1.0)
+        fill_rect(grid, 0, 30, 6, 30, self.UNKNOWN)
+        fill_rect(grid, 10, 20, 5, 6, LETHAL)
+        return grid
+
+    def test_picks_a_vantage_away_from_the_rock(self, fake_frontier):
+        import numpy as np
+        fake_frontier.costmap = self.rock_at_the_frontier()
+        fake_frontier.polygon = [(0.0, 0.0), (30.0, 0.0), (30.0, 30.0), (0.0, 30.0)]
+        fake_frontier.get_parameter.values['vantage_obstacle_margin'] = 3.0
+        fake_frontier.flood()
+        goal = fake_frontier._frontier_goal()
+        assert goal is not None
+        g, info = fake_frontier._costmap_grid()
+        solid = np.argwhere(g >= INSCRIBED)
+        ys = info.origin.position.y + (solid[:, 0] + 0.5) * info.resolution
+        xs = info.origin.position.x + (solid[:, 1] + 0.5) * info.resolution
+        nearest = float(np.min(np.hypot(xs - goal[0], ys - goal[1])))
+        assert nearest >= 3.0, f'vantage only {nearest:.1f} m from mapped rock'
+
+    def test_margin_zero_restores_the_old_behaviour(self, fake_frontier):
+        fake_frontier.costmap = self.rock_at_the_frontier()
+        fake_frontier.polygon = [(0.0, 0.0), (30.0, 0.0), (30.0, 30.0), (0.0, 30.0)]
+        fake_frontier.get_parameter.values['vantage_obstacle_margin'] = 0.0
+        fake_frontier.flood()
+        assert fake_frontier._frontier_goal() is not None
+
+    def test_takes_what_there_is_when_nothing_is_roomy(self, fake_frontier):
+        """A margin nothing can satisfy must not stop it looking altogether."""
+        fake_frontier.costmap = self.rock_at_the_frontier()
+        fake_frontier.polygon = [(0.0, 0.0), (30.0, 0.0), (30.0, 30.0), (0.0, 30.0)]
+        fake_frontier.get_parameter.values['vantage_obstacle_margin'] = 500.0
+        fake_frontier.flood()
+        assert fake_frontier._frontier_goal() is not None

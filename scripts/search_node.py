@@ -376,6 +376,12 @@ class SearchNode(Node):
         # that really is hopeless (a box drawn wholly inside a rock costs
         # 40 m at 5, and 91 m at 10).
         self.declare_parameter('vantage_patience', 5)
+        # Keep vantage points this far clear of mapped obstacle. A frontier
+        # cell is clear when picked but sits at the edge of what has been
+        # seen, so the next scan often fills in rock beside it and inflation
+        # swallows it - and arriving at a waypoint that has turned
+        # unreachable spends one of the FAILURE replan budget.
+        self.declare_parameter('vantage_obstacle_margin', 2.0)   # metres
         # How much unverified ground one trip has to resolve to count as
         # progress, as a fraction of the area the operator drew.
         self.declare_parameter('vantage_progress_fraction', 0.02)
@@ -739,7 +745,12 @@ class SearchNode(Node):
         before = self.cells_to_search
         self.inside_mask = self._build_inside_mask()
         self.cells_to_search = int(np.count_nonzero(self.inside_mask))
-        if self.cells_to_search != before:
+        if self.cells_to_search > before:
+            self.get_logger().info(
+                f'{self.cells_to_search - before} more cells are searchable '
+                f'than before - ground that could not be reached has opened '
+                f'up; the target is now {self.cells_to_search} cells.')
+        elif self.cells_to_search != before:
             dropped = before - self.cells_to_search
             self.get_logger().info(
                 f'{dropped} cells that looked searchable turned out to be '
@@ -823,9 +834,13 @@ class SearchNode(Node):
         each part with its own rows), which is a much bigger change. Measuring
         the result and tightening the spacing gets the same guarantee.
         """
-        if len(points) < 2:
-            return 0.0
-
+        # NOTE: no early return for a short path. "No path" and "no ground
+        # left to cover" are different things, and an early 0.0 conflated
+        # them: on a replan with everything already searched the sweep is
+        # legitimately empty, and scoring that 0% is what set the retry loop
+        # tightening. The target is worked out first, below, and an empty
+        # target answers 1.0; an empty path against a real target still falls
+        # out of the loop as 0.0, which is correct.
         xs = [p[0] for p in self.polygon]
         ys = [p[1] for p in self.polygon]
         pad = radius + res
@@ -872,9 +887,26 @@ class SearchNode(Node):
                             and not self._is_reachable(x, y, confirmed)):
                         inside[r, c] = False
 
+        # On a REPLAN the sweep only covers what is left, so ground the
+        # camera has already been over must come out of the target too -
+        # otherwise the check marks an almost-finished pass against the whole
+        # area, scores near zero, and the retry loop tightens the spacing for
+        # nothing. Seen in flight at 88% coverage: six "would leave 100.0% of
+        # the area unsearched - tightening" lines in a row, spacing dragged
+        # from 8.98 m to 3.4 m, and a flat "100.0% will NOT be searched"
+        # warning on a search that was nearly done.
+        if self.replanning:
+            for r in range(rows):
+                for c in range(cols):
+                    if inside[r, c] and self._already_searched(gx[r, c], gy[r, c]):
+                        inside[r, c] = False
+
         total = int(inside.sum())
         if total == 0:
-            return 0.0
+            # Nothing left to cover is FULLY covered, not uncovered. Returning
+            # 0.0 here is what set the retry loop off: it read "no ground
+            # covered" when the honest answer is "no ground outstanding".
+            return 1.0
 
         # Fly the path and mark everything the footprint circle passes over.
         seen = np.zeros((rows, cols), dtype=bool)
@@ -2036,6 +2068,8 @@ class SearchNode(Node):
         nearest = int(np.argmin(np.hypot(wx - here[0], wy - here[1])))
         target = (wx[nearest], wy[nearest])
 
+        grid_now, info_now = self._costmap_grid()
+
         # The frontier is where confirmed ground touches unverified ground:
         # the places that, stood on, turn unknown into known. Note this uses
         # ALL the unverified ground, not just the part inside the area - to
@@ -2053,6 +2087,24 @@ class SearchNode(Node):
         if not away.any():
             return None
         ex, ey = ex[away], ey[away]
+
+        # Nor anywhere too close to mapped obstacle. A frontier cell is clear
+        # when it is picked, but it sits by definition at the edge of what has
+        # been seen, so the next scan often fills in rock beside it and the
+        # inflation ring swallows it. The drone then flies at a waypoint that
+        # turns unreachable on arrival, and because that counts as a FAILED
+        # waypoint it spends one of the failure-replan budget: three of five
+        # went that way in one flight, on vantage points at (3.7, 29.7),
+        # (6.7, 30.0) and (9.7, 29.1), all hard against the same rock face.
+        solid_now = grid_now >= self.get_parameter('obstacle_cost_threshold').value
+        margin = float(self.get_parameter('vantage_obstacle_margin').value)
+        if margin > 0 and solid_now.any():
+            clear_by = ndimage.distance_transform_edt(~solid_now) * res
+            cols_i = np.clip(((ex - ox) / res).astype(int), 0, info_now.width - 1)
+            rows_i = np.clip(((ey - oy) / res).astype(int), 0, info_now.height - 1)
+            roomy = clear_by[rows_i, cols_i] >= margin
+            if roomy.any():                 # if none, take what there is
+                ex, ey = ex[roomy], ey[roomy]
 
         # Nor anywhere already looked from. Some ground can never be settled
         # however long you stare at it - the inside of a rock is unverifiable
@@ -2074,8 +2126,7 @@ class SearchNode(Node):
         # without this the drone works its way along the frontier for ever,
         # hop after hop, learning nothing - measured at 14 wasted hops after
         # the search was already complete.
-        grid, info = self._costmap_grid()
-        solid = grid >= self.get_parameter('obstacle_cost_threshold').value
+        solid, info = solid_now, info_now
         rng = float(self.get_parameter('sensor_range').value)
 
         # Try the nearest unverified ground first, then a spread of the rest:
