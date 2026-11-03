@@ -45,6 +45,7 @@ def search(search_node):
             self.index = 2
             self.points = [(0, 0)] * 6
             self.busy = False
+            self._replan_wanted = False
             self.timed_out = False
             self.rejections = 0
             self.ticks = 0

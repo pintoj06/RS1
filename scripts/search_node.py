@@ -1000,20 +1000,17 @@ class SearchNode(Node):
 
         # Nothing left after cutting the obstacles out: the whole area is
         # rock. Say so plainly rather than flying a meaningless path.
-        if not self.points:
-            # Before writing the area off, check whether the reason nothing
-            # could be planned is simply that we have not LOOKED yet. On the
-            # pad the lidar sits at 0.2 m and sees almost nothing useful 20 m
-            # out, so an empty first plan is entirely expected - that is a
-            # reason to wait for a better view, not to declare the area rock.
-            unverified = self._unverified_cells()
-            if unverified > 0 and not self.replanning:
-                area = unverified * self.coverage_resolution ** 2
-                self.get_logger().info(
-                    f'Nothing confirmed reachable yet - {area:.0f} m2 of the '
-                    f'area has not been seen by the lidar. Waiting for a '
-                    f'better view rather than writing the area off.')
-                return False             # retried on the next tick
+        # Nothing to sweep. That has two very different causes - the area
+        # really is all rock, or we have not looked at it yet - and only the
+        # first is a reason to give up.
+        #
+        # An earlier version waited here for a better view when there was
+        # unverified ground. That deadlocked: the view only improves if the
+        # drone moves, and it only moves if there is a plan, so it sat still
+        # for ever. If there is ground we have not judged, fall through to the
+        # go-and-look block below instead: flying to one vantage point IS the
+        # plan, and it is what produces the better view.
+        if not self.points and self._unverified_cells() == 0:
             if self.replanning:
                 self.get_logger().info(
                     'Replan found nothing left to fly: everything reachable '
@@ -1154,6 +1151,18 @@ class SearchNode(Node):
             return
         if self.busy: #goal is already in flight
             self._check_stalled()
+            return
+        # Carry out a replan that has been asked for. This has to live here,
+        # not only in the goal-result callback, because not every path through
+        # that callback runs: a goal Nav2 REJECTS clears busy and returns
+        # without ever producing a result, so a replan requested while it was
+        # in flight was never carried out. _review_map suppresses itself while
+        # one is pending, so it then never asked again either, and the drone
+        # sat parked at a vantage point for 213 s of sim time with nothing
+        # commanding it. Doing it from the tick makes the state self-healing
+        # whatever became of the goal.
+        if self._replan_wanted:
+            self._after_abandoned_goal()
             return
         # Plan on the first tick that has camera data, not in __init__.
         if not self.planned and not self.plan_sweep():
@@ -1298,6 +1307,7 @@ class SearchNode(Node):
             self.next_waypoint()
             return
         self._replan_wanted = False
+        self.timed_out = False       # leave no stale flag for the next goal
         # A map-driven replan is routine - the drone learned something and is
         # acting on it - so it does not spend one of the failure budget.
         if self._replan_is_map_driven:

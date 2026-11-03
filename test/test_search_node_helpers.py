@@ -8,6 +8,7 @@ costmap_raw.
 """
 
 import math
+from types import SimpleNamespace
 
 import pytest
 
@@ -973,17 +974,24 @@ class TestPlanSweep:
         for x, y in node.points:
             assert not node._is_blocked(x, y), f'waypoint ({x}, {y}) is in rock'
 
-    def test_unobserved_area_waits_rather_than_being_written_off(self, planning_node):
-        """On the pad the lidar has seen nothing useful. That must not be
-        reported as "your area is solid rock"."""
+    def test_unobserved_area_goes_to_look_instead_of_waiting(self, planning_node):
+        """On the pad the lidar has seen nothing useful, so nothing is
+        confirmed reachable and no leg can be planned.
+
+        That must not be reported as "your area is solid rock", and it must
+        not WAIT either. Waiting was a deadlock: the view only improves if the
+        drone moves, and it only moves if there is a plan - the drone sat
+        parked for 213 s of sim time with nothing commanding it. The answer is
+        to fly to one vantage point, which is what produces the better view.
+        """
         grid = make_costmap(60, 60, resolution=0.5, origin=(-5.0, -5.0), fill=-1)
-        for col in range(60):              # just a patch of observed ground
-            set_cell(grid, col, 0, 0)
+        fill_rect(grid, 0, 60, 0, 1, 0)    # just a strip of observed ground
         node = planning_node(self.box(), grid)
         node.at = (0.5, -4.75)
-        result = node.plan_sweep()
-        assert result is False             # retried next tick, not given up on
-        assert any('not been seen by the lidar' in m for m in node.logged)
+        assert node.plan_sweep() is True
+        assert node.points, 'no plan at all - the drone would sit still'
+        assert len(node.looked_from) == 1
+        assert node.points[-1] == node.looked_from[0]
         assert not any('NOT SEARCHABLE' in m for m in node.logged)
 
     def test_goes_to_look_when_part_cannot_be_judged(self, planning_node):
@@ -1248,3 +1256,99 @@ class TestUnknownTrackingGuard:
         for _ in range(5):
             node._check_unknown_tracking(grid)
         assert len(node.errors) == 1
+
+
+class TestPendingReplanAlwaysRuns:
+    """The freeze that parked the drone for 213 s of sim time.
+
+    A replan is asked for by setting _replan_wanted and cancelling the goal in
+    flight; the goal's result callback then carries it out. But not every path
+    through that callback runs - a goal Nav2 REJECTS clears busy and returns
+    without producing a result - so the replan was never carried out. And
+    _review_map suppresses itself while one is pending, so it never asked
+    again. Net effect: the drone sat at a vantage point, no active goal,
+    nothing commanding it, the node ticking away happily.
+
+    So the tick carries out a pending replan itself, whatever became of the
+    goal.
+    """
+
+    @pytest.fixture
+    def search(self, search_node):
+        SearchNode = search_node.SearchNode
+
+        class Fake:
+            tick = SearchNode.tick
+
+            def __init__(self):
+                self.pending_area = None
+                self.area_set = True
+                self.planned = True
+                self.holding = self.estopped = False
+                self.busy = False
+                self._replan_wanted = False
+                self.index = 0
+                self.points = [(1.0, 1.0)]
+                self.replanned = 0
+                self.stall_checks = 0
+                self.sent = []
+                self.nav_client = SimpleNamespace(server_is_ready=lambda: True)
+
+            def paused(self):
+                return self.holding or self.estopped
+
+            def get_logger(self):
+                return FakeLogger()
+
+            def send_goal(self, p):
+                self.sent.append(p)
+
+            def _check_stalled(self):
+                self.stall_checks += 1
+
+            def _after_abandoned_goal(self):
+                self.replanned += 1
+                self._replan_wanted = False
+
+        return Fake()
+
+    def test_tick_carries_out_a_pending_replan(self, search):
+        search._replan_wanted = True
+        search.tick()
+        assert search.replanned == 1
+        assert search.sent == []          # replans, does not fly the old plan
+
+    def test_and_then_gets_on_with_flying(self, search):
+        search._replan_wanted = True
+        search.tick()                     # does the replan
+        search.tick()                     # next tick flies again
+        assert search.replanned == 1
+        assert search.sent == [(1.0, 1.0)]
+
+    def test_a_goal_in_flight_is_left_alone(self, search):
+        """While a goal is still in flight the cancel route handles it; the
+        tick must not replan from under it."""
+        search.busy = True
+        search._replan_wanted = True
+        search.tick()
+        assert search.replanned == 0
+        assert search.stall_checks == 1
+
+    def test_nothing_pending_means_normal_flying(self, search):
+        search.tick()
+        assert search.replanned == 0
+        assert search.sent == [(1.0, 1.0)]
+
+    def test_estop_still_wins(self, search):
+        search.estopped = True
+        search._replan_wanted = True
+        search.tick()
+        assert search.replanned == 0
+        assert search.sent == []
+
+    def test_exhausted_plan_no_longer_wedges(self, search):
+        """The exact frozen state: plan flown out, a replan pending."""
+        search.index = len(search.points)
+        search._replan_wanted = True
+        search.tick()
+        assert search.replanned == 1
