@@ -287,7 +287,36 @@ class SearchNode(Node):
         # Measuring progress instead tells a slow leg apart from a stuck one.
         self.declare_parameter('goal_stall_timeout', 60.0)  # seconds, 0 disables
         # Getting this much closer counts as progress and resets the clock.
-        self.declare_parameter('goal_progress_threshold', 0.5)   # metres
+        # Deliberately not a token amount: a drone bouncing off a mountain face
+        # edges a little nearer now and then, and too small a threshold lets
+        # that count as progress forever. Even the slowest honest leg seen here
+        # (0.06 m/s) closes 3.6 m in the 60 s window, so 2 m is safe for real
+        # flying while ruling out a drone that is only jostling.
+        self.declare_parameter('goal_progress_threshold', 2.0)   # metres
+        # When a waypoint turns out to be unreachable, replan the rest of the
+        # sweep against the costmap as it now stands instead of just skipping
+        # it. By the time the drone has been stopped by the side of a mountain
+        # it has mapped far more of that mountain than it had when the sweep
+        # was first planned, so a second attempt can route around what the
+        # first one did not know was there.
+        self.declare_parameter('replan_on_obstacle', True)
+        # A cap, so a genuinely impossible area cannot replan forever.
+        self.declare_parameter('max_replans', 5)
+        # Hard backstop on one waypoint, as a multiple of how long the leg
+        # should take at this speed. Needed because the progress check above
+        # can be defeated by oscillation: a drone bouncing off a mountain face
+        # creeps a little closer now and then, which keeps resetting the
+        # progress clock while it gets nowhere.
+        self.declare_parameter('goal_time_factor', 4.0)
+        self.declare_parameter('assumed_speed', 0.3)        # m/s, measured
+        # Remember where a waypoint proved unreachable and keep later plans
+        # out of that pocket, or a replan picks the same spot and stalls again.
+        self.declare_parameter('nogo_radius', 6.0)          # metres
+        # How often to re-check that the waypoint being flown to is still
+        # reachable. The cheap "is it in an obstacle" test runs every tick;
+        # the flood fill is a search over the whole costmap, so it runs on
+        # this interval instead.
+        self.declare_parameter('goal_recheck_period', 3.0)  # seconds
         # Drop waypoints the drone cannot actually get to, worked out by
         # flooding outwards from its position across free costmap cells.
         self.declare_parameter('drop_unreachable', True)
@@ -332,8 +361,14 @@ class SearchNode(Node):
         self.points = []
         self.planned = False
         self.spacing = None
+        self.nogo = []              # (x, y) where a waypoint proved unreachable
+        self.replans = 0            # replans used on the current search area
+        self.replanning = False     # True while rebuilding after an obstacle
         self.goal_best_dist = None  # closest the drone has got to this goal
         self.goal_progress_at = None  # when it last got closer (seconds, node clock)
+        self.goal_sent_at = None    # when the current goal went out
+        self.last_recheck = 0.0     # when the goal was last re-validated
+        self.goal_leg_length = None  # how far it was when sent
         self.timed_out = False      # set when we abandon one as stuck
         self.home_index = None
 
@@ -571,10 +606,34 @@ class SearchNode(Node):
         self.index = 0
         self.home_index = None
         self.planned = False
+        self.replans = 0
+        self.replanning = False
+        self.nogo = []              # a new area starts with a clean slate
 
         self.get_logger().info(
             f'Operator set a new {len(self.polygon)}-sided search area; '
             f'replanning on the next tick.')
+
+    def _refresh_searchable(self):
+        """Recompute which cells are worth searching, keeping the coverage.
+
+        _rebuild_coverage_grid() would do this too, but it also clears the
+        coverage array - which on a replan would throw away the record of
+        everything already swept and send the drone round again.
+        """
+        before = self.cells_to_search
+        self.inside_mask = self._build_inside_mask()
+        self.cells_to_search = int(np.count_nonzero(self.inside_mask))
+        if self.cells_to_search != before:
+            dropped = before - self.cells_to_search
+            self.get_logger().info(
+                f'{dropped} cells that looked searchable turned out to be '
+                f'obstacles once mapped; the target is now '
+                f'{self.cells_to_search} cells.')
+        # Progress is measured against a smaller target now, so let the next
+        # percentage print rather than waiting for a further 5% of a number
+        # that just changed underneath it.
+        self.last_coverage_log = 0.0
 
     def _rebuild_coverage_grid(self):
         """Size and clear the coverage grid for the current polygon.
@@ -741,6 +800,32 @@ class SearchNode(Node):
             blocked = self._is_blocked
         else:
             blocked = None
+
+        # On a REPLAN, ground the camera has already swept counts as done, so
+        # the new sweep only covers what is left. Without this the drone would
+        # start the whole area again from one end every time it met an
+        # obstacle, re-flying everything it had already searched.
+        # Places that already proved unreachable. Without this a replan picks
+        # a waypoint in the same pocket, stalls again, and burns every replan.
+        if self.nogo:
+            r = float(self.get_parameter('nogo_radius').value)
+            nogo = list(self.nogo)
+            prev = blocked
+            if prev is None:
+                blocked = lambda x, y: any(math.hypot(x-nx, y-ny) <= r for nx, ny in nogo)
+            else:
+                blocked = lambda x, y: (prev(x, y)
+                                        or any(math.hypot(x-nx, y-ny) <= r for nx, ny in nogo))
+            self.get_logger().info(
+                f'Keeping clear of {len(nogo)} spot(s) that proved unreachable '
+                f'earlier ({r:.0f} m around each).')
+
+        if self.replanning:
+            geometric = blocked
+            if geometric is None:
+                blocked = self._already_searched
+            else:
+                blocked = lambda x, y: geometric(x, y) or self._already_searched(x, y)
         clearance = float(self.get_parameter('obstacle_clearance').value)
         min_leg = float(self.get_parameter('min_leg_length').value)
 
@@ -784,11 +869,19 @@ class SearchNode(Node):
         # Nothing left after cutting the obstacles out: the whole area is
         # rock. Say so plainly rather than flying a meaningless path.
         if not self.points:
-            self.get_logger().error(
-                'SEARCH AREA NOT SEARCHABLE: every part of it is either inside '
-                'an obstacle or walled off with no way in, so there is nothing '
-                'to fly. Draw an area that includes reachable open ground.')
+            if self.replanning:
+                self.get_logger().info(
+                    'Replan found nothing left to fly: everything reachable '
+                    'has already been searched. Sweep complete.')
+                self.sweep_complete_pub.publish(Empty())
+            else:
+                self.get_logger().error(
+                    'SEARCH AREA NOT SEARCHABLE: every part of it is either '
+                    'inside an obstacle or walled off with no way in, so there '
+                    'is nothing to fly. Draw an area that includes reachable '
+                    'open ground.')
             self.planned = True          # stop retrying every tick
+            self.replanning = False
             return True
 
         # (0, 0) in the odom frame is the spawn point (see map_frame comment
@@ -802,6 +895,7 @@ class SearchNode(Node):
             self.home_index = len(self.points) - 1
 
         self.planned = True
+        self.replanning = False
         self._publish_path()
 
         sweep_deg = math.degrees(best_sweep_angle(self.polygon))
@@ -815,6 +909,17 @@ class SearchNode(Node):
             f'Leg spacing {self.spacing:.1f} m ({source}): '
             f'{len(self.points) // 2} legs, {len(self.points)} waypoints.'
         )
+        # Say plainly how much of the drawn area is out of reach, so a full
+        # sweep of what is left is not mistaken for a full sweep of the box.
+        in_shape = getattr(self, 'cells_in_shape', 0)
+        if avoiding and in_shape:
+            flyable = 100.0 * self.cells_to_search / in_shape
+            if flyable < 99.0:
+                self.get_logger().warn(
+                    f'{100 - flyable:.0f}% of the area you drew cannot be '
+                    f'searched - it is inside an obstacle or walled off with '
+                    f'no way in. Searching the remaining {flyable:.0f}%.')
+
         if avoiding:
             extra = (' Ground with no way in to it was dropped too.'
                      if reached is not None else '')
@@ -871,14 +976,37 @@ class SearchNode(Node):
         the honest test - it falls steadily on a slow leg and flattens out on
         a stuck one.
         """
-        limit = float(self.get_parameter('goal_stall_timeout').value)
-        if limit <= 0 or self.paused() or self.index >= len(self.points):
+        # paused() covers a contact hold AND the operator E-Stop.
+        if self.paused() or self.index >= len(self.points):
             return
         here = self._lookup_robot_xy()
         if here is None:
             return
 
         gx, gy = self.points[self.index]
+
+        # Read the map rather than infer from behaviour. By the time the drone
+        # is hovering at a mountain face, the lidar has already put that face
+        # in the costmap - so the node can simply ask whether the waypoint it
+        # is flying to is still somewhere it can get to, instead of waiting a
+        # minute to work it out from the fact that it is not getting there.
+        if self._goal_now_impossible(gx, gy):
+            self.get_logger().warn(
+                f'Waypoint {self.index + 1}/{len(self.points)} is no longer '
+                f'reachable - the lidar has since mapped an obstacle there. '
+                f'Abandoning it now rather than flying at it.')
+            self.nogo.append((gx, gy))
+            self.timed_out = True
+            self._replan_wanted = self._should_replan()
+            if self.goal_handle is not None:
+                self.goal_handle.cancel_goal_async()
+            else:
+                self._after_abandoned_goal()
+            return
+
+        limit = float(self.get_parameter('goal_stall_timeout').value)
+        if limit <= 0:
+            return
         dist = math.hypot(gx - here[0], gy - here[1])
         step = float(self.get_parameter('goal_progress_threshold').value)
 
@@ -887,17 +1015,105 @@ class SearchNode(Node):
             self.goal_progress_at = self._now()
             return
 
-        if self._now() - self.goal_progress_at > limit:
-            self.get_logger().warn(
-                f'Waypoint {self.index + 1}/{len(self.points)} has not got any '
-                f'closer for {limit:.0f} s (still {dist:.1f} m away) - giving up '
-                f'on it. It is probably unreachable, inside or behind an '
-                f'obstacle.')
+        stalled = self._now() - self.goal_progress_at > limit
+
+        # Backstop. A drone bouncing off a mountain face creeps a little closer
+        # every so often, which resets the progress clock above and lets it
+        # oscillate there indefinitely. Cap the whole leg at a generous
+        # multiple of how long it should take at this speed.
+        overrun = False
+        if self.goal_sent_at is not None and self.goal_leg_length:
+            speed = max(0.05, float(self.get_parameter('assumed_speed').value))
+            budget = (self.goal_leg_length / speed
+                      * float(self.get_parameter('goal_time_factor').value))
+            overrun = self._now() - self.goal_sent_at > budget
+            if overrun and not stalled:
+                self.get_logger().warn(
+                    f'Waypoint {self.index + 1}/{len(self.points)} has taken '
+                    f'{self._now() - self.goal_sent_at:.0f} s for a {self.goal_leg_length:.0f} m '
+                    f'leg (budget {budget:.0f} s) and is still {dist:.1f} m away - '
+                    f'it is going back and forth rather than getting there.')
+
+        if stalled or overrun:
+            if stalled:
+                self.get_logger().warn(
+                    f'Waypoint {self.index + 1}/{len(self.points)} has not got any '
+                    f'closer for {limit:.0f} s (still {dist:.1f} m away) - giving up '
+                    f'on it. It is probably unreachable, inside or behind an '
+                    f'obstacle.')
+            # Remember this pocket so later plans do not aim into it again.
+            self.nogo.append((gx, gy))
             self.timed_out = True
+            self._replan_wanted = self._should_replan()
             if self.goal_handle is not None:
                 self.goal_handle.cancel_goal_async()
             else:
-                self.next_waypoint()
+                self._after_abandoned_goal()
+
+    def _goal_now_impossible(self, gx, gy):
+        """Has the map turned the current waypoint into somewhere unreachable?
+
+        Two tests, at different costs:
+
+        - is the waypoint inside a mapped obstacle? One array lookup, so it
+          runs every tick. This is the mountain case: as the drone closes in,
+          the lidar fills in the rock the waypoint sits in and this fires
+          within a tick or two.
+        - is it walled off with no way in? That needs a flood fill over the
+          whole costmap, so it runs every goal_recheck_period instead.
+        """
+        if not self.get_parameter('avoid_obstacles').value or self.costmap is None:
+            return False
+
+        if self._is_blocked(gx, gy):
+            return True
+
+        if not self.get_parameter('drop_unreachable').value:
+            return False
+        period = float(self.get_parameter('goal_recheck_period').value)
+        if period <= 0 or self._now() - self.last_recheck < period:
+            return False
+        self.last_recheck = self._now()
+        here = self._lookup_robot_xy()
+        if here is None:
+            return False
+        reached = self._reachable_from(here)
+        return reached is not None and not self._is_reachable(gx, gy, reached)
+
+    def _should_replan(self):
+        """Is a replan worth doing after giving up on a waypoint?"""
+        if not self.get_parameter('replan_on_obstacle').value:
+            return False
+        if self.replans >= int(self.get_parameter('max_replans').value):
+            self.get_logger().warn(
+                f'Already replanned {self.replans} times for this area - '
+                f'skipping the rest instead of replanning again.')
+            return False
+        return self.costmap is not None
+
+    def _after_abandoned_goal(self):
+        """Either replan around what we now know, or just skip the waypoint."""
+        if not getattr(self, '_replan_wanted', False):
+            self.next_waypoint()
+            return
+        self._replan_wanted = False
+        self.replans += 1
+        self.get_logger().warn(
+            f'Replanning the rest of the search (attempt {self.replans}) '
+            f'against the obstacles mapped so far. Ground already searched '
+            f'is kept, so only what is left gets flown.')
+        # Keep WHAT HAS BEEN SEARCHED, but refresh WHAT IS WORTH SEARCHING.
+        # The mask of searchable cells was built when the operator drew the
+        # area, when the mountain had not been mapped - so its cells counted
+        # as "still to do". They are rock the camera can never see, so without
+        # this the percentage would stall short of 100% forever and there
+        # would be no way to tell a mountain from a genuine gap.
+        self._refresh_searchable()
+        self.replanning = True
+        self.planned = False
+        self.index = 0
+        self.home_index = None
+        self.busy = False
 
     def send_goal (self, point):
         """Send one waypoint to Nav2."""
@@ -920,6 +1136,11 @@ class SearchNode(Node):
         # Progress tracking, not a stopwatch on the whole leg.
         self.goal_best_dist = None
         self.goal_progress_at = self._now()
+        self.goal_sent_at = self._now()
+        self.last_recheck = self._now()
+        here = self._lookup_robot_xy()
+        self.goal_leg_length = (math.hypot(x - here[0], y - here[1])
+                                if here is not None else None)
         self.timed_out = False
         self.get_logger().info (
             f'Waypoint {self.index +1}/{len(self.points)}: flying to ({x:.1f}, {y:.1f})'
@@ -967,10 +1188,11 @@ class SearchNode(Node):
         self.goal_handle = None
         status = future.result().status
         if self.timed_out:
-            # Cancelled by us for taking too long: skip it rather than re-fly.
+            # We abandoned this one as unreachable. Either replan the rest of
+            # the sweep against what the costmap now shows, or just skip it.
             self.timed_out = False
             self.busy = False
-            self.next_waypoint()
+            self._after_abandoned_goal()
             return
         if self.paused() or status == GoalStatus.STATUS_CANCELED:
             # Cancelled by a hold or E-Stop, or by the operator redrawing the
@@ -1175,15 +1397,22 @@ class SearchNode(Node):
         avoiding = (bool(self.get_parameter('avoid_obstacles').value)
                     and self.costmap is not None)
         mask = np.zeros((self.cov_rows, self.cov_cols), dtype=bool)
+        # Cells inside the shape the operator drew, obstacles included. Kept so
+        # the operator can be told how much of what they drew is actually
+        # flyable - "100% of the searchable area" reads like the whole box was
+        # done, when a third of it may have been rock.
+        in_shape = 0
         for row in range(self.cov_rows):
             cell_y = self.cov_origin_y + (row + 0.5) * self.coverage_resolution
             for col in range(self.cov_cols):
                 cell_x = self.cov_origin_x + (col + 0.5) * self.coverage_resolution
                 if not self.point_in_polygon(cell_x, cell_y, self.polygon):
                     continue
+                in_shape += 1
                 if avoiding and self._is_blocked(cell_x, cell_y):
                     continue
                 mask[row, col] = True
+        self.cells_in_shape = in_shape
         return mask
 
     def _resolve_polygon(self):
@@ -1426,6 +1655,19 @@ class SearchNode(Node):
                     self.coverage[row, col] = 100
 
         self._publish_coverage()
+
+    def _already_searched(self, x, y):
+        """True if the camera has already covered this point.
+
+        Used only when replanning. The coverage grid is deliberately NOT reset
+        on a replan, so this is the record of everything swept before the
+        obstacle stopped us.
+        """
+        col = int((x - self.cov_origin_x) / self.coverage_resolution)
+        row = int((y - self.cov_origin_y) / self.coverage_resolution)
+        if not (0 <= col < self.cov_cols and 0 <= row < self.cov_rows):
+            return False
+        return bool(self.coverage[row, col] > 0)
 
     def _publish_path(self):
         """Publish the planned sweep so the ground station can draw it.
