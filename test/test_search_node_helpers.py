@@ -1740,3 +1740,66 @@ class TestReturnsHome:
         node.coverage[:, :] = 100
         text = node._coverage_summary()
         assert 'not checked' in text, text
+
+
+class TestLookingDoesNotDeadEnd:
+    """Measured in flight: the drone reached its vantage point, 0.7 m from the
+    target, and stopped there for good - status stuck on LOOKING, no goal,
+    nothing commanding it.
+
+    _maybe_return_home declined to go home because there was still somewhere
+    worth looking, which was right, but then did nothing. The plan was already
+    flown out, so nothing moved the drone again. The map review only replans
+    when reachability CHANGES, and a look that resolved nothing changes
+    nothing, so it never fired either.
+    """
+
+    def box(self):
+        return [(0.0, 0.0), (20.0, 0.0), (20.0, 20.0), (0.0, 20.0)]
+
+    def arrived_at_a_vantage(self, planning_node):
+        grid = make_costmap(60, 60, resolution=0.5, origin=(-5.0, -5.0))
+        fill_rect(grid, 0, 60, 30, 60, -1)      # top half never observed
+        node = planning_node(self.box(), grid)
+        node.plan_sweep()
+        assert node.vantage_index is not None, 'test needs a vantage point'
+        node.coverage[:, :] = 100               # the legs have been flown
+        node.index = len(node.points)           # and the plan is flown out
+        node.at = node.points[node.vantage_index]   # parked at the vantage
+        return node
+
+    def test_plans_the_next_pass_instead_of_stopping(self, planning_node):
+        node = self.arrived_at_a_vantage(planning_node)
+        node._maybe_return_home()
+        assert not node.returning, 'went home with ground left to look at'
+        assert not node.planned, 'nothing will plan again - the drone is stuck'
+        assert node.index == 0
+        assert node.replanning
+
+    def test_and_the_next_pass_is_flyable(self, planning_node):
+        node = self.arrived_at_a_vantage(planning_node)
+        node._maybe_return_home()
+        assert node.plan_sweep() is True
+        assert node.points, 'the next pass had nothing to fly'
+
+    def test_it_still_goes_home_once_there_is_nothing_to_look_at(
+            self, planning_node):
+        grid = make_costmap(60, 60, resolution=0.5, origin=(-5.0, -5.0))
+        node = planning_node(self.box(), grid)
+        node.plan_sweep()
+        node.coverage[:, :] = 100
+        node.at = (18.0, 18.0)
+        node.index = len(node.points)
+        node._maybe_return_home()
+        assert node.returning
+        assert node.points == [(0.0, 0.0)]
+
+
+    def test_a_vantage_near_base_does_not_end_the_search(self, planning_node):
+        """The "already home" check must not pre-empt the "still somewhere to
+        look" one, or a pass ending near base stops with ground unresolved."""
+        node = self.arrived_at_a_vantage(planning_node)
+        node.at = (0.5, 0.5)                    # happens to be near base
+        node._maybe_return_home()
+        assert not node.returning
+        assert not node.planned                 # a new pass is queued instead

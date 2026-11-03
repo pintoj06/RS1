@@ -1278,18 +1278,38 @@ class SearchNode(Node):
             if self.status_state not in (ST_COMPLETE, ST_RETURNING):
                 self._set_status(ST_COMPLETE, self._coverage_summary())
             return
+        # Somewhere left to look is checked FIRST, before whether the drone
+        # happens to be near base. The other way round, a pass that ended on a
+        # vantage point close to home declared the search COMPLETE and stopped
+        # with ground still unresolved.
+        # Still somewhere worth looking? Then plan the NEXT pass rather than
+        # going home - flying home now would abandon ground that is about to
+        # become reachable.
+        #
+        # It has to plan, not just decline to go home. The plan is already
+        # flown out, so returning without acting leaves nothing to move the
+        # drone: measured in flight, parked 0.7 m from its vantage point,
+        # status stuck on LOOKING, no goal, nothing commanding it. The map
+        # review only replans when reachability CHANGES, and a look that
+        # resolved nothing changes nothing - so it never fired.
+        if (self.get_parameter('avoid_obstacles').value
+                and self.get_parameter('drop_unreachable').value
+                and self._frontier_goal() is not None):
+            self._refresh_searchable()
+            self.replanning = True       # keeps ground already searched out
+            self.planned = False
+            self.index = 0
+            self.home_index = None
+            self.vantage_index = None
+            self.busy = False
+            return
+
         here = self._lookup_robot_xy()
         if here is not None and math.hypot(here[0], here[1]) <= 2.0:
             self._set_status(ST_COMPLETE, self._coverage_summary())
             self.returning = True        # home already; nothing to fly
             return
-        # Only once there is nothing left to go and look at. Otherwise the map
-        # review is still expected to reopen the search, and flying home now
-        # would abandon ground that is about to become reachable.
-        if (self.get_parameter('avoid_obstacles').value
-                and self.get_parameter('drop_unreachable').value
-                and self._frontier_goal() is not None):
-            return
+
         self.returning = True
         self.points = [(0.0, 0.0)]
         self.index = 0
