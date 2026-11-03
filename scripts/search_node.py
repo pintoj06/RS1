@@ -4,7 +4,6 @@
 "Fly a lawnmower search patter over a rectangle, using NAV2"
 
 import math
-import time
 
 import numpy as np
 # Connected-component labelling, used by the reachability checks below. Those
@@ -464,6 +463,12 @@ class SearchNode(Node):
         self.last_recheck = 0.0     # when the goal was last re-validated
         self.goal_leg_length = None  # how far it was when sent
         self.timed_out = False      # set when we abandon one as stuck
+        # Set when a replan has been asked for and we are waiting on the
+        # current goal to cancel. Initialised here, not left to a getattr
+        # default: _review_map reads it every couple of seconds to avoid
+        # asking for the same replan twice, and an attribute that only came
+        # into existence on the first abandoned waypoint crashed the node.
+        self._replan_wanted = False
         self.home_index = None
 
         self.index = 0
@@ -844,12 +849,25 @@ class SearchNode(Node):
             inside ^= (((y1 > gy) != (y2 > gy))
                        & (gx < x1 + (gy - y1) / (y2 - y1) * (x2 - x1)))
 
-        # Drop blocked cells: the camera can never see through rock, so
-        # counting it would make a fully successful plan score below 100%.
+        # Drop what this sweep was never going to cover, so the check marks
+        # the plan against its own job rather than against the whole shape.
+        #
+        # Blocked cells, because the camera cannot see through rock. And
+        # ground not CONFIRMED reachable, because legs are only planned over
+        # ground the drone can prove a way to - counting the rest made a
+        # perfectly sound plan score badly and sent the retry loop below
+        # tightening the spacing for nothing: measured going 10.67 m -> 4.0 m,
+        # 2.7x as many legs, while the uncovered part was rock either way.
         if bool(self.get_parameter('avoid_obstacles').value) and self.costmap is not None:
+            confirmed = self.confirmed
             for r in range(rows):
                 for c in range(cols):
-                    if inside[r, c] and self._is_blocked(gx[r, c], gy[r, c]):
+                    if not inside[r, c]:
+                        continue
+                    x, y = gx[r, c], gy[r, c]
+                    if self._is_blocked(x, y) or (
+                            confirmed is not None
+                            and not self._is_reachable(x, y, confirmed)):
                         inside[r, c] = False
 
         total = int(inside.sum())
@@ -1105,8 +1123,8 @@ class SearchNode(Node):
                     f'no way in. Searching the remaining {flyable:.0f}%.')
 
         if avoiding:
-            extra = (' Ground with no way in to it was dropped too.'
-                     if reached is not None else '')
+            extra = (' Ground the drone cannot confirm a way to was left out '
+                     'of this pass.' if self.confirmed is not None else '')
             self.get_logger().info(
                 'Obstacles from the costmap were cut out of the sweep; legs '
                 f'stop {clearance:.1f} m clear of them and Nav2 flies around '
@@ -1274,7 +1292,7 @@ class SearchNode(Node):
 
     def _after_abandoned_goal(self):
         """Either replan around what we now know, or just skip the waypoint."""
-        if not getattr(self, '_replan_wanted', False):
+        if not self._replan_wanted:
             self.next_waypoint()
             return
         self._replan_wanted = False
@@ -2079,6 +2097,13 @@ class SearchNode(Node):
         """
         if not self.area_set or not self.planned or self.replanning:
             return
+        # A replan already asked for, waiting on a goal to cancel. Without
+        # this the review fires again on the next period, reports the very
+        # same change, and spends another of the replan budget doing it -
+        # observed running 2/20, 3/20, 4/20 on a map that had not altered at
+        # all, because self.replanning is not set until the cancel lands.
+        if self._replan_wanted:
+            return
         if self.paused():
             return
         if float(self.get_parameter('map_review_period').value) <= 0:
@@ -2119,6 +2144,10 @@ class SearchNode(Node):
             return
 
         self.map_replans += 1
+        # Take the new figure as the baseline NOW, not when the replan
+        # eventually runs: the replan may be several seconds away and the
+        # review must not keep reporting a change it has already acted on.
+        self.plan_reachable_cells = reachable
         area = abs(change) * self.coverage_resolution ** 2
         opened = 'opened up' if change > 0 else 'turned out to be blocked'
         self.get_logger().info(

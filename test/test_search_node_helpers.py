@@ -11,7 +11,8 @@ import math
 
 import pytest
 
-from conftest import FakeLogger, FakeParams, make_costmap, set_cell
+from conftest import (FakeLogger, FakeParams, fill_rect, make_costmap,
+                      set_cell)
 
 LETHAL = 100
 INSCRIBED = 99
@@ -790,3 +791,401 @@ class TestGapFill:
         fake_search.get_parameter.values['observation_gap_fill'] = 2.0
         filled = fake_search._confirmed_from((0.1, 0.075))
         assert not filled[1, 10]
+
+
+class TestNoUndefinedNames:
+    """Catch the class of bug that killed the scout mid-flight.
+
+    plan_sweep referred to a local called `reached` that an earlier edit had
+    renamed to self.confirmed. Nothing here called plan_sweep, and a NameError
+    is a RUNTIME error, so both the unit tests and a syntax check passed - and
+    the node died the first time an operator drew a search area. A static
+    check over the whole file costs nothing and would have caught it.
+    """
+
+    def source_files(self):
+        from pathlib import Path
+        root = Path(__file__).resolve().parent.parent
+        return ([p for p in (root / 'scripts').glob('*.py')]
+                + [p for p in (root / 'UI').glob('*.py')])
+
+    def test_no_undefined_names(self):
+        api = pytest.importorskip('pyflakes.api')
+        from pyflakes import reporter as pyflakes_reporter
+        import io
+
+        problems = []
+        for path in self.source_files():
+            out, err = io.StringIO(), io.StringIO()
+            api.checkPath(str(path), pyflakes_reporter.Reporter(out, err))
+            for line in (out.getvalue() + err.getvalue()).splitlines():
+                # Unused imports are untidy, not dangerous. Undefined names
+                # are the ones that take a node down in flight.
+                if 'undefined name' in line or 'syntax' in line.lower():
+                    problems.append(line)
+        assert not problems, 'undefined names:\n' + '\n'.join(problems)
+
+
+@pytest.fixture
+def planning_node(search_node):
+    """A SearchNode complete enough to run plan_sweep end to end.
+
+    Worth the setup: plan_sweep is where the sweep, the two floods, the
+    frontier trip and the coverage mask all meet, and it was the one function
+    with no test at all when it crashed the scout.
+    """
+    import numpy as np
+    SearchNode = search_node.SearchNode
+
+    class PlanningNode:
+        for _name in ('_is_blocked', '_costmap_grid', '_flood', '_reachable_from',
+                      '_confirmed_from', '_is_reachable', '_project',
+                      '_polygon_mask_costmap', '_line_of_sight', '_frontier_goal',
+                      '_unverified_cells', '_write_off_unverified',
+                      '_build_inside_mask', '_refresh_searchable',
+                      '_predicted_coverage', '_already_searched',
+                      '_camera_fov', '_camera_altitude', '_footprint_radius',
+                      'plan_sweep', '_review_map'):
+            locals()[_name] = getattr(SearchNode, _name)
+        del _name
+        # Still a staticmethod here, or self would be passed as its first
+        # argument and every cell would test as outside the polygon.
+        point_in_polygon = staticmethod(SearchNode.point_in_polygon)
+
+        def __init__(self, polygon, costmap):
+            self.polygon = polygon
+            self.costmap = costmap
+            self.cam_fx = self.cam_fy = 360.0
+            self.cam_width, self.cam_height = 720, 480
+            self.confirmed = self.possible = None
+            self.unverifiable = None
+            self.looked_from = []
+            self.unverified_at_vantage = None
+            self.fruitless_vantages = 0
+            self.plan_reachable_cells = None
+            self.map_replans = 0
+            self.replanning = False
+            self.planned = False
+            self.replans = 0
+            self.points = []
+            self.home_index = None
+            self.spacing = 0.0
+            self.at = (0.5, 0.5)
+            self.logged = []
+            self.completed = 0
+            # Coverage grid over the polygon plus a small pad, 0.5 m cells.
+            xs = [p[0] for p in polygon]; ys = [p[1] for p in polygon]
+            self.coverage_resolution = 0.5
+            self.cov_origin_x = min(xs) - 2.0
+            self.cov_origin_y = min(ys) - 2.0
+            self.cov_cols = int((max(xs) + 2.0 - self.cov_origin_x) / 0.5) + 1
+            self.cov_rows = int((max(ys) + 2.0 - self.cov_origin_y) / 0.5) + 1
+            self.coverage = np.zeros((self.cov_rows, self.cov_cols), dtype=np.int8)
+            self.cells_in_shape = 0
+            self.get_parameter = FakeParams(
+                obstacle_cost_threshold=INSCRIBED,
+                avoid_obstacles=True,
+                drop_unreachable=True,
+                observation_gap_fill=0.0,
+                sensor_range=40.0,
+                vantage_min_separation=3.0,
+                vantage_patience=5,
+                vantage_progress_fraction=0.02,
+                spacing=0.0,
+                overlap=0.8,
+                obstacle_clearance=1.0,
+                min_leg_length=1.5,
+                return_to_spawn=True,
+                flight_altitude=10.0,
+                fallback_camera_hfov=1.0472,
+                fallback_image_width=720,
+                fallback_image_height=480,
+            )
+            self.inside_mask = self._build_inside_mask()
+            self.cells_to_search = int(np.count_nonzero(self.inside_mask))
+
+        def _lookup_robot_xy(self):
+            return self.at
+
+        def get_logger(self):
+            node = self
+
+            class L:
+                def __getattr__(self, level):
+                    def log(msg):
+                        node.logged.append(msg)
+                    return log
+            return L()
+
+        class _Pub:
+            def __init__(self, node):
+                self.node = node
+
+            def publish(self, _msg):
+                self.node.completed += 1
+
+        @property
+        def sweep_complete_pub(self):
+            return self._Pub(self)
+
+        def _publish_path(self):
+            pass
+
+    return PlanningNode
+
+
+class TestPlanSweep:
+    """The integration the crash exposed as untested."""
+
+    def box(self):
+        return [(0.0, 0.0), (20.0, 0.0), (20.0, 20.0), (0.0, 20.0)]
+
+    def test_plans_a_sweep_over_open_ground(self, planning_node):
+        """The exact path that crashed: operator draws an area, node plans."""
+        grid = make_costmap(60, 60, resolution=0.5, origin=(-5.0, -5.0))
+        node = planning_node(self.box(), grid)
+        assert node.plan_sweep() is True
+        assert node.planned
+        assert len(node.points) > 2
+        # Return-to-spawn tacked on the end, and no go-and-look trip needed
+        # because everything in the area is observed and clear.
+        assert node.points[-1] == (0.0, 0.0)
+        assert node.home_index == len(node.points) - 1
+        assert node.looked_from == []
+        assert node.plan_reachable_cells > 0
+
+    def test_waits_for_the_camera(self, planning_node):
+        node = planning_node(self.box(), make_costmap(60, 60, resolution=0.5))
+        node.cam_fx = None
+        assert node.plan_sweep() is False
+
+    def test_waits_for_the_costmap(self, planning_node):
+        node = planning_node(self.box(), None)
+        assert node.plan_sweep() is False
+        assert any('costmap' in m for m in node.logged)
+
+    def test_no_waypoint_lands_in_an_obstacle(self, planning_node):
+        """A rock across the middle of the area, mapped."""
+        grid = make_costmap(60, 60, resolution=0.5, origin=(-5.0, -5.0))
+        fill_rect(grid, 20, 36, 20, 30, LETHAL)
+        node = planning_node(self.box(), grid)
+        assert node.plan_sweep() is True
+        for x, y in node.points:
+            assert not node._is_blocked(x, y), f'waypoint ({x}, {y}) is in rock'
+
+    def test_unobserved_area_waits_rather_than_being_written_off(self, planning_node):
+        """On the pad the lidar has seen nothing useful. That must not be
+        reported as "your area is solid rock"."""
+        grid = make_costmap(60, 60, resolution=0.5, origin=(-5.0, -5.0), fill=-1)
+        for col in range(60):              # just a patch of observed ground
+            set_cell(grid, col, 0, 0)
+        node = planning_node(self.box(), grid)
+        node.at = (0.5, -4.75)
+        result = node.plan_sweep()
+        assert result is False             # retried next tick, not given up on
+        assert any('not been seen by the lidar' in m for m in node.logged)
+        assert not any('NOT SEARCHABLE' in m for m in node.logged)
+
+    def test_goes_to_look_when_part_cannot_be_judged(self, planning_node):
+        """Bottom half observed, top half never seen: plan the confirmed half
+        and end at a vantage point rather than going home none the wiser."""
+        grid = make_costmap(60, 60, resolution=0.5, origin=(-5.0, -5.0))
+        fill_rect(grid, 0, 60, 30, 60, -1)
+        node = planning_node(self.box(), grid)
+        assert node.plan_sweep() is True
+        assert len(node.looked_from) == 1
+        assert node.points[-1] == node.looked_from[0]
+        assert node.home_index is None     # not home yet, still work to do
+        assert any('to get a view of it' in m for m in node.logged)
+
+    def test_area_entirely_inside_rock_is_reported(self, planning_node):
+        grid = make_costmap(60, 60, resolution=0.5, origin=(-5.0, -5.0),
+                            fill=LETHAL)
+        fill_rect(grid, 0, 4, 0, 4, 0)     # a scrap of clear ground to sit on
+        node = planning_node(self.box(), grid)
+        node.at = (-4.0, -4.0)
+        assert node.plan_sweep() is True
+        assert node.points == []
+        assert any('NOT SEARCHABLE' in m for m in node.logged)
+
+    def test_replan_keeps_searched_ground_out(self, planning_node):
+        import numpy as np
+        grid = make_costmap(60, 60, resolution=0.5, origin=(-5.0, -5.0))
+        node = planning_node(self.box(), grid)
+        node.plan_sweep()
+        # Mark the bottom half as already swept, then replan.
+        node.coverage[:node.cov_rows // 2, :] = 100
+        node.replanning = True
+        node.planned = False
+        node.points = []
+        assert node.plan_sweep() is True
+        assert node.points
+        # The point is WHERE it replans, not how many waypoints it uses: every
+        # sweep waypoint must be on ground the camera has not already covered.
+        swept_y = node.cov_origin_y + (node.cov_rows // 2) * node.coverage_resolution
+        for x, y in node.points[:-1]:
+            assert not node._already_searched(x, y), f'({x}, {y}) already done'
+            assert y >= swept_y, f'({x}, {y}) is back in the searched half'
+        assert node.points[-1] == (0.0, 0.0)
+
+
+class TestReviewDoesNotRetrigger:
+    """A replan is asked for by cancelling the goal in flight, and
+    self.replanning is not set until that cancel lands - which can be several
+    seconds. The review must not keep firing in the meantime: in a live run it
+    reported the identical "276 m2 has opened up" every few seconds and spent
+    map replan 2/20, 3/20, 4/20 on a map that had not changed at all.
+    """
+
+    def opening_up(self, fake_review):
+        grid = make_costmap(10, 10, resolution=1.0, fill=-1)
+        for col in range(10):
+            set_cell(grid, col, 0, 0)
+        fake_review.costmap = grid
+        fake_review._review_map()                 # baseline
+        for col in range(10):
+            for row in range(10):
+                set_cell(grid, col, row, 0)
+        fake_review.costmap = grid
+        return grid
+
+    def test_one_replan_per_change(self, fake_review):
+        class Handle:
+            cancels = 0
+
+            def cancel_goal_async(self):
+                Handle.cancels += 1
+
+        self.opening_up(fake_review)
+        fake_review.goal_handle = Handle()
+        for _ in range(5):                        # five review ticks
+            fake_review._review_map()
+        assert fake_review.map_replans == 1
+        assert Handle.cancels == 1
+
+    def test_baseline_moves_on_immediately(self, fake_review):
+        """Even with no goal to cancel, the figure acted on must be recorded
+        at once, or the next tick reports the same change again."""
+        self.opening_up(fake_review)
+        fake_review._review_map()
+        assert fake_review.replanned
+        assert fake_review.plan_reachable_cells == 100
+        fake_review.replanned = False
+        fake_review._replan_wanted = False        # as plan_sweep would leave it
+        fake_review._review_map()
+        assert not fake_review.replanned
+
+    def test_a_later_real_change_still_replans(self, fake_review):
+        """The guard must not wedge it shut for good."""
+        self.opening_up(fake_review)
+        fake_review._review_map()
+        assert fake_review.map_replans == 1
+        fake_review._replan_wanted = False        # the replan has now run
+        grid = fake_review.costmap
+        for col in range(10):                     # half of it turns to rock
+            for row in range(5, 10):
+                set_cell(grid, col, row, LETHAL)
+        fake_review.costmap = grid
+        fake_review._review_map()
+        assert fake_review.map_replans == 2
+
+
+class TestPredictedCoverageIgnoresUnreachable:
+    """The self-check marks the plan against its own job.
+
+    Legs are only planned over confirmed ground, so counting ground the drone
+    cannot confirm a way to made a sound plan score badly and sent the spacing
+    retry loop tightening for nothing - 10.67 m down to 4.0 m, 2.7x the legs,
+    with the uncovered part being rock either way.
+    """
+
+    def test_unconfirmed_ground_is_not_counted_against_the_plan(self, planning_node):
+        grid = make_costmap(60, 60, resolution=0.5, origin=(-5.0, -5.0))
+        fill_rect(grid, 0, 60, 30, 60, -1)        # top half never observed
+        node = planning_node([(0.0, 0.0), (20.0, 0.0), (20.0, 20.0), (0.0, 20.0)],
+                             grid)
+        node.plan_sweep()
+        assert not any('tightening' in m for m in node.logged), \
+            'spacing was tightened over ground the sweep never meant to cover'
+        assert not any('will NOT be searched' in m for m in node.logged)
+
+    def test_still_tightens_for_a_genuine_gap(self, planning_node):
+        """It must keep working for what it was written for: a shape whose arm
+        is reached by a single sweep row and is taller than the footprint."""
+        grid = make_costmap(120, 120, resolution=0.5, origin=(-5.0, -5.0))
+        cross = [(18.0, 0.0), (26.0, 0.0), (26.0, 18.0), (44.0, 18.0),
+                 (44.0, 26.0), (26.0, 26.0), (26.0, 44.0), (18.0, 44.0),
+                 (18.0, 26.0), (0.0, 26.0), (0.0, 18.0), (18.0, 18.0)]
+        node = planning_node(cross, grid)
+        node.get_parameter.values['spacing'] = 0.0
+        node.plan_sweep()
+        covered = node._predicted_coverage(node.points, node._footprint_radius())
+        assert covered >= 0.999, f'cross shape only {100*covered:.1f}% covered'
+
+
+class TestRealNode:
+    """Drive the REAL SearchNode, not a stand-in.
+
+    Both crashes that reached the operator got through because every test used
+    a fake self. plan_sweep referred to a local that had been renamed
+    (NameError), and _review_map read an attribute that only came into
+    existence on the first abandoned waypoint (AttributeError) - and the fakes
+    happened to define it. A real object, with the real __init__, is the only
+    thing that catches that class of bug.
+    """
+
+    @pytest.fixture
+    def node(self, search_node):
+        rclpy = pytest.importorskip('rclpy')
+        if not rclpy.ok():
+            rclpy.init()
+        n = search_node.SearchNode()
+        yield n
+        n.destroy_node()
+
+    def test_constructs_and_the_timers_are_safe_to_call(self, node):
+        """Every periodic callback must survive being called with no sim
+        running - that is the state the node starts in."""
+        node.tick()
+        node._review_map()
+        node.record_trail()
+        node.update_coverage()
+        node.publish_search_area()
+        node._log_footprint()
+
+    def test_plans_for_real_from_a_drawn_area(self, node, search_node):
+        """The exact sequence that killed the scout: camera info, a costmap,
+        an operator drawing an area, then the node planning."""
+        import numpy as np
+        node.cam_fx = node.cam_fy = 360.0
+        node.cam_width, node.cam_height = 720, 480
+        node.polygon = [(0.0, 2.0), (16.0, 2.0), (16.0, 18.0), (0.0, 18.0)]
+        node.area_set = True
+        node._rebuild_coverage_grid()
+        # TF is not available in a unit test, so stand in for it.
+        node._lookup_robot_xy = lambda: (0.0, 0.0)
+
+        grid = make_costmap(300, 300, resolution=0.2, origin=(-20.0, -20.0))
+        fill_rect(grid, 0, 300, 140, 150, LETHAL)   # a mapped wall across it
+        node.costmap = grid
+
+        assert node.plan_sweep() is True
+        assert node.points, 'no path planned'
+        for x, y in node.points:
+            assert not node._is_blocked(x, y), f'waypoint ({x}, {y}) is in rock'
+        # And the review runs against that plan without falling over.
+        node._review_map()
+
+    def test_review_runs_repeatedly_without_replanning_a_stable_map(self, node):
+        node.cam_fx = node.cam_fy = 360.0
+        node.cam_width, node.cam_height = 720, 480
+        node.polygon = [(0.0, 2.0), (12.0, 2.0), (12.0, 14.0), (0.0, 14.0)]
+        node.area_set = True
+        node._rebuild_coverage_grid()
+        node._lookup_robot_xy = lambda: (0.0, 0.0)
+        node.costmap = make_costmap(300, 300, resolution=0.2, origin=(-20.0, -20.0))
+        assert node.plan_sweep() is True
+        before = node.map_replans
+        for _ in range(6):
+            node._review_map()
+        assert node.map_replans == before, 'replanned on a map that did not change'
