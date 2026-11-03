@@ -11,7 +11,7 @@ import math
 
 import pytest
 
-from conftest import FakeParams, make_costmap, set_cell
+from conftest import FakeLogger, FakeParams, make_costmap, set_cell
 
 LETHAL = 100
 INSCRIBED = 99
@@ -24,7 +24,10 @@ def fake_search(search_node):
 
     class FakeSearch:
         _is_blocked = SearchNode._is_blocked
+        _costmap_grid = SearchNode._costmap_grid
+        _flood = SearchNode._flood
         _reachable_from = SearchNode._reachable_from
+        _confirmed_from = SearchNode._confirmed_from
         _is_reachable = SearchNode._is_reachable
         _camera_fov = SearchNode._camera_fov
         _camera_altitude = SearchNode._camera_altitude
@@ -40,6 +43,7 @@ def fake_search(search_node):
                 fallback_image_width=720,
                 fallback_image_height=480,
                 flight_altitude=10.0,
+                observation_gap_fill=0.0,
             )
 
     return FakeSearch()
@@ -127,10 +131,29 @@ class TestReachability:
         reached = fake_search._reachable_from((1.5, 1.5))
         assert fake_search._is_reachable(7.5, 7.5, reached)
 
-    def test_start_in_wall_or_off_map(self, fake_search):
+    def test_start_in_wall_falls_back_to_the_nearest_free_cell(self, fake_search):
+        """A drone hovering inside an obstacle's inflation ring reads as being
+        in a wall, which happens in ordinary flight. This used to return None,
+        and a caller given None stopped checking reachability at all - so the
+        flood starts from the nearest free cell instead.
+
+        What it must NOT do is seed both sides of the wall at once: the cell
+        the drone is standing in is on the ring around a sealed pocket, and
+        the answer has to be the OUTSIDE of it, not outside and inside merged.
+        """
         fake_search.costmap = self.walled_pocket()
-        assert fake_search._reachable_from((5.5, 5.5)) is None
+        reached = fake_search._reachable_from((5.5, 5.5))
+        assert reached is not None
+        assert fake_search._is_reachable(1.5, 1.5, reached)        # outside
+        assert not fake_search._is_reachable(7.5, 7.5, reached)    # the pocket
+
+    def test_off_map_start_has_no_answer(self, fake_search):
+        fake_search.costmap = self.walled_pocket()
         assert fake_search._reachable_from((-4.0, 2.0)) is None
+
+    def test_no_free_cell_anywhere_near(self, fake_search):
+        fake_search.costmap = make_costmap(6, 6, fill=LETHAL)
+        assert fake_search._reachable_from((2.5, 2.5)) is None
 
     def test_off_map_point_is_left_to_nav2(self, fake_search):
         fake_search.costmap = self.walled_pocket()
@@ -162,3 +185,608 @@ class TestCameraFootprint:
         low = fake_search._footprint_radius()
         fake_search.get_parameter.values['flight_altitude'] = 20.0
         assert fake_search._footprint_radius() == pytest.approx(2 * low)
+
+
+class TestConfirmedReachability:
+    """The two-flood scheme, and the mountain bug it was written to fix.
+
+    The scout flies at 10 m over rock formations 15-49 m across and 24-27 m
+    tall, so its 2D lidar slices through solid stone and only ever paints the
+    NEAR face. Everything behind that face - the rock's own interior included
+    - stays unobserved for as long as the drone approaches from one side.
+    """
+
+    UNKNOWN = -1
+
+    def crescent(self, observed_outside=True):
+        """A wall across the middle with open ends: what one face of a rock
+        looks like after a single pass. Beyond it everything is unobserved.
+
+        Row 0 is where the drone starts. Row 4 is the wall, cells 2..7 only,
+        so the flood can still run round both ends at columns 0-1 and 8-9.
+        Rows 5+ have never been seen.
+        """
+        grid = make_costmap(10, 10)
+        for row in range(5, 10):
+            for col in range(10):
+                set_cell(grid, col, row, self.UNKNOWN)
+        for col in range(2, 8):
+            set_cell(grid, col, 4, LETHAL)
+        if not observed_outside:
+            for col in range(10):
+                set_cell(grid, col, 0, self.UNKNOWN)
+        return grid
+
+    def test_optimistic_flood_walks_straight_into_the_rock(self, fake_search):
+        # This is the bug, pinned down. Unobserved ground counts as free, and
+        # the mapped face is a crescent rather than a ring, so the flood runs
+        # round its ends and fills the space behind it. Both of the old tests
+        # therefore passed for a point in the middle of solid rock and a
+        # waypoint was planted there.
+        fake_search.costmap = self.crescent()
+        behind = (5.5, 6.5)                       # behind the wall, unobserved
+        assert not fake_search._is_blocked(*behind)       # unknown reads clear
+        reached = fake_search._reachable_from((0.5, 0.5))
+        assert fake_search._is_reachable(behind[0], behind[1], reached)
+
+    def test_confirmed_flood_refuses_ground_it_has_not_seen(self, fake_search):
+        # Same map, same point, honest answer: nothing confirms the drone can
+        # get there, so no leg is planned there.
+        fake_search.costmap = self.crescent()
+        confirmed = fake_search._confirmed_from((0.5, 0.5))
+        assert not fake_search._is_reachable(5.5, 6.5, confirmed)
+        # Observed open ground on this side is still confirmed, so the sweep
+        # is not throttled back to nothing.
+        assert fake_search._is_reachable(0.5, 0.5, confirmed)
+        assert fake_search._is_reachable(9.5, 3.5, confirmed)
+
+    def test_confirmed_grows_as_the_lidar_sees_more(self, fake_search):
+        """The verdict has to be revisable - that is the point of the rewrite.
+
+        The old code remembered a no-go disc, so ground written off on the
+        approach stayed written off even after the drone flew round and could
+        see it was open. Here the same ground flips to confirmed as soon as it
+        has been observed.
+        """
+        grid = self.crescent()
+        fake_search.costmap = grid
+        assert not fake_search._is_reachable(
+            5.5, 6.5, fake_search._confirmed_from((0.5, 0.5)))
+        # The drone flies round the end of the wall and sweeps its far side.
+        for col in range(10):
+            for row in range(5, 10):
+                set_cell(grid, col, row, 0)
+        fake_search.costmap = grid
+        assert fake_search._is_reachable(
+            5.5, 6.5, fake_search._confirmed_from((0.5, 0.5)))
+
+    def test_rock_itself_is_never_confirmed(self, fake_search):
+        fake_search.costmap = self.crescent()
+        confirmed = fake_search._confirmed_from((0.5, 0.5))
+        assert not fake_search._is_reachable(4.5, 4.5, confirmed)   # the wall
+
+    def test_nothing_observed_yet_gives_empty_not_none(self, fake_search):
+        """On the pad the lidar has seen nothing useful. That must read as
+        "nothing confirmed yet", which is retried, not as "no costmap"."""
+        fake_search.costmap = make_costmap(8, 8, fill=self.UNKNOWN)
+        confirmed = fake_search._confirmed_from((0.5, 0.5))
+        assert confirmed is not None
+        assert not confirmed.any()
+        # ...whereas the optimistic flood reaches everywhere, so the area is
+        # reported as unverified rather than as rock.
+        assert fake_search._reachable_from((0.5, 0.5)).all()
+
+    def test_drone_on_an_unobserved_pad_still_gets_a_seed(self, fake_search):
+        """Window seeding, not single-cell. The drone sits on the ute, so the
+        cell underneath it can read blocked or unobserved; seeding from that
+        one cell alone would confirm nothing at all."""
+        grid = make_costmap(10, 10, resolution=1.0)
+        set_cell(grid, 0, 0, LETHAL)          # the pad under the drone
+        fake_search.costmap = grid
+        confirmed = fake_search._confirmed_from((0.5, 0.5))
+        assert confirmed.any()
+        assert fake_search._is_reachable(5.5, 5.5, confirmed)
+
+    def test_no_costmap_means_no_answer(self, fake_search):
+        assert fake_search._confirmed_from((1.0, 1.0)) is None
+
+    def test_off_map_start(self, fake_search):
+        fake_search.costmap = make_costmap(4, 4)
+        assert fake_search._confirmed_from((-10.0, 0.0)) is None
+
+    def test_sealed_pocket_fails_both_floods(self, fake_search):
+        """A pocket walled all the way round is ruled out even optimistically,
+        which is what makes it safe to drop from the coverage total."""
+        grid = make_costmap(10, 10)
+        for i in range(5, 10):
+            set_cell(grid, i, 5, LETHAL)
+            set_cell(grid, 5, i, LETHAL)
+        for i in range(5, 10):
+            set_cell(grid, i, 9, LETHAL)
+            set_cell(grid, 9, i, LETHAL)
+        fake_search.costmap = grid
+        assert not fake_search._is_reachable(
+            7.5, 7.5, fake_search._reachable_from((1.5, 1.5)))
+        assert not fake_search._is_reachable(
+            7.5, 7.5, fake_search._confirmed_from((1.5, 1.5)))
+
+    def test_matches_the_old_hand_written_flood(self, fake_search):
+        """scipy labelling must give the same 4-connected answer the Python
+        breadth-first search gave - it only replaced it for speed."""
+        import numpy as np
+        rng = np.random.default_rng(1234)
+        grid = make_costmap(40, 40)
+        for col in range(40):
+            for row in range(40):
+                if rng.random() < 0.3:
+                    set_cell(grid, col, row, LETHAL)
+        set_cell(grid, 0, 0, 0)
+        fake_search.costmap = grid
+
+        free = np.asarray(grid.data, dtype=np.int16).reshape(40, 40) < INSCRIBED
+        want = np.zeros_like(free)
+        want[0, 0] = True
+        stack = [(0, 0)]
+        while stack:
+            r, c = stack.pop()
+            for dr, dc in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                r2, c2 = r + dr, c + dc
+                if 0 <= r2 < 40 and 0 <= c2 < 40 and free[r2, c2] and not want[r2, c2]:
+                    want[r2, c2] = True
+                    stack.append((r2, c2))
+        assert np.array_equal(fake_search._reachable_from((0.5, 0.5)), want)
+
+
+@pytest.fixture
+def fake_review(search_node):
+    """A stand-in SearchNode carrying the coverage-grid state that the map
+    review reads, plus a record of whether it asked for a replan."""
+    import numpy as np
+    SearchNode = search_node.SearchNode
+
+    class FakeReview:
+        _is_blocked = SearchNode._is_blocked
+        _costmap_grid = SearchNode._costmap_grid
+        _flood = SearchNode._flood
+        _reachable_from = SearchNode._reachable_from
+        _confirmed_from = SearchNode._confirmed_from
+        _is_reachable = SearchNode._is_reachable
+        _project = SearchNode._project
+        _unverified_cells = SearchNode._unverified_cells
+        _review_map = SearchNode._review_map
+
+        def __init__(self):
+            self.costmap = None
+            self.confirmed = self.possible = None
+            # A 10x10 m area as 10x10 one-metre coverage cells, origin (0, 0).
+            self.coverage_resolution = 1.0
+            self.cov_rows = self.cov_cols = 10
+            self.cov_origin_x = self.cov_origin_y = 0.0
+            self.inside_mask = np.ones((10, 10), dtype=bool)
+            self.cells_in_shape = 100
+            self.plan_reachable_cells = None
+            self.map_replans = 0
+            self.area_set = True
+            self.planned = True
+            self.replanning = False
+            self.holding = self.estopped = False
+            self.busy = False
+            self.goal_handle = None
+            self.timed_out = False
+            self._replan_wanted = False
+            self._replan_is_map_driven = False
+            self.replanned = False
+            self.at = (0.5, 0.5)
+            self.get_parameter = FakeParams(
+                obstacle_cost_threshold=INSCRIBED,
+                avoid_obstacles=True,
+                drop_unreachable=True,
+                map_review_period=2.0,
+                map_review_fraction=0.02,
+                max_map_replans=20,
+                observation_gap_fill=0.0,
+            )
+
+        def paused(self):
+            return self.holding or self.estopped
+
+        def get_logger(self):
+            return FakeLogger()
+
+        def _lookup_robot_xy(self):
+            return self.at
+
+        def _after_abandoned_goal(self):
+            self.replanned = True
+
+    return FakeReview()
+
+
+class TestProjectAndUnverified:
+    def test_project_resamples_onto_the_coverage_grid(self, fake_review):
+        import numpy as np
+        # Costmap at 0.5 m, coverage at 1.0 m: four costmap cells per
+        # coverage cell, so the projection must pick, not average.
+        fake_review.costmap = make_costmap(20, 20, resolution=0.5)
+        grid = np.zeros((20, 20), dtype=bool)
+        grid[:, :10] = True                 # x < 5 m is reachable
+        out = fake_review._project(grid)
+        assert out[:, :5].all()
+        assert not out[:, 5:].any()
+
+    def test_project_defaults_outside_the_costmap(self, fake_review):
+        import numpy as np
+        # Costmap covers only the bottom-left 4x4 m of the 10x10 m area.
+        fake_review.costmap = make_costmap(4, 4, resolution=1.0)
+        grid = np.zeros((4, 4), dtype=bool)
+        out = fake_review._project(grid, default=True)
+        assert not out[:4, :4].any()        # inside the map: what the grid says
+        assert out[9, 9]                    # outside it: left to Nav2
+
+    def test_project_without_a_costmap(self, fake_review):
+        assert fake_review._project(None).all()
+
+    def test_unverified_counts_seen_but_unconfirmed_ground(self, fake_review):
+        import numpy as np
+        fake_review.costmap = make_costmap(10, 10, resolution=1.0)
+        fake_review.possible = np.ones((10, 10), dtype=bool)
+        fake_review.confirmed = np.zeros((10, 10), dtype=bool)
+        fake_review.confirmed[:5, :] = True
+        assert fake_review._unverified_cells() == 50
+
+    def test_nothing_unverified_once_everything_is_confirmed(self, fake_review):
+        import numpy as np
+        fake_review.costmap = make_costmap(10, 10, resolution=1.0)
+        fake_review.possible = np.ones((10, 10), dtype=bool)
+        fake_review.confirmed = np.ones((10, 10), dtype=bool)
+        assert fake_review._unverified_cells() == 0
+
+    def test_sealed_ground_is_not_unverified(self, fake_review):
+        """Walled in with no way through is a verdict, not an open question -
+        so it must not keep the sweep waiting for a better view."""
+        import numpy as np
+        fake_review.costmap = make_costmap(10, 10, resolution=1.0)
+        fake_review.possible = np.zeros((10, 10), dtype=bool)
+        fake_review.confirmed = np.zeros((10, 10), dtype=bool)
+        assert fake_review._unverified_cells() == 0
+
+    def test_unverified_is_zero_before_any_flood(self, fake_review):
+        assert fake_review._unverified_cells() == 0
+
+
+class TestReviewMapTrigger:
+    def all_clear(self):
+        return make_costmap(10, 10, resolution=1.0)
+
+    def test_first_pass_only_records_the_baseline(self, fake_review):
+        fake_review.costmap = self.all_clear()
+        fake_review._review_map()
+        assert fake_review.plan_reachable_cells == 100
+        assert not fake_review.replanned
+
+    def test_no_replan_when_nothing_changed(self, fake_review):
+        fake_review.costmap = self.all_clear()
+        fake_review._review_map()           # baseline
+        fake_review._review_map()
+        assert not fake_review.replanned
+        assert fake_review.map_replans == 0
+
+    def test_replans_when_ground_opens_up(self, fake_review):
+        """The case the no-go list could never handle: ground that was written
+        off becomes reachable once the drone can see it."""
+        grid = make_costmap(10, 10, resolution=1.0, fill=-1)
+        for col in range(10):               # only the first row observed
+            set_cell(grid, col, 0, 0)
+        fake_review.costmap = grid
+        fake_review._review_map()
+        assert fake_review.plan_reachable_cells == 10
+
+        for col in range(10):               # the drone has now seen it all
+            for row in range(10):
+                set_cell(grid, col, row, 0)
+        fake_review.costmap = grid
+        fake_review._review_map()
+        assert fake_review.replanned
+        assert fake_review.map_replans == 1
+        assert fake_review._replan_is_map_driven
+
+    def test_replans_when_ground_turns_out_blocked(self, fake_review):
+        grid = self.all_clear()
+        fake_review.costmap = grid
+        fake_review._review_map()
+        for col in range(10):
+            for row in range(5, 10):
+                set_cell(grid, col, row, LETHAL)
+        fake_review.costmap = grid
+        fake_review._review_map()
+        assert fake_review.replanned
+
+    def test_small_change_is_ignored(self, fake_review):
+        """A threshold, not any change at all - otherwise every flicker of the
+        costmap would restart the sweep."""
+        grid = self.all_clear()
+        fake_review.costmap = grid
+        fake_review._review_map()
+        set_cell(grid, 0, 0, LETHAL)        # 1 cell of 100, under the 2%
+        fake_review.costmap = grid
+        fake_review._review_map()
+        assert not fake_review.replanned
+
+    def test_cancels_a_goal_in_flight_instead_of_replanning_under_it(self, fake_review):
+        class Handle:
+            def __init__(self):
+                self.cancelled = False
+
+            def cancel_goal_async(self):
+                self.cancelled = True
+
+        grid = make_costmap(10, 10, resolution=1.0, fill=-1)
+        for col in range(10):
+            set_cell(grid, col, 0, 0)
+        fake_review.costmap = grid
+        fake_review._review_map()
+        fake_review.goal_handle = Handle()
+        for col in range(10):
+            for row in range(10):
+                set_cell(grid, col, row, 0)
+        fake_review.costmap = grid
+        fake_review._review_map()
+        assert fake_review.goal_handle.cancelled
+        assert fake_review.timed_out          # goal_finished picks it up
+        assert fake_review._replan_wanted
+        assert not fake_review.replanned      # not replanned under the goal
+
+    def test_cap_stops_endless_map_replans(self, fake_review):
+        fake_review.get_parameter.values['max_map_replans'] = 0
+        grid = make_costmap(10, 10, resolution=1.0, fill=-1)
+        for col in range(10):
+            set_cell(grid, col, 0, 0)
+        fake_review.costmap = grid
+        fake_review._review_map()
+        for col in range(10):
+            for row in range(10):
+                set_cell(grid, col, row, 0)
+        fake_review.costmap = grid
+        fake_review._review_map()
+        assert not fake_review.replanned
+        assert fake_review.map_replans == 0
+
+    def test_quiet_while_paused_or_unplanned(self, fake_review):
+        fake_review.costmap = self.all_clear()
+        for attr in ('estopped', 'holding', 'replanning'):
+            setattr(fake_review, attr, True)
+            fake_review._review_map()
+            assert fake_review.plan_reachable_cells is None
+            setattr(fake_review, attr, False)
+        fake_review.planned = False
+        fake_review._review_map()
+        assert fake_review.plan_reachable_cells is None
+        fake_review.planned = True
+        fake_review.area_set = False
+        fake_review._review_map()
+        assert fake_review.plan_reachable_cells is None
+
+    def test_disabled_by_period_zero(self, fake_review):
+        fake_review.costmap = self.all_clear()
+        fake_review.get_parameter.values['map_review_period'] = 0.0
+        fake_review._review_map()
+        assert fake_review.plan_reachable_cells is None
+
+    def test_quiet_without_a_pose_or_a_costmap(self, fake_review):
+        fake_review._review_map()                 # no costmap
+        assert fake_review.plan_reachable_cells is None
+        fake_review.costmap = self.all_clear()
+        fake_review.at = None
+        fake_review._review_map()
+        assert fake_review.plan_reachable_cells is None
+
+
+@pytest.fixture
+def fake_frontier(search_node):
+    """A stand-in SearchNode for the go-and-look logic."""
+    import numpy as np
+    SearchNode = search_node.SearchNode
+
+    class FakeFrontier:
+        _is_blocked = SearchNode._is_blocked
+        _costmap_grid = SearchNode._costmap_grid
+        _flood = SearchNode._flood
+        _reachable_from = SearchNode._reachable_from
+        _confirmed_from = SearchNode._confirmed_from
+        _is_reachable = SearchNode._is_reachable
+        _polygon_mask_costmap = SearchNode._polygon_mask_costmap
+        _line_of_sight = SearchNode._line_of_sight
+        _frontier_goal = SearchNode._frontier_goal
+
+        def __init__(self):
+            self.costmap = None
+            self.confirmed = self.possible = None
+            self.polygon = [(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)]
+            self.looked_from = []
+            self.at = (0.5, 0.5)
+            self.get_parameter = FakeParams(
+                obstacle_cost_threshold=INSCRIBED,
+                observation_gap_fill=0.0,
+                sensor_range=40.0,
+                vantage_min_separation=3.0,
+            )
+
+        def _lookup_robot_xy(self):
+            return self.at
+
+        def flood(self):
+            self.confirmed = self._confirmed_from(self.at)
+            self.possible = self._reachable_from(self.at)
+
+    return FakeFrontier()
+
+
+class TestFrontier:
+    UNKNOWN = -1
+
+    def half_seen(self):
+        """Bottom half observed and clear, top half never looked at."""
+        grid = make_costmap(10, 10)
+        for row in range(5, 10):
+            for col in range(10):
+                set_cell(grid, col, row, self.UNKNOWN)
+        return grid
+
+    def test_goes_to_look_at_unverified_ground(self, fake_frontier):
+        """The gap that planning over confirmed ground alone leaves: without
+        this the drone searches what it can confirm, reports itself finished,
+        and quietly abandons ground that is in fact wide open."""
+        fake_frontier.costmap = self.half_seen()
+        fake_frontier.flood()
+        goal = fake_frontier._frontier_goal()
+        assert goal is not None
+        # On the frontier: in the observed half, up against the unseen half.
+        assert 3.0 <= goal[1] <= 5.5
+
+    def test_nothing_to_look_at_when_all_confirmed(self, fake_frontier):
+        fake_frontier.costmap = make_costmap(10, 10)
+        fake_frontier.flood()
+        assert fake_frontier._frontier_goal() is None
+
+    def test_ignores_unverified_ground_outside_the_area(self, fake_frontier):
+        """Unseen ground elsewhere in the world is not the drone's problem."""
+        fake_frontier.costmap = self.half_seen()
+        fake_frontier.polygon = [(0.0, 0.0), (9.0, 0.0), (9.0, 4.0), (0.0, 4.0)]
+        fake_frontier.flood()
+        assert fake_frontier._frontier_goal() is None
+
+    def test_will_not_pick_where_it_already_looked(self, fake_frontier):
+        """Otherwise it ping-pongs between neighbouring frontier cells for
+        ever: a rock's interior is never resolved by looking from outside."""
+        fake_frontier.costmap = self.half_seen()
+        fake_frontier.flood()
+        first = fake_frontier._frontier_goal()
+        seen = {first}
+        for _ in range(6):
+            fake_frontier.looked_from.append(fake_frontier._frontier_goal())
+            nxt = fake_frontier._frontier_goal()
+            if nxt is None:
+                break
+            assert all(math.hypot(nxt[0] - lx, nxt[1] - ly) > 3.0
+                       for lx, ly in fake_frontier.looked_from)
+            seen.add(nxt)
+        assert len(seen) > 1
+
+    def test_no_vantage_when_nothing_can_see_the_target(self, fake_frontier):
+        """Sealed behind mapped rock: there is no point flying anywhere."""
+        grid = make_costmap(10, 10)
+        for i in range(4, 9):             # a closed ring of mapped wall
+            set_cell(grid, i, 4, LETHAL)
+            set_cell(grid, 4, i, LETHAL)
+            set_cell(grid, i, 8, LETHAL)
+            set_cell(grid, 8, i, LETHAL)
+        for col in range(5, 8):           # unknown inside the ring
+            for row in range(5, 8):
+                set_cell(grid, col, row, self.UNKNOWN)
+        fake_frontier.costmap = grid
+        fake_frontier.flood()
+        # Sealed even optimistically, so there is nothing to go and look at.
+        assert fake_frontier._frontier_goal() is None
+
+    def test_quiet_without_floods_or_pose(self, fake_frontier):
+        assert fake_frontier._frontier_goal() is None       # no costmap
+        fake_frontier.costmap = self.half_seen()
+        fake_frontier.flood()
+        fake_frontier.at = None
+        assert fake_frontier._frontier_goal() is None
+
+
+class TestLineOfSight:
+    def test_mapped_obstacle_blocks_sight(self, fake_frontier):
+        import numpy as np
+        grid = make_costmap(10, 10)
+        for row in range(10):
+            set_cell(grid, 5, row, LETHAL)       # a full wall at col 5
+        fake_frontier.costmap = grid
+        g, info = fake_frontier._costmap_grid()
+        solid = g >= INSCRIBED
+        xs = np.array([1.5]); ys = np.array([1.5])
+        assert not fake_frontier._line_of_sight(xs, ys, (8.5, 1.5), solid, info)[0]
+        assert fake_frontier._line_of_sight(xs, ys, (4.0, 1.5), solid, info)[0]
+
+    def test_unknown_does_not_block_sight(self, fake_frontier):
+        """Not having looked somewhere is the whole reason to go and look, so
+        unknown cells must not count as a wall for this test."""
+        import numpy as np
+        grid = make_costmap(10, 10, fill=-1)
+        fake_frontier.costmap = grid
+        g, info = fake_frontier._costmap_grid()
+        solid = g >= INSCRIBED
+        xs = np.array([0.5]); ys = np.array([0.5])
+        assert fake_frontier._line_of_sight(xs, ys, (9.5, 9.5), solid, info)[0]
+
+    def test_vectorised_over_many_origins(self, fake_frontier):
+        import numpy as np
+        grid = make_costmap(10, 10)
+        for row in range(0, 6):
+            set_cell(grid, 5, row, LETHAL)       # wall only across the bottom
+        fake_frontier.costmap = grid
+        g, info = fake_frontier._costmap_grid()
+        solid = g >= INSCRIBED
+        xs = np.array([1.5, 1.5]); ys = np.array([1.5, 8.5])
+        got = fake_frontier._line_of_sight(xs, ys, (8.5, 8.5), solid, info)
+        assert not got[0]       # from low down, the wall is in the way
+        assert got[1]           # from up high, clear over the top of it
+
+
+class TestPolygonMask:
+    def test_marks_the_cells_inside_the_shape(self, fake_frontier):
+        import numpy as np
+        fake_frontier.costmap = make_costmap(10, 10)
+        fake_frontier.polygon = [(2.0, 2.0), (6.0, 2.0), (6.0, 6.0), (2.0, 6.0)]
+        mask = fake_frontier._polygon_mask_costmap()
+        assert mask[3, 3] and mask[5, 5]
+        assert not mask[1, 1] and not mask[7, 7]
+        assert np.count_nonzero(mask) == 16          # a 4x4 m square
+
+    def test_handles_a_concave_shape(self, fake_frontier):
+        fake_frontier.costmap = make_costmap(12, 12)
+        fake_frontier.polygon = [(1.0, 1.0), (9.0, 1.0), (9.0, 3.0),
+                                 (3.0, 3.0), (3.0, 9.0), (1.0, 9.0)]
+        mask = fake_frontier._polygon_mask_costmap()
+        assert mask[2, 7]        # along the bottom arm of the L
+        assert mask[7, 2]        # up the side arm
+        assert not mask[7, 7]    # the bite out of the corner
+
+    def test_degenerate_polygon(self, fake_frontier):
+        fake_frontier.costmap = make_costmap(6, 6)
+        fake_frontier.polygon = [(1.0, 1.0), (2.0, 2.0)]
+        assert not fake_frontier._polygon_mask_costmap().any()
+
+
+class TestGapFill:
+    """The lidar's 360 rays fan out, leaving unobserved wedges between them
+    past about 9 m. Without closing those the confirmed region is a thin fan
+    and no leg can be planned at all - measured at 0 legs on open grass."""
+
+    def test_bridges_a_gap_between_two_rays(self, fake_search):
+        grid = make_costmap(20, 3, resolution=0.15)
+        for col in range(20):            # two observed rays...
+            set_cell(grid, col, 0, 0)
+            set_cell(grid, col, 2, 0)
+        for col in range(20):            # ...with an unobserved wedge between
+            set_cell(grid, col, 1, -1)
+        fake_search.costmap = grid
+        fake_search.get_parameter.values['observation_gap_fill'] = 0.0
+        strict = fake_search._confirmed_from((0.1, 0.075))
+        assert not strict[1, 10]         # the gap reads as a wall
+        fake_search.get_parameter.values['observation_gap_fill'] = 0.75
+        filled = fake_search._confirmed_from((0.1, 0.075))
+        assert filled[1, 10]             # bridged
+
+    def test_never_fills_in_rock(self, fake_search):
+        """The one thing it must not do: invent a way through an obstacle."""
+        grid = make_costmap(20, 3, resolution=0.15)
+        for col in range(20):
+            set_cell(grid, col, 0, 0)
+            set_cell(grid, col, 2, 0)
+            set_cell(grid, col, 1, LETHAL)
+        fake_search.costmap = grid
+        fake_search.get_parameter.values['observation_gap_fill'] = 2.0
+        filled = fake_search._confirmed_from((0.1, 0.075))
+        assert not filled[1, 10]

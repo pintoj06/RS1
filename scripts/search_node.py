@@ -7,6 +7,13 @@ import math
 import time
 
 import numpy as np
+# Connected-component labelling, used by the reachability checks below. Those
+# used to be a hand-written breadth-first flood in Python, which took 1.7 s on
+# the live 533x533 costmap - far too slow to run continuously. scipy does the
+# same 4-connected job in one C call in about 19 ms, and it is that speed-up
+# which makes re-deriving the searchable area every couple of seconds
+# affordable instead of a once-per-plan luxury.
+from scipy import ndimage
 
 import rclpy
 from action_msgs.msg import GoalStatus
@@ -309,14 +316,76 @@ class SearchNode(Node):
         # progress clock while it gets nowhere.
         self.declare_parameter('goal_time_factor', 4.0)
         self.declare_parameter('assumed_speed', 0.3)        # m/s, measured
-        # Remember where a waypoint proved unreachable and keep later plans
-        # out of that pocket, or a replan picks the same spot and stalls again.
-        self.declare_parameter('nogo_radius', 6.0)          # metres
+        # --- staying honest about what is reachable ----------------------
+        # "Unreachable" is not a fact about the world. It is a belief about
+        # where the drone has so far been able to LOOK, so it gets re-derived
+        # from the live map on this interval rather than remembered.
+        #
+        # What this replaced: a no-go disc of fixed radius around every
+        # waypoint that failed. That was wrong twice over. Wrong size - the
+        # rock in this world is 15-49 m across, so a 6 m disc blanked out less
+        # than half of one summit and the next sweep leg, 6.2 m away, landed
+        # straight back inside it. And permanent - ground written off on the
+        # approach stayed written off for the whole flight, even after the
+        # drone had flown round and could plainly see it was open.
+        self.declare_parameter('map_review_period', 2.0)    # seconds, 0 disables
+        # Replan only once the reachable part of the area has changed by at
+        # least this fraction of what the operator drew. A threshold rather
+        # than any change at all is what stops a replan on every flicker of
+        # the costmap, and it guarantees each replan makes real progress.
+        self.declare_parameter('map_review_fraction', 0.02)  # 2%
+        # Map-driven replans are normal operation rather than a failure, so
+        # they get their own generous cap, separate from max_replans.
+        self.declare_parameter('max_map_replans', 20)
+        # The lidar fires 360 rays over 360 degrees, so they fan out: the gap
+        # between neighbouring rays is 0.17 m at 10 m and 0.70 m at the 40 m
+        # limit, against a 0.15 m costmap cell. Past about 9 m a single scan
+        # therefore leaves unobserved wedges BETWEEN the rays, and "ground the
+        # lidar has seen to be clear" comes out as a thin fan rather than a
+        # solid area - measured at 24 of 96 probe points on open grass 12 m
+        # out. Gaps narrower than this, with observed-clear ground all round
+        # them, are closed up before the flood runs. Cells the costmap calls
+        # blocked are never filled in this way, so it cannot invent a way
+        # through rock; it only stops a ray gap from reading as a wall.
+        self.declare_parameter('observation_gap_fill', 0.75)   # metres
+        # How far the lidar can see, from the sensor's own <max> in the xacro.
+        # Used to rule out flying to a vantage point from which the ground in
+        # question would still be out of range - the drone would arrive having
+        # learned nothing.
+        self.declare_parameter('sensor_range', 40.0)        # metres
+        # Vantage points this close to one already used count as the same
+        # spot. Without this the drone ping-pongs between two neighbouring
+        # cells on the frontier for ever: the interior of a rock stays
+        # unverified no matter how long you look at it from outside, so there
+        # has to be something that stops the drone trying.
+        self.declare_parameter('vantage_min_separation', 3.0)   # metres
+        # Give up looking after this many trips in a row that taught us
+        # nothing. A sight line is only blocked by MAPPED obstacle - not
+        # having looked somewhere is the whole reason to go and look - so a
+        # rock whose face is only partly mapped still appears to have a way of
+        # seeing into it, and the drone would keep trying vantage points round
+        # it. Measured: a box drawn wholly inside a rock went on circling it.
+        # Judging the trips by whether they actually resolve any ground is the
+        # same progress-based test used for a stalled waypoint, and it stops
+        # after a few hops instead of running the replan budget down.
+        #
+        # 5 is measured, not guessed. Working round this world's rock ridge
+        # takes three or four trips that resolve nothing before the one that
+        # breaks through, so 3 gave up just before the payoff and searched
+        # only 43.6% of a box reaching past the ridge; 5 searched 100%. Going
+        # higher does not improve that and only adds wasted flying on an area
+        # that really is hopeless (a box drawn wholly inside a rock costs
+        # 40 m at 5, and 91 m at 10).
+        self.declare_parameter('vantage_patience', 5)
+        # How much unverified ground one trip has to resolve to count as
+        # progress, as a fraction of the area the operator drew.
+        self.declare_parameter('vantage_progress_fraction', 0.02)
         # How often to re-check that the waypoint being flown to is still
         # reachable. The cheap "is it in an obstacle" test runs every tick;
-        # the flood fill is a search over the whole costmap, so it runs on
-        # this interval instead.
-        self.declare_parameter('goal_recheck_period', 3.0)  # seconds
+        # the flood fill covers the whole costmap, so it runs on this interval
+        # instead. It used to be 3 s because the flood was a 1.7 s Python
+        # loop; at 19 ms via scipy it can run every tick.
+        self.declare_parameter('goal_recheck_period', 1.0)  # seconds
         # Drop waypoints the drone cannot actually get to, worked out by
         # flooding outwards from its position across free costmap cells.
         self.declare_parameter('drop_unreachable', True)
@@ -361,7 +430,32 @@ class SearchNode(Node):
         self.points = []
         self.planned = False
         self.spacing = None
-        self.nogo = []              # (x, y) where a waypoint proved unreachable
+        # The two reachability pictures, refreshed by _review_map() and at
+        # every plan. 'confirmed' is what the drone can demonstrably get to
+        # across ground the lidar has SEEN to be clear; 'possible' also counts
+        # unobserved ground as clear. See _confirmed_from / _reachable_from.
+        self.confirmed = None
+        self.possible = None
+        # How much of the area was confirmed reachable when the current path
+        # was built, in coverage cells. _review_map() compares the live figure
+        # against this to spot ground that has opened up or closed off since.
+        self.plan_reachable_cells = None
+        self.map_replans = 0
+        self._replan_is_map_driven = False
+        # Vantage points already used. Unlike the no-go list this all
+        # replaced, this records something about the DRONE's own history -
+        # where it has been and looked from - rather than a guess about the
+        # world, so it cannot go stale in the way "that ground is
+        # unreachable" did.
+        self.looked_from = []
+        # Coverage cells written off as impossible to check: unverified, with
+        # no vantage point anywhere that can see them. Kept out of the
+        # coverage total, or the percentage would stall short of 100% for ever
+        # with no way to tell a rock interior from a genuine gap.
+        self.unverifiable = None
+        # Progress tracking for the look-around trips, see vantage_patience.
+        self.unverified_at_vantage = None
+        self.fruitless_vantages = 0
         self.replans = 0            # replans used on the current search area
         self.replanning = False     # True while rebuilding after an obstacle
         self.goal_best_dist = None  # closest the drone has got to this goal
@@ -538,6 +632,14 @@ class SearchNode(Node):
         # follows the drone if its altitude changes mid-flight.
         self.footprint_timer = self.create_timer(10.0, self._log_footprint)
 
+        # Re-derive what is reachable from the live map and replan when that
+        # changes - see _review_map. This is what replaced remembering where
+        # a waypoint failed, so that a verdict of "unreachable" can be taken
+        # back once the drone has flown somewhere it can see from.
+        self.map_timer = self.create_timer(
+            max(0.5, float(self.get_parameter('map_review_period').value)),
+            self._review_map)
+
         # Live search area from the ground station: the operator drags a box on
         # the map and this replaces whatever the launch parameter set.
         #
@@ -608,7 +710,13 @@ class SearchNode(Node):
         self.planned = False
         self.replans = 0
         self.replanning = False
-        self.nogo = []              # a new area starts with a clean slate
+        # A new area starts with a clean slate.
+        self.plan_reachable_cells = None
+        self.map_replans = 0
+        self.looked_from = []
+        self.unverifiable = None
+        self.unverified_at_vantage = None
+        self.fruitless_vantages = 0
 
         self.get_logger().info(
             f'Operator set a new {len(self.polygon)}-sided search area; '
@@ -783,19 +891,37 @@ class SearchNode(Node):
                 'route straight through anything out there...')
             return False
 
-        # Passed to the planner so each sweep leg is cut around obstacles.
-        # "Blocked" means occupied OR walled off with no way in - a waypoint in
-        # the hollow middle of a mountain is not in the rock, but the drone
-        # still cannot get to it, and chasing it stalls the whole sweep.
-        reached = None
+        # Two different questions get asked of the same map, and the gap
+        # between the answers is the whole point:
+        #
+        #   confirmed - flood outwards over ground the lidar has actually SEEN
+        #               to be clear. Unobserved ground counts as WALL.
+        #   possible  - the same flood, but unobserved ground counts as FLOOR.
+        #
+        # In both           -> the drone can demonstrably get there. Plan legs.
+        # possible only     -> unverified. It might be the far side of the
+        #                      mountain or the inside of it; from here there
+        #                      is no way to tell, so do not fly at it yet.
+        # in neither        -> walled in with no way through.
+        #
+        # Planning over CONFIRMED ground only is what stops waypoints being
+        # planted in solid rock. The single flood this replaced counted
+        # unobserved cells as clear, so the hollow middle of a mountain read
+        # as open ground AND the flood reached it by running round the ends of
+        # the mapped near face - both tests passed, and a waypoint went
+        # straight into the rock.
+        self.confirmed = None
+        self.possible = None
         if avoiding and self.get_parameter('drop_unreachable').value:
             here = self._lookup_robot_xy()
             if here is not None:
-                reached = self._reachable_from(here)
+                self.confirmed = self._confirmed_from(here)
+                self.possible = self._reachable_from(here)
 
-        if avoiding and reached is not None:
+        if avoiding and self.confirmed is not None:
+            confirmed = self.confirmed
             blocked = lambda x, y: (self._is_blocked(x, y)
-                                    or not self._is_reachable(x, y, reached))
+                                    or not self._is_reachable(x, y, confirmed))
         elif avoiding:
             blocked = self._is_blocked
         else:
@@ -805,20 +931,6 @@ class SearchNode(Node):
         # the new sweep only covers what is left. Without this the drone would
         # start the whole area again from one end every time it met an
         # obstacle, re-flying everything it had already searched.
-        # Places that already proved unreachable. Without this a replan picks
-        # a waypoint in the same pocket, stalls again, and burns every replan.
-        if self.nogo:
-            r = float(self.get_parameter('nogo_radius').value)
-            nogo = list(self.nogo)
-            prev = blocked
-            if prev is None:
-                blocked = lambda x, y: any(math.hypot(x-nx, y-ny) <= r for nx, ny in nogo)
-            else:
-                blocked = lambda x, y: (prev(x, y)
-                                        or any(math.hypot(x-nx, y-ny) <= r for nx, ny in nogo))
-            self.get_logger().info(
-                f'Keeping clear of {len(nogo)} spot(s) that proved unreachable '
-                f'earlier ({r:.0f} m around each).')
 
         if self.replanning:
             geometric = blocked
@@ -869,6 +981,19 @@ class SearchNode(Node):
         # Nothing left after cutting the obstacles out: the whole area is
         # rock. Say so plainly rather than flying a meaningless path.
         if not self.points:
+            # Before writing the area off, check whether the reason nothing
+            # could be planned is simply that we have not LOOKED yet. On the
+            # pad the lidar sits at 0.2 m and sees almost nothing useful 20 m
+            # out, so an empty first plan is entirely expected - that is a
+            # reason to wait for a better view, not to declare the area rock.
+            unverified = self._unverified_cells()
+            if unverified > 0 and not self.replanning:
+                area = unverified * self.coverage_resolution ** 2
+                self.get_logger().info(
+                    f'Nothing confirmed reachable yet - {area:.0f} m2 of the '
+                    f'area has not been seen by the lidar. Waiting for a '
+                    f'better view rather than writing the area off.')
+                return False             # retried on the next tick
             if self.replanning:
                 self.get_logger().info(
                     'Replan found nothing left to fly: everything reachable '
@@ -890,9 +1015,68 @@ class SearchNode(Node):
         # here, after self.points has its final value, rather than in
         # __init__ - the retry loop above replaces self.points outright, so
         # appending any earlier would just get overwritten.
-        if self.get_parameter('return_to_spawn').value:
+        # If part of the area can still be judged neither way, end the run by
+        # flying somewhere it can be SEEN from instead of going home none the
+        # wiser. No new flight mode: it is one more waypoint, and once the
+        # drone gets there the lidar has a new view, _review_map() spots the
+        # change and replans. Home is appended only once there is nothing left
+        # to go and look at. See _frontier_goal.
+        vantage = None
+        if (self.get_parameter('avoid_obstacles').value
+                and self.get_parameter('drop_unreachable').value):
+            vantage = self._frontier_goal()
+        if vantage is not None:
+            # Are these trips actually resolving anything? If the last few
+            # taught us nothing, the ground in question is not going to be
+            # settled by looking at it from yet another angle.
+            cells = self._unverified_cells()
+            if self.unverified_at_vantage is not None:
+                gained = self.unverified_at_vantage - cells
+                frac = float(self.get_parameter('vantage_progress_fraction').value)
+                if gained / max(1, self.cells_in_shape) < frac:
+                    self.fruitless_vantages += 1
+                else:
+                    self.fruitless_vantages = 0
+            if self.fruitless_vantages >= int(self.get_parameter('vantage_patience').value):
+                self.get_logger().info(
+                    f'The last {self.fruitless_vantages} trips to get a view '
+                    f'of the remaining ground resolved almost none of it, so '
+                    f'there is no point flying another.')
+                vantage = None
+            else:
+                self.unverified_at_vantage = cells
+
+        if vantage is not None:
+            unseen = self._unverified_cells() * self.coverage_resolution ** 2
+            self.points.append(vantage)
+            self.looked_from.append(vantage)
+            self.home_index = None
+            self.get_logger().info(
+                f'{unseen:.0f} m2 of the area cannot be judged reachable or '
+                f'not from here. Ending this pass at ({vantage[0]:.1f}, '
+                f'{vantage[1]:.1f}) to get a view of it, then replanning.')
+        else:
+            # Say so when part of the area is being left unchecked. Quietly
+            # flying home with a gap in the search is the one outcome the
+            # operator must never be left to guess at.
+            unseen = self._unverified_cells() * self.coverage_resolution ** 2
+            if unseen > 0:
+                self.get_logger().warn(
+                    f'{unseen:.0f} m2 of the search area could not be checked: '
+                    f'nowhere the drone can reach has a view of it, so it is '
+                    f'most likely enclosed by rock. Searching everything '
+                    f'else, and leaving that out of the coverage total.')
+                # Writing it off is also what makes the percentage honest. It
+                # is reported separately above rather than silently dropped.
+                self._write_off_unverified()
+        if vantage is None and self.get_parameter('return_to_spawn').value:
             self.points.append((0.0, 0.0))
             self.home_index = len(self.points) - 1
+
+        # What _review_map() will compare against: how much of the area was
+        # confirmed reachable at the moment this path was built.
+        self.plan_reachable_cells = int(np.count_nonzero(
+            self.inside_mask & self._project(self.confirmed)))
 
         self.planned = True
         self.replanning = False
@@ -995,7 +1179,6 @@ class SearchNode(Node):
                 f'Waypoint {self.index + 1}/{len(self.points)} is no longer '
                 f'reachable - the lidar has since mapped an obstacle there. '
                 f'Abandoning it now rather than flying at it.')
-            self.nogo.append((gx, gy))
             self.timed_out = True
             self._replan_wanted = self._should_replan()
             if self.goal_handle is not None:
@@ -1041,8 +1224,6 @@ class SearchNode(Node):
                     f'closer for {limit:.0f} s (still {dist:.1f} m away) - giving up '
                     f'on it. It is probably unreachable, inside or behind an '
                     f'obstacle.')
-            # Remember this pocket so later plans do not aim into it again.
-            self.nogo.append((gx, gy))
             self.timed_out = True
             self._replan_wanted = self._should_replan()
             if self.goal_handle is not None:
@@ -1097,11 +1278,16 @@ class SearchNode(Node):
             self.next_waypoint()
             return
         self._replan_wanted = False
-        self.replans += 1
-        self.get_logger().warn(
-            f'Replanning the rest of the search (attempt {self.replans}) '
-            f'against the obstacles mapped so far. Ground already searched '
-            f'is kept, so only what is left gets flown.')
+        # A map-driven replan is routine - the drone learned something and is
+        # acting on it - so it does not spend one of the failure budget.
+        if self._replan_is_map_driven:
+            self._replan_is_map_driven = False
+        else:
+            self.replans += 1
+            self.get_logger().warn(
+                f'Replanning the rest of the search (attempt {self.replans}) '
+                f'against the obstacles mapped so far. Ground already searched '
+                f'is kept, so only what is left gets flown.')
         # Keep WHAT HAS BEEN SEARCHED, but refresh WHAT IS WORTH SEARCHING.
         # The mask of searchable cells was built when the operator drew the
         # area, when the mountain had not been mapped - so its cells counted
@@ -1389,13 +1575,19 @@ class SearchNode(Node):
     def _build_inside_mask(self):
         """Boolean grid marking which coverage cells are worth searching.
 
-        Inside the polygon AND not blocked by an obstacle. Excluding the rock
-        matters: those cells can never be seen by the camera, so counting them
-        would hold the coverage percentage below 100% forever and make a
-        complete search look like a failed one.
+        Inside the polygon, not blocked by an obstacle, and not walled off
+        with no way in. Excluding those matters: the camera can never see
+        them, so counting them would hold the coverage percentage below 100%
+        forever and make a complete search look like a failed one.
+
+        The walled-off test uses the OPTIMISTIC flood (see _reachable_from),
+        not the confirmed one. Ground is only dropped from the total once it
+        is unreachable however the unseen parts turn out - merely not having
+        looked there yet is not a reason to stop counting it.
         """
         avoiding = (bool(self.get_parameter('avoid_obstacles').value)
                     and self.costmap is not None)
+        possible = self.possible if avoiding else None
         mask = np.zeros((self.cov_rows, self.cov_cols), dtype=bool)
         # Cells inside the shape the operator drew, obstacles included. Kept so
         # the operator can be told how much of what they drew is actually
@@ -1410,6 +1602,11 @@ class SearchNode(Node):
                     continue
                 in_shape += 1
                 if avoiding and self._is_blocked(cell_x, cell_y):
+                    continue
+                if possible is not None and not self._is_reachable(
+                        cell_x, cell_y, possible):
+                    continue
+                if self.unverifiable is not None and self.unverifiable[row, col]:
                     continue
                 mask[row, col] = True
         self.cells_in_shape = in_shape
@@ -1514,50 +1711,433 @@ class SearchNode(Node):
             return False
         return cost >= self.get_parameter('obstacle_cost_threshold').value
 
-    def _reachable_from(self, start_xy):
-        """Flood outwards from the drone across free costmap cells.
-
-        Answers "could the drone actually get there?", which is a different
-        question from "is that cell occupied?". The hollow middle of a mountain
-        reads as free - the lidar has only ever seen the near wall, and
-        unobserved ground is treated as free so Nav2 can plan at altitude - so
-        a waypoint can sit in a pocket with no way in. Only cells the flood
-        reaches are really reachable.
-
-        Returns a numpy bool grid matching the costmap, or None if there is no
-        costmap. Being honest about the limit: this only excludes a pocket once
-        its walls have actually been mapped all the way round. Seen from one
-        side the flood simply runs past the ends of the wall.
-        """
+    def _costmap_grid(self):
+        """The costmap as a 2D int array, with its geometry. None if we have none."""
         m = self.costmap
         if m is None:
             return None
+        grid = np.asarray(m.data, dtype=np.int16).reshape(
+            m.info.height, m.info.width)
+        return grid, m.info
 
-        w, h, res = m.info.width, m.info.height, m.info.resolution
-        ox, oy = m.info.origin.position.x, m.info.origin.position.y
+    def _flood(self, passable, row, col, seed_radius=0):
+        """Which passable cells join up with the one the drone is standing on?
+
+        One scipy labelling pass rather than a Python breadth-first search:
+        the same 4-connected answer, about 90x faster on a full costmap (19 ms
+        against 1.7 s), which is what lets reachability be re-derived every
+        couple of seconds instead of once per plan.
+
+        When the drone's own cell is not passable, seed_radius lets the flood
+        start from the NEAREST passable cell within that many cells instead of
+        giving up. Both cases happen in normal flight: on the pad the cell
+        under the drone can read unobserved, and at altitude the drone can sit
+        inside an obstacle's inflation ring, which reads as blocked.
+
+        Deliberately the nearest single cell, not every passable cell in a
+        window: a window straddling a wall would seed both sides at once and
+        quietly declare a sealed pocket reachable from outside it.
+
+        Returns None if there is no passable cell near enough to start from.
+        """
+        h, w = passable.shape
+        if not passable[row, col]:
+            if seed_radius <= 0:
+                return None
+            r0, r1 = max(0, row - seed_radius), min(h, row + seed_radius + 1)
+            c0, c1 = max(0, col - seed_radius), min(w, col + seed_radius + 1)
+            window = passable[r0:r1, c0:c1]
+            if not window.any():
+                return None
+            wr, wc = np.nonzero(window)
+            wr, wc = wr + r0, wc + c0
+            nearest = int(np.argmin((wr - row) ** 2 + (wc - col) ** 2))
+            row, col = int(wr[nearest]), int(wc[nearest])
+        labels, count = ndimage.label(passable)       # 4-connected by default
+        if count == 0:
+            return None
+        return labels == labels[row, col]
+
+    def _reachable_from(self, start_xy):
+        """Optimistic flood: where could the drone get to if the unseen parts
+        of the world turn out to be clear?
+
+        Answers "could the drone actually get there?", which is a different
+        question from "is that cell occupied?" - a waypoint can sit in a
+        pocket with no way in without being in the rock itself.
+
+        Unobserved ground counts as FREE here, which makes this the generous
+        answer: anything this flood cannot reach is walled in no matter what
+        turns out to be hiding in the unseen parts. Use it to rule ground OUT.
+        To decide what is safe to fly at, use _confirmed_from instead.
+
+        Returns a numpy bool grid matching the costmap, or None if there is no
+        costmap or the drone is off-map or inside a wall.
+        """
+        got = self._costmap_grid()
+        if got is None:
+            return None
+        grid, info = got
         thr = self.get_parameter('obstacle_cost_threshold').value
-
-        grid = np.asarray(m.data, dtype=np.int16).reshape(h, w)
         free = (grid < thr) & (grid >= -1)        # -1 = unobserved, count as free
 
-        col = int((start_xy[0] - ox) / res)
-        row = int((start_xy[1] - oy) / res)
-        if not (0 <= col < w and 0 <= row < h) or not free[row, col]:
-            return None                            # drone off-map or in a wall
+        res = info.resolution
+        col = int((start_xy[0] - info.origin.position.x) / res)
+        row = int((start_xy[1] - info.origin.position.y) / res)
+        if not (0 <= col < info.width and 0 <= row < info.height):
+            return None                            # drone off-map
+        # A drone hovering inside an obstacle's inflation ring reads as being
+        # in a wall. Starting from the nearest free cell instead of refusing
+        # to answer matters: callers that get None lose the map altogether and
+        # stop checking reachability at all.
+        return self._flood(free, row, col,
+                           seed_radius=max(1, int(2.0 / res)))
 
-        # Breadth-first flood. A deque of row ranges would be faster, but the
-        # grid is a few hundred thousand cells and this runs once per plan.
-        reached = np.zeros_like(free)
-        reached[row, col] = True
-        stack = [(row, col)]
-        while stack:
-            r, c = stack.pop()
-            for dr, dc in ((1, 0), (-1, 0), (0, 1), (0, -1)):
-                r2, c2 = r + dr, c + dc
-                if 0 <= r2 < h and 0 <= c2 < w and free[r2, c2] and not reached[r2, c2]:
-                    reached[r2, c2] = True
-                    stack.append((r2, c2))
-        return reached
+    def _confirmed_from(self, start_xy):
+        """Pessimistic flood: where can the drone get to across ground the
+        lidar has actually seen to be clear?
+
+        The only difference from _reachable_from is one line - unobserved
+        cells count as WALL here, not floor - and that one line is what keeps
+        waypoints out of the middle of a mountain. The lidar only ever sees a
+        rock's near face, so its interior is never observed; counting
+        unobserved ground as clear made that interior read as open AND let the
+        flood arrive there by running round the ends of the mapped face.
+
+        Returns a bool grid, which is all-False when nothing is confirmed yet
+        (the honest answer on the pad, before the lidar has seen anything), or
+        None if there is no costmap at all.
+        """
+        got = self._costmap_grid()
+        if got is None:
+            return None
+        grid, info = got
+        thr = self.get_parameter('obstacle_cost_threshold').value
+        seen_clear = (grid >= 0) & (grid < thr)   # observed AND clear
+
+        res = info.resolution
+        # Close the wedges between diverging lidar rays - see
+        # observation_gap_fill. ANDed back against "not blocked" so this can
+        # never fill in rock: it only stops a gap between two rays from
+        # reading as a wall the flood cannot cross.
+        gap = float(self.get_parameter('observation_gap_fill').value)
+        if gap > 0:
+            # A closing: grow, then shrink back by the same amount, which
+            # fills gaps up to 2*iters cells wide and leaves everything else
+            # where it was. Done as the two steps rather than binary_closing
+            # so each gets the right border: the growth must not invent free
+            # space beyond the edge of the map (border_value=0), and the
+            # shrink must not eat the map's own edge away (border_value=1).
+            iters = max(1, int(math.ceil(gap / 2.0 / res)))
+            grown = ndimage.binary_dilation(
+                seen_clear, iterations=iters, border_value=0)
+            seen_clear = ndimage.binary_erosion(
+                grown, iterations=iters, border_value=1) & (grid < thr)
+        col = int((start_xy[0] - info.origin.position.x) / res)
+        row = int((start_xy[1] - info.origin.position.y) / res)
+        if not (0 <= col < info.width and 0 <= row < info.height):
+            return None
+        # Seeded from the nearest clear cell within 2 m - see _flood.
+        reached = self._flood(seen_clear, row, col,
+                              seed_radius=max(1, int(2.0 / res)))
+        # An empty grid, not None: "nothing is confirmed yet" is a real answer
+        # that callers act on by waiting, whereas None means "no map at all".
+        return np.zeros_like(seen_clear) if reached is None else reached
+
+    def _project(self, grid, default=True):
+        """Resample a costmap-sized bool grid onto the coverage grid.
+
+        The two grids have different resolutions and origins (0.15 m for the
+        costmap, 0.5 m for coverage), so comparing them cell for cell needs
+        one of them moved. Cells outside the costmap take 'default', which
+        matches _is_reachable: beyond the map we do not claim to know, so we
+        leave it to Nav2 rather than refusing to search there.
+        """
+        shape = (self.cov_rows, self.cov_cols)
+        m = self.costmap
+        if grid is None or m is None:
+            return np.full(shape, default, dtype=bool)
+        res = m.info.resolution
+        xs = self.cov_origin_x + (np.arange(self.cov_cols) + 0.5) * self.coverage_resolution
+        ys = self.cov_origin_y + (np.arange(self.cov_rows) + 0.5) * self.coverage_resolution
+        cols = np.floor((xs - m.info.origin.position.x) / res).astype(int)
+        rows = np.floor((ys - m.info.origin.position.y) / res).astype(int)
+        ok_c = (cols >= 0) & (cols < m.info.width)
+        ok_r = (rows >= 0) & (rows < m.info.height)
+        out = np.full(shape, default, dtype=bool)
+        if ok_c.any() and ok_r.any():
+            out[np.ix_(ok_r, ok_c)] = grid[np.ix_(rows[ok_r], cols[ok_c])]
+        return out
+
+    def _polygon_mask_costmap(self):
+        """The search polygon as a mask at costmap resolution.
+
+        Vectorised even-odd crossing test over the polygon's bounding box
+        only. point_in_polygon one cell at a time would be 284k Python calls;
+        this is two array passes per edge.
+        """
+        m = self.costmap
+        h, w, res = m.info.height, m.info.width, m.info.resolution
+        ox, oy = m.info.origin.position.x, m.info.origin.position.y
+        mask = np.zeros((h, w), dtype=bool)
+        poly = np.asarray(self.polygon, dtype=float)
+        if poly.shape[0] < 3:
+            return mask
+        c0 = max(0, int((poly[:, 0].min() - ox) / res))
+        c1 = min(w, int((poly[:, 0].max() - ox) / res) + 2)
+        r0 = max(0, int((poly[:, 1].min() - oy) / res))
+        r1 = min(h, int((poly[:, 1].max() - oy) / res) + 2)
+        if c1 <= c0 or r1 <= r0:
+            return mask
+        xs = ox + (np.arange(c0, c1) + 0.5) * res
+        ys = oy + (np.arange(r0, r1) + 0.5) * res
+        gx, gy = np.meshgrid(xs, ys)
+        inside = np.zeros(gx.shape, dtype=bool)
+        x1, y1 = poly[-1]
+        for x2, y2 in poly:
+            if y1 != y2:
+                crosses = (y1 > gy) != (y2 > gy)
+                xint = (x2 - x1) * (gy - y1) / (y2 - y1) + x1
+                inside ^= crosses & (gx < xint)
+            x1, y1 = x2, y2
+        mask[r0:r1, c0:c1] = inside
+        return mask
+
+    def _line_of_sight(self, xs, ys, target, solid, info):
+        """Clear straight line from each of (xs, ys) to target? Vectorised.
+
+        Unknown cells do NOT block sight - not having looked somewhere is the
+        whole reason to go and look. Only mapped obstacle does.
+        """
+        tx, ty = target
+        res = info.resolution
+        far = float(np.max(np.hypot(xs - tx, ys - ty))) if xs.size else 0.0
+        n = int(max(16, min(400, far / res)))
+        t = np.linspace(0.0, 1.0, n)[None, :]
+        px = xs[:, None] + (tx - xs[:, None]) * t
+        py = ys[:, None] + (ty - ys[:, None]) * t
+        cols = ((px - info.origin.position.x) / res).astype(np.int32)
+        rows = ((py - info.origin.position.y) / res).astype(np.int32)
+        inside = ((cols >= 0) & (cols < info.width)
+                  & (rows >= 0) & (rows < info.height))
+        np.clip(cols, 0, info.width - 1, out=cols)
+        np.clip(rows, 0, info.height - 1, out=rows)
+        return ~(solid[rows, cols] & inside).any(axis=1)
+
+    def _frontier_goal(self):
+        """Somewhere to fly to in order to SEE ground we cannot yet judge.
+
+        Needed because planning only over confirmed ground is safe but, on its
+        own, quietly incomplete. Legs are planned only where the drone can
+        prove it can get to, and from the near side of a rock it can never
+        prove anything about the far side - so it would search the near half,
+        report itself finished, and silently abandon ground that is in fact
+        wide open. Measured on this world's rock ridge: 369 m2 of clear ground
+        past the ridge, never looked at.
+
+        So when the confirmed sweep runs out and part of the area is still
+        unverified, the drone flies to the edge of what it knows, nearest to
+        the ground in question, and looks from there. That grows the confirmed
+        region, _review_map() notices and replans, and the cycle repeats until
+        the ground is either searched or proved to be rock. Standard
+        frontier-driven exploration, aimed at the operator's area.
+
+        Returns (x, y) in the planning frame, or None if there is nothing left
+        worth going to look at.
+        """
+        if self.confirmed is None or self.possible is None or self.costmap is None:
+            return None
+        here = self._lookup_robot_xy()
+        if here is None:
+            return None
+        unverified = self.possible & ~self.confirmed
+        if not unverified.any():
+            return None
+
+        m = self.costmap
+        res = m.info.resolution
+        ox, oy = m.info.origin.position.x, m.info.origin.position.y
+
+        # Only worth going to look if the ground in question is inside the
+        # area the operator drew. Unverified ground elsewhere is not our job.
+        wanted = unverified & self._polygon_mask_costmap()
+        if not wanted.any():
+            return None
+        wr, wc = np.nonzero(wanted)
+        wx = ox + (wc + 0.5) * res
+        wy = oy + (wr + 0.5) * res
+        nearest = int(np.argmin(np.hypot(wx - here[0], wy - here[1])))
+        target = (wx[nearest], wy[nearest])
+
+        # The frontier is where confirmed ground touches unverified ground:
+        # the places that, stood on, turn unknown into known. Note this uses
+        # ALL the unverified ground, not just the part inside the area - to
+        # see round a rock the drone usually has to step outside the box.
+        edge = ndimage.binary_dilation(unverified) & self.confirmed
+        if not edge.any():
+            return None
+        er, ec = np.nonzero(edge)
+        ex = ox + (ec + 0.5) * res
+        ey = oy + (er + 0.5) * res
+
+        # Somewhere we are not already standing, or this would pick the
+        # drone's own position and learn nothing, over and over.
+        away = np.hypot(ex - here[0], ey - here[1]) > 1.0
+        if not away.any():
+            return None
+        ex, ey = ex[away], ey[away]
+
+        # Nor anywhere already looked from. Some ground can never be settled
+        # however long you stare at it - the inside of a rock is unverifiable
+        # by definition, since no vantage point outside can see in - and
+        # without this the drone ping-pongs between two neighbouring frontier
+        # cells until it runs out of replans.
+        if self.looked_from:
+            sep = float(self.get_parameter('vantage_min_separation').value)
+            fresh = np.ones(ex.shape, dtype=bool)
+            for lx, ly in self.looked_from:
+                fresh &= np.hypot(ex - lx, ey - ly) > sep
+            if not fresh.any():
+                return None
+            ex, ey = ex[fresh], ey[fresh]
+
+        # Now the test that makes this terminate: a vantage point is only
+        # worth flying to if the ground in question can actually be SEEN from
+        # it. The inside of a rock cannot be seen from anywhere outside it, so
+        # without this the drone works its way along the frontier for ever,
+        # hop after hop, learning nothing - measured at 14 wasted hops after
+        # the search was already complete.
+        grid, info = self._costmap_grid()
+        solid = grid >= self.get_parameter('obstacle_cost_threshold').value
+        rng = float(self.get_parameter('sensor_range').value)
+
+        # Try the nearest unverified ground first, then a spread of the rest:
+        # one pocket being invisible does not mean they all are.
+        order = np.argsort(np.hypot(wx - here[0], wy - here[1]))
+        probes = order[np.linspace(0, order.size - 1,
+                                   min(order.size, 12)).astype(int)]
+        for i in probes:
+            target = (wx[i], wy[i])
+            reach = np.hypot(ex - target[0], ey - target[1])
+            near = reach <= rng
+            if not near.any():
+                continue
+            seen = self._line_of_sight(ex[near], ey[near], target, solid, info)
+            if not seen.any():
+                continue                      # nothing can see this pocket
+            cx, cy = ex[near][seen], ey[near][seen]
+            best = int(np.argmin(np.hypot(cx - target[0], cy - target[1])))
+            return float(cx[best]), float(cy[best])
+        return None
+
+    def _write_off_unverified(self):
+        """Stop counting ground that has been shown to be uncheckable.
+
+        Only called once every vantage point has been exhausted, so this is a
+        conclusion rather than a guess - and it is reported to the operator in
+        square metres at the same time, never applied quietly.
+        """
+        if self.possible is None or self.confirmed is None:
+            return
+        gone = self.inside_mask & self._project(self.possible) \
+            & ~self._project(self.confirmed)
+        if self.unverifiable is None:
+            self.unverifiable = gone
+        else:
+            self.unverifiable = self.unverifiable | gone
+        self._refresh_searchable()
+
+    def _unverified_cells(self):
+        """Coverage cells inside the area that cannot yet be called either way.
+
+        Reachable if the unseen ground turns out to be clear, but not
+        confirmed reachable across ground the lidar has actually looked at.
+        This is what tells "the area is rock" apart from "we have not looked
+        at the area yet", which are very different things to report.
+        """
+        if self.possible is None or self.confirmed is None:
+            return 0
+        maybe = self._project(self.possible)
+        sure = self._project(self.confirmed)
+        return int(np.count_nonzero(self.inside_mask & maybe & ~sure))
+
+    def _review_map(self):
+        """Re-derive what is reachable, and replan when the answer changes.
+
+        This is what keeps the verdict honest, and it is the whole reason the
+        no-go list could be deleted. Whether ground is reachable is a belief
+        about where the drone has been able to look, so it is recomputed from
+        the live map instead of remembered: ground written off on the approach
+        is picked up again the moment the drone can see round the obstacle,
+        and ground that turns out to be rock drops out of the search.
+
+        It also makes the first plan harmless. The path is built about a
+        second after the operator draws the area, while the drone is still on
+        the pad with its lidar at 0.2 m - a map that has little to do with
+        what it will see at survey height. That plan no longer has to be
+        right, because this corrects it as soon as there is a real map.
+        """
+        if not self.area_set or not self.planned or self.replanning:
+            return
+        if self.paused():
+            return
+        if float(self.get_parameter('map_review_period').value) <= 0:
+            return
+        if not self.get_parameter('avoid_obstacles').value:
+            return
+        if not self.get_parameter('drop_unreachable').value or self.costmap is None:
+            return
+        here = self._lookup_robot_xy()
+        if here is None:
+            return
+        confirmed = self._confirmed_from(here)
+        if confirmed is None:
+            return
+        self.confirmed = confirmed
+        self.possible = self._reachable_from(here)
+
+        # Measured over the area the operator drew, NOT over what is left to
+        # search: using the outstanding cells would fall as the drone flew and
+        # trigger a replan on ordinary progress.
+        reachable = int(np.count_nonzero(
+            self.inside_mask & self._project(confirmed)))
+        if self.plan_reachable_cells is None:
+            self.plan_reachable_cells = reachable
+            return
+
+        change = reachable - self.plan_reachable_cells
+        denom = max(1, self.cells_in_shape)
+        if abs(change) / denom < float(self.get_parameter('map_review_fraction').value):
+            return
+        cap = int(self.get_parameter('max_map_replans').value)
+        if self.map_replans >= cap:
+            self.plan_reachable_cells = reachable   # stop re-reporting it
+            self.get_logger().warn(
+                f'What is reachable has changed again, but this area has '
+                f'already been replanned from the map {cap} times - flying '
+                f'the current path out instead.')
+            return
+
+        self.map_replans += 1
+        area = abs(change) * self.coverage_resolution ** 2
+        opened = 'opened up' if change > 0 else 'turned out to be blocked'
+        self.get_logger().info(
+            f'The map has changed what is reachable: {area:.0f} m2 of the '
+            f'search area has {opened} since this path was planned. '
+            f'Replanning over what is reachable now (map replan '
+            f'{self.map_replans}/{cap}).')
+
+        # Reuses the same route as an abandoned waypoint: cancel what is in
+        # flight, then rebuild the remaining sweep keeping searched ground.
+        self._replan_is_map_driven = True
+        self._replan_wanted = True
+        if self.goal_handle is not None:
+            self.timed_out = True
+            self.goal_handle.cancel_goal_async()
+        elif self.busy:
+            self.timed_out = True        # dealt with when the goal resolves
+        else:
+            self._after_abandoned_goal()
 
     def _is_reachable(self, x, y, reached):
         """Look one point up in the grid from _reachable_from."""
