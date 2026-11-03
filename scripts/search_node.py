@@ -37,7 +37,7 @@ from rclpy.node import Node
 from rclpy.qos import QoSDurabilityPolicy, QoSProfile, QoSReliabilityPolicy
 # ColorRGBA lets us colour each waypoint individually (done vs still to do).
 # Empty carries no data - it is just a "this happened" signal for the courier.
-from std_msgs.msg import Bool, ColorRGBA, Empty
+from std_msgs.msg import Bool, ColorRGBA, Empty, String
 # tf2_ros answers "where is the drone right now?" by reading the transform tree.
 import tf2_ros
 # Marker = one drawing in RViz. MarkerArray = several sent together.
@@ -58,6 +58,20 @@ COVER_TO_DO = 0         # in the area, reachable, not swept yet
 COVER_UNVERIFIED = 25   # in the area, never confirmed reachable: UNKNOWN
 COVER_BLOCKED = 50      # in the area, obstacle or walled off with no way in
 COVER_SEARCHED = 100    # the camera has been over it
+
+# What the scout says it is doing, published on search_status as
+# "STATE|detail". Without this the operator watches the green path vanish and
+# the drone fly off out of the box with no way to tell a finished search from
+# a look-around trip from a crash - which is exactly how it read.
+ST_IDLE = 'IDLE'                  # no search area drawn yet
+ST_PLANNING = 'PLANNING'          # waiting on camera or costmap, or planning
+ST_SEARCHING = 'SEARCHING'        # flying sweep legs
+ST_LOOKING = 'LOOKING'            # flying to a vantage point to get a view
+ST_RETURNING = 'RETURNING'        # search done, flying back to base
+ST_COMPLETE = 'COMPLETE'          # finished and home
+ST_HOLD = 'HOLD'                  # paused on a contact
+ST_ESTOP = 'ESTOP'                # operator stop
+ST_UNSEARCHABLE = 'UNSEARCHABLE'  # nothing in the area can be flown
 
 
 def rotate_points(points, angle):
@@ -470,6 +484,10 @@ class SearchNode(Node):
         # world, so it cannot go stale in the way "that ground is
         # unreachable" did.
         self.looked_from = []
+        # Which waypoint (if any) is a go-and-look trip rather than a sweep
+        # leg, so the operator can be told which one the drone is flying.
+        self.vantage_index = None
+        self.returning = False
         # Coverage cells written off as impossible to check: unverified, with
         # no vantage point anywhere that can see them. Kept out of the
         # coverage total, or the percentage would stall short of 100% for ever
@@ -654,6 +672,11 @@ class SearchNode(Node):
                               reliability=QoSReliabilityPolicy.RELIABLE,
                               durability=QoSDurabilityPolicy.TRANSIENT_LOCAL)
         self.path_pub = self.create_publisher(Path, 'search_path', path_qos)
+        # Latched: a ground station started or restarted later still learns
+        # what the scout is doing instead of showing nothing.
+        self.status_pub = self.create_publisher(String, 'search_status', path_qos)
+        self.status_state = None
+        self.status_detail = ''
         self.coverage_timer = self.create_timer(0.5, self.update_coverage)
 
         # Report the footprint periodically rather than once at startup: at
@@ -743,6 +766,8 @@ class SearchNode(Node):
         # A new area starts with a clean slate.
         self.plan_reachable_cells = None
         self.map_replans = 0
+        self.returning = False
+        self.vantage_index = None
         self.looked_from = []
         self.unverifiable = None
         self.unverified_at_vantage = None
@@ -1066,6 +1091,10 @@ class SearchNode(Node):
                     'has already been searched. Sweep complete.')
                 self.sweep_complete_pub.publish(Empty())
             else:
+                self._set_status(
+                    ST_UNSEARCHABLE,
+                    'nothing in the area can be reached - draw an area that '
+                    'includes open ground')
                 self.get_logger().error(
                     'SEARCH AREA NOT SEARCHABLE: every part of it is either '
                     'inside an obstacle or walled off with no way in, so there '
@@ -1117,6 +1146,7 @@ class SearchNode(Node):
             self.points.append(vantage)
             self.looked_from.append(vantage)
             self.home_index = None
+            self.vantage_index = len(self.points) - 1
             self.get_logger().info(
                 f'{unseen:.0f} m2 of the area cannot be judged reachable or '
                 f'not from here. Ending this pass at ({vantage[0]:.1f}, '
@@ -1135,6 +1165,8 @@ class SearchNode(Node):
                 # Writing it off is also what makes the percentage honest. It
                 # is reported separately above rather than silently dropped.
                 self._write_off_unverified()
+        if vantage is None:
+            self.vantage_index = None
         if vantage is None and self.get_parameter('return_to_spawn').value:
             self.points.append((0.0, 0.0))
             self.home_index = len(self.points) - 1
@@ -1195,8 +1227,14 @@ class SearchNode(Node):
         if self.pending_area is not None:  # drawn before takeoff, see on_area_request
             self.on_area_request(self.pending_area)
         if not self.area_set:  # nothing to search until the operator draws it
+            self._set_status(ST_IDLE, 'draw a search area to start')
             return
         if self.paused():
+            if self.estopped:
+                self._set_status(ST_ESTOP, 'operator stop - press RESUME')
+            else:
+                self._set_status(ST_HOLD,
+                                 'paused on a contact - confirm or dismiss it')
             return
         if self.busy: #goal is already in flight
             self._check_stalled()
@@ -1214,14 +1252,70 @@ class SearchNode(Node):
             self._after_abandoned_goal()
             return
         # Plan on the first tick that has camera data, not in __init__.
-        if not self.planned and not self.plan_sweep():
-            return
+        if not self.planned:
+            self._set_status(ST_PLANNING, 'working out the search path')
+            if not self.plan_sweep():
+                return
         if self.index>= len(self.points):
+            self._maybe_return_home()
             return
         if not self.nav_client.server_is_ready(): #NAv2 sevrer not up yet
             self.get_logger().info('Waiting for Nav2 to be ready...')
             return
         self.send_goal(self.points[self.index])
+
+    def _maybe_return_home(self):
+        """Fly back to base once the search is genuinely finished.
+
+        A pass that ends on a go-and-look trip deliberately gets no home
+        waypoint, because the run is meant to carry on after the look. But if
+        coverage completes DURING that trip nothing ever planned again, so the
+        drone was left parked wherever the last look took it - out by the
+        rock, no path drawn, nothing commanding it. That reads as a crash, and
+        it is the state the operator was left staring at.
+        """
+        if self.returning or not self.get_parameter('return_to_spawn').value:
+            if self.status_state not in (ST_COMPLETE, ST_RETURNING):
+                self._set_status(ST_COMPLETE, self._coverage_summary())
+            return
+        here = self._lookup_robot_xy()
+        if here is not None and math.hypot(here[0], here[1]) <= 2.0:
+            self._set_status(ST_COMPLETE, self._coverage_summary())
+            self.returning = True        # home already; nothing to fly
+            return
+        # Only once there is nothing left to go and look at. Otherwise the map
+        # review is still expected to reopen the search, and flying home now
+        # would abandon ground that is about to become reachable.
+        if (self.get_parameter('avoid_obstacles').value
+                and self.get_parameter('drop_unreachable').value
+                and self._frontier_goal() is not None):
+            return
+        self.returning = True
+        self.points = [(0.0, 0.0)]
+        self.index = 0
+        self.home_index = 0
+        self.vantage_index = None
+        self.planned = True
+        self.busy = False
+        self._publish_path()
+        self._set_status(ST_RETURNING, f'search finished - {self._coverage_summary()}')
+        self.get_logger().info(
+            f'Search finished ({self._coverage_summary()}). Flying back to base.')
+
+    def _coverage_summary(self):
+        """One short phrase for the operator: progress and any gap."""
+        if not self.cells_to_search:
+            return 'nothing searchable'
+        swept = int(np.count_nonzero((self.coverage > 0) & self.inside_mask))
+        pct = 100.0 * swept / self.cells_to_search
+        gap = 0
+        in_shape = getattr(self, 'in_shape_mask', None)
+        if in_shape is not None:
+            gap = int(np.count_nonzero(in_shape & ~self.inside_mask))
+        area = gap * self.coverage_resolution ** 2
+        if area >= 0.5:
+            return f'{pct:.0f}% of reachable area, {area:.0f} m2 not checked'
+        return f'{pct:.0f}% of the area'
 
     def _now(self):
         """Seconds from the node's own clock, so this follows sim time."""
@@ -1378,6 +1472,8 @@ class SearchNode(Node):
         self.planned = False
         self.index = 0
         self.home_index = None
+        self.vantage_index = None
+        self.returning = False       # the search is open again
         self.busy = False
 
     def send_goal (self, point):
@@ -1396,6 +1492,22 @@ class SearchNode(Node):
         # An angle as a quaternion. For a flat 2D turn, only z and w matter.
         goal.pose.pose.orientation.z = math.sin(yaw / 2.0)
         goal.pose.pose.orientation.w = math.cos(yaw / 2.0)
+
+        # Tell the operator which kind of trip this is. A go-and-look leg
+        # takes the drone outside the search area with no sweep pattern to
+        # draw, which is indistinguishable from a fault unless it is named.
+        if self.returning:
+            self._set_status(ST_RETURNING, 'flying back to base')
+        elif self.vantage_index is not None and self.index == self.vantage_index:
+            self._set_status(
+                ST_LOOKING,
+                f'no view of part of the area yet - moving to '
+                f'({x:.0f}, {y:.0f}) to see it, then replanning')
+        else:
+            legs = (self.vantage_index if self.vantage_index is not None
+                    else len(self.points))
+            self._set_status(ST_SEARCHING,
+                             f'waypoint {self.index + 1} of {legs}')
 
         self.busy = True
         # Progress tracking, not a stopwatch on the whole leg.
@@ -1787,6 +1899,22 @@ class SearchNode(Node):
                 f'Camera info received: {self.cam_width}x{self.cam_height}, '
                 f'FOV {math.degrees(hfov):.1f} x {math.degrees(vfov):.1f} degrees.'
             )
+
+    def _set_status(self, state, detail=''):
+        """Say what the scout is doing, once per change.
+
+        Published rather than logged because the operator is watching the
+        map, not the terminal. The whole point is that "the green path
+        disappeared and the drone flew out of the box" should read as
+        LOOKING - going to get a view of ground it could not judge - and not
+        as a crash.
+        """
+        if state == self.status_state and detail == self.status_detail:
+            return
+        self.status_state, self.status_detail = state, detail
+        msg = String()
+        msg.data = f'{state}|{detail}'
+        self.status_pub.publish(msg)
 
     def _costmap_callback(self, msg):
         """Keep the latest costmap so the planner can ask what is blocked."""

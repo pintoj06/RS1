@@ -46,11 +46,18 @@ def search(search_node):
             self.points = [(0, 0)] * 6
             self.busy = False
             self._replan_wanted = False
+            self.returning = False
+            self.vantage_index = None
+            self.statuses = []
             self.timed_out = False
             self.rejections = 0
             self.ticks = 0
             self.advanced = 0
             self.get_logger = FakeLogger
+
+        def _set_status(self, state, detail=''):
+            # tick() reports what the scout is doing; nothing here reads it.
+            pass
 
         def tick(self):
             # Only counts calls; the real tick returns early when paused().

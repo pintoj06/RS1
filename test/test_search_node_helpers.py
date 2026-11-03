@@ -389,6 +389,10 @@ def fake_review(search_node):
                 observation_gap_fill=0.0,
             )
 
+        def _set_status(self, state, detail=''):
+            self.statuses.append((state, detail))
+            self.status_state, self.status_detail = state, detail
+
         def paused(self):
             return self.holding or self.estopped
 
@@ -847,7 +851,8 @@ def planning_node(search_node):
                       '_build_inside_mask', '_refresh_searchable',
                       '_predicted_coverage', '_already_searched',
                       '_camera_fov', '_camera_altitude', '_footprint_radius',
-                      'plan_sweep', '_review_map', '_publish_coverage'):
+                      'plan_sweep', '_review_map', '_publish_coverage',
+                      '_maybe_return_home', '_coverage_summary'):
             locals()[_name] = getattr(SearchNode, _name)
         del _name
         # Still a staticmethod here, or self would be passed as its first
@@ -885,6 +890,11 @@ def planning_node(search_node):
             self.coverage = np.zeros((self.cov_rows, self.cov_cols), dtype=np.int8)
             self.cells_in_shape = 0
             self.map_frame = 'parrot1_odom'
+            self.statuses = []
+            self.status_state = None
+            self.status_detail = ''
+            self.returning = False
+            self.vantage_index = None
             self.last_coverage_log = 0.0
             from builtin_interfaces.msg import Time as _T
             self.get_clock = lambda: SimpleNamespace(
@@ -914,6 +924,10 @@ def planning_node(search_node):
 
         def _lookup_robot_xy(self):
             return self.at
+
+        def _set_status(self, state, detail=''):
+            self.statuses.append((state, detail))
+            self.status_state, self.status_detail = state, detail
 
         def get_logger(self):
             node = self
@@ -1294,12 +1308,20 @@ class TestPendingReplanAlwaysRuns:
                 self.holding = self.estopped = False
                 self.busy = False
                 self._replan_wanted = False
+                self.returning = False
+                self.vantage_index = None
+                self.statuses = []
+                self.status_state = None
+                self.status_detail = ''
                 self.index = 0
                 self.points = [(1.0, 1.0)]
                 self.replanned = 0
                 self.stall_checks = 0
                 self.sent = []
                 self.nav_client = SimpleNamespace(server_is_ready=lambda: True)
+
+            def _set_status(self, state, detail=''):
+                self.statuses.append((state, detail))
 
             def paused(self):
                 return self.holding or self.estopped
@@ -1566,3 +1588,155 @@ class TestSpeckleFilter:
         node = planning_node(self.box(), grid)
         assert node.blocked_mask.sum() > 20, 'a real obstacle was filtered away'
         assert not node.inside_mask[node.blocked_mask].any()
+
+
+class TestSaysWhatItIsDoing:
+    """The scout flew out of the search area with the green path gone and
+    nothing on screen to say why. From the operator's seat a finished search,
+    a go-and-look trip and a crash all looked identical. Each one now names
+    itself on search_status.
+    """
+
+    def box(self):
+        return [(0.0, 0.0), (20.0, 0.0), (20.0, 20.0), (0.0, 20.0)]
+
+    def flyable(self, node, search_node):
+        """Give the fake just enough to let the real send_goal run."""
+        node.goal_best_dist = None
+        node.goal_progress_at = node.goal_sent_at = node.last_recheck = 0.0
+        node.goal_leg_length = 0.0
+        node.rejections = 0
+        node._now = lambda: 0.0
+        node.nav_client = SimpleNamespace(
+            send_goal_async=lambda g: SimpleNamespace(
+                add_done_callback=lambda cb: None))
+        node.goal_response = lambda f: None
+        node.send_goal = search_node.SearchNode.send_goal.__get__(node)
+
+    def test_a_look_around_trip_is_named(self, planning_node, search_node):
+        """The one that mattered: a single waypoint outside the search area,
+        with no sweep pattern to draw. It has to announce itself as LOOKING,
+        or it is indistinguishable from the drone wandering off."""
+        grid = make_costmap(60, 60, resolution=0.5, origin=(-5.0, -5.0))
+        fill_rect(grid, 0, 60, 30, 60, -1)       # top half never observed
+        node = planning_node(self.box(), grid)
+        assert node.plan_sweep() is True
+        assert node.vantage_index == len(node.points) - 1
+        self.flyable(node, search_node)
+        node.index = node.vantage_index
+        node.send_goal(node.points[node.index])
+        assert node.status_state == search_node.ST_LOOKING
+        assert 'see it' in node.status_detail, node.status_detail
+
+    def test_a_sweep_leg_is_named_searching(self, planning_node, search_node):
+        grid = make_costmap(60, 60, resolution=0.5, origin=(-5.0, -5.0))
+        fill_rect(grid, 0, 60, 30, 60, -1)
+        node = planning_node(self.box(), grid)
+        node.plan_sweep()
+        self.flyable(node, search_node)
+        node.index = 0
+        node.send_goal(node.points[0])
+        assert node.status_state == search_node.ST_SEARCHING
+        assert 'waypoint 1' in node.status_detail
+
+    def test_the_way_home_is_named_returning(self, planning_node, search_node):
+        grid = make_costmap(60, 60, resolution=0.5, origin=(-5.0, -5.0))
+        node = planning_node(self.box(), grid)
+        node.plan_sweep()
+        self.flyable(node, search_node)
+        node.returning = True
+        node.index = 0
+        node.send_goal((0.0, 0.0))
+        assert node.status_state == search_node.ST_RETURNING
+
+    def test_no_vantage_means_no_vantage_index(self, planning_node):
+        grid = make_costmap(60, 60, resolution=0.5, origin=(-5.0, -5.0))
+        node = planning_node(self.box(), grid)
+        node.plan_sweep()
+        assert node.vantage_index is None
+        assert node.points[-1] == (0.0, 0.0)         # home instead
+
+    def test_unsearchable_area_says_so(self, planning_node, search_node):
+        grid = make_costmap(60, 60, resolution=0.5, origin=(-5.0, -5.0),
+                            fill=LETHAL)
+        fill_rect(grid, 0, 4, 0, 4, 0)
+        node = planning_node(self.box(), grid)
+        node.at = (-4.0, -4.0)
+        node.plan_sweep()
+        assert search_node.ST_UNSEARCHABLE in [st for st, _ in node.statuses]
+
+
+class TestReturnsHome:
+    """The run used to end wherever the last look-around trip left the drone -
+    out by the rock, no path drawn, nothing commanding it, which reads as a
+    crash. A pass ending on a vantage point gets no home waypoint on purpose,
+    because the run is meant to carry on; but when coverage completed DURING
+    that trip, nothing ever planned again.
+    """
+
+    def box(self):
+        return [(0.0, 0.0), (20.0, 0.0), (20.0, 20.0), (0.0, 20.0)]
+
+    def finished(self, planning_node):
+        grid = make_costmap(60, 60, resolution=0.5, origin=(-5.0, -5.0))
+        node = planning_node(self.box(), grid)
+        node.plan_sweep()
+        node.coverage[:, :] = 100          # everything swept
+        node.at = (18.0, 18.0)             # parked out at the far corner
+        node.index = len(node.points)      # plan flown out
+        return node
+
+    def test_flies_home_when_finished(self, planning_node, search_node):
+        node = self.finished(planning_node)
+        node._maybe_return_home()
+        assert node.returning
+        assert node.points == [(0.0, 0.0)]
+        assert node.home_index == 0
+        assert node.index == 0
+        assert node.planned
+        assert search_node.ST_RETURNING in [st for st, _ in node.statuses]
+
+    def test_does_not_go_home_while_there_is_somewhere_left_to_look(
+            self, planning_node):
+        """Flying home now would abandon ground that is about to become
+        reachable - the map review is still expected to reopen the search."""
+        grid = make_costmap(60, 60, resolution=0.5, origin=(-5.0, -5.0))
+        fill_rect(grid, 0, 60, 30, 60, -1)
+        node = planning_node(self.box(), grid)
+        node.plan_sweep()
+        node.coverage[:, :] = 100
+        node.at = (10.0, 10.0)
+        node.index = len(node.points)
+        node.returning = False
+        node._maybe_return_home()
+        assert not node.returning, 'went home with unverified ground left'
+
+    def test_already_home_reports_complete(self, planning_node, search_node):
+        node = self.finished(planning_node)
+        node.at = (0.5, 0.5)
+        node._maybe_return_home()
+        assert search_node.ST_COMPLETE in [st for st, _ in node.statuses]
+        assert node.points != [(0.0, 0.0)] or node.index != 0
+
+    def test_only_goes_home_once(self, planning_node):
+        node = self.finished(planning_node)
+        node._maybe_return_home()
+        node.points = []
+        node._maybe_return_home()
+        assert node.points == []          # not replanned a second time
+
+    def test_respects_return_to_spawn_false(self, planning_node, search_node):
+        node = self.finished(planning_node)
+        node.get_parameter.values['return_to_spawn'] = False
+        node._maybe_return_home()
+        assert not node.returning
+        assert search_node.ST_COMPLETE in [st for st, _ in node.statuses]
+
+    def test_the_summary_mentions_the_gap(self, planning_node):
+        grid = make_costmap(60, 60, resolution=0.5, origin=(-5.0, -5.0))
+        fill_rect(grid, 20, 36, 20, 30, LETHAL)
+        node = planning_node(self.box(), grid)
+        node.plan_sweep()
+        node.coverage[:, :] = 100
+        text = node._coverage_summary()
+        assert 'not checked' in text, text

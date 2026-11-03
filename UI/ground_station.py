@@ -243,6 +243,11 @@ class GroundStationNode(Node):
         self.coverage_gap_reason = ""                    # and why
         # Planned sweep route, in the map frame once transformed.
         self.search_path: List[Tuple[float, float]] = []
+        # What the scout says it is doing. Without it the operator watches the
+        # green path vanish and the drone fly out of the box with no way to
+        # tell a finished search from a look-around trip from a crash.
+        self.search_state: Optional[str] = None
+        self.search_detail = ""
 
         self.drone_xy: Optional[Tuple[float, float]] = None
         self.drone_yaw = 0.0
@@ -284,6 +289,7 @@ class GroundStationNode(Node):
                               reliability=QoSReliabilityPolicy.RELIABLE,
                               durability=QoSDurabilityPolicy.TRANSIENT_LOCAL)
         self.create_subscription(Path, "search_path", self._on_path, path_qos)
+        self.create_subscription(String, "search_status", self._on_status, path_qos)
 
         self.decision_pub = self.create_publisher(String, "operator/decision", 10)
 
@@ -520,6 +526,16 @@ class GroundStationNode(Node):
             self.coverage_gap_reason = "enclosed by terrain"
         else:
             self.coverage_gap_reason = ""
+
+    def _on_status(self, msg) -> None:
+        """Store the scout's own account of what it is doing.
+
+        Sent as "STATE|detail" so the state can drive the colour while the
+        detail carries the specifics (which waypoint, how far off, why).
+        """
+        state, _, detail = msg.data.partition("|")
+        self.search_state = state.strip() or None
+        self.search_detail = detail.strip()
 
     def _on_path(self, msg: Path):
         """Store the scout's planned sweep, shifted into this map's frame.
@@ -929,6 +945,19 @@ class MapPage(QWidget):
         # The planned sweep, under the trail so the line the drone actually
         # flew reads on top of the one it meant to. Where the route jumps
         # around an obstacle the gap is visible, which is the point.
+        # A go-and-look trip has no sweep pattern to draw - often a single
+        # waypoint, outside the search area - so the green path legitimately
+        # disappears. Draw the leg from the drone to it in amber instead, or
+        # it reads as the drone flying off for no reason.
+        if (self.show_path and self.node.search_state == "LOOKING"
+                and self.node.search_path and self.node.drone_xy is not None):
+            a = self._world_to_widget(*self.node.drone_xy)
+            b = self._world_to_widget(*self.node.search_path[-1])
+            p.setPen(QPen(QColor(ALERT), 2, Qt.DotLine))
+            p.drawLine(a, b)
+            p.setBrush(QColor(ALERT))
+            p.drawEllipse(b, 4, 4)
+
         if self.show_path and len(self.node.search_path) > 1:
             pts = [self._world_to_widget(x, y) for x, y in self.node.search_path]
             p.setPen(QPen(QColor(PLANNED), 2, Qt.DashLine))
@@ -974,6 +1003,23 @@ class MapPage(QWidget):
         # How much of the searchable ground has been swept. The one number
         # that answers "is this area done?", so it stays on screen rather than
         # living only in the search node's terminal.
+        # What the scout is doing, in its own words. The single most useful
+        # line on the screen: it is what tells "finished" apart from "gone to
+        # get a view" apart from "something has broken".
+        STATE_COLOUR = {
+            "SEARCHING": CONFIRM, "LOOKING": ALERT, "RETURNING": TEXT,
+            "COMPLETE": CONFIRM, "HOLD": ALERT, "ESTOP": ALERT,
+            "UNSEARCHABLE": ALERT, "PLANNING": MUTED, "IDLE": MUTED,
+        }
+        if self.node.search_state and not self.draw_mode:
+            p.setFont(QFont("DejaVu Sans Mono", 11, QFont.Bold))
+            p.setPen(QColor(STATE_COLOUR.get(self.node.search_state, TEXT)))
+            p.drawText(18, 28, self.node.search_state)
+            if self.node.search_detail:
+                p.setFont(QFont("DejaVu Sans Mono", 9))
+                p.setPen(QColor(MUTED))
+                p.drawText(18, 44, self.node.search_detail[:68])
+
         if self.show_coverage and self.node.coverage_percent is not None:
             p.setFont(QFont("DejaVu Sans Mono", 10, QFont.Bold))
             done = self.node.coverage_percent >= 99.5
