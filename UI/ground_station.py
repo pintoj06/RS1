@@ -56,8 +56,9 @@ from cv_bridge import CvBridge
 import cv2
 import yaml
 
-from PyQt5.QtCore import QPointF, QRectF, Qt, QTimer
-from PyQt5.QtGui import (QColor, QFont, QImage, QKeySequence, QPainter, QPen,
+from PyQt5.QtCore import QPoint, QPointF, QRect, QRectF, QSize, Qt, QTimer
+from PyQt5.QtGui import (QColor, QFont, QImage, QKeySequence, QPainter,
+                         QPainterPath, QPen,
                          QPixmap)
 from PyQt5.QtWidgets import (QApplication, QFrame, QGridLayout, QHBoxLayout,
                              QLabel, QListWidget, QListWidgetItem,
@@ -1320,6 +1321,219 @@ class ContactsPage(QWidget):
 
 
 # ---------------------------------------------------------------------------
+# Tutorial
+# ---------------------------------------------------------------------------
+@dataclass
+class TutorialStep:
+    title: str
+    body: str
+    # Returns the widgets to highlight; empty means a centred box with no
+    # highlight (welcome and summary steps).
+    targets: Callable[[], List[QWidget]] = lambda: []
+    # Page to show while this step is up, so page-specific labels (the right
+    # column) say what the text describes.
+    page: Optional[int] = None
+
+
+def place_callout(target: Optional[QRect], box: QSize, bounds: QRect,
+                  gap: int = 16) -> QPoint:
+    """Top-left for a callout box of size `box` next to `target`, inside
+    `bounds`. Tries right, left, below, then above the target and takes the
+    first side with room; centres it if there is no target or no room."""
+    if target is None:
+        return QPoint(bounds.center().x() - box.width() // 2,
+                      bounds.center().y() - box.height() // 2)
+    cy = target.center().y() - box.height() // 2
+    cx = target.center().x() - box.width() // 2
+    candidates = [
+        QPoint(target.right() + gap, cy),
+        QPoint(target.left() - gap - box.width(), cy),
+        QPoint(cx, target.bottom() + gap),
+        QPoint(cx, target.top() - gap - box.height()),
+    ]
+    for p in candidates:
+        r = QRect(p, box)
+        # Sideways only needs horizontal room (the clamp below fixes y);
+        # above/below only needs vertical room.
+        if bounds.left() <= r.left() and r.right() <= bounds.right() and \
+                bounds.top() <= r.top() + box.height() // 2 and \
+                r.bottom() - box.height() // 2 <= bounds.bottom():
+            break
+    else:
+        p = QPoint(bounds.center().x() - box.width() // 2,
+                   bounds.center().y() - box.height() // 2)
+    x = min(max(p.x(), bounds.left()), bounds.right() - box.width())
+    y = min(max(p.y(), bounds.top()), bounds.bottom() - box.height())
+    return QPoint(x, y)
+
+
+class TutorialOverlay(QWidget):
+    """Guided tour: dims the window, outlines one control at a time and pops
+    a small box beside it saying what it does.
+
+    Covers the whole window, so clicks can't reach the bezels underneath
+    while the operator is reading. Highlight is CONFIRM cyan, never ALERT:
+    the yellow-green stays reserved for an unruled contact.
+    """
+
+    def __init__(self, parent: QWidget, steps: List[TutorialStep],
+                 on_page: Callable[[int], None], on_close: Callable[[], None]):
+        super().__init__(parent)
+        self.steps = steps
+        self.index = 0
+        self._on_page = on_page
+        self._on_close = on_close
+        self.setFocusPolicy(Qt.StrongFocus)
+
+        self.box = QFrame(self)
+        self.box.setFixedWidth(360)
+        self.box.setStyleSheet(
+            f"QFrame {{ background:{PANEL}; border:2px solid {CONFIRM}; "
+            f"border-radius:4px; }}"
+            f"QLabel {{ border:none; background:transparent; }}")
+        lay = QVBoxLayout(self.box)
+        lay.setContentsMargins(16, 14, 16, 12)
+        lay.setSpacing(8)
+
+        self.step_label = QLabel()
+        self.step_label.setFont(QFont("DejaVu Sans Mono", 8))
+        self.step_label.setStyleSheet(f"color:{MUTED};")
+        lay.addWidget(self.step_label)
+
+        self.title_label = QLabel()
+        f = QFont("DejaVu Sans Mono", 12)
+        f.setBold(True)
+        self.title_label.setFont(f)
+        self.title_label.setStyleSheet(f"color:{CONFIRM};")
+        self.title_label.setWordWrap(True)
+        lay.addWidget(self.title_label)
+
+        self.body_label = QLabel()
+        self.body_label.setFont(QFont("DejaVu Sans", 10))
+        self.body_label.setStyleSheet(f"color:{TEXT};")
+        self.body_label.setWordWrap(True)
+        self.body_label.setTextFormat(Qt.RichText)
+        lay.addWidget(self.body_label)
+
+        buttons = QHBoxLayout()
+        buttons.setSpacing(8)
+        self.close_btn = self._button("CLOSE", MUTED, self.finish)
+        self.back_btn = self._button("◀ BACK", TEXT, self.back)
+        self.next_btn = self._button("NEXT ▶", CONFIRM, self.next)
+        buttons.addWidget(self.close_btn)
+        buttons.addStretch(1)
+        buttons.addWidget(self.back_btn)
+        buttons.addWidget(self.next_btn)
+        lay.addLayout(buttons)
+
+        self.hint = QLabel("← → to move, Esc to close. Space still E-Stops.")
+        self.hint.setFont(QFont("DejaVu Sans Mono", 8))
+        self.hint.setStyleSheet(f"color:{MUTED};")
+        lay.addWidget(self.hint)
+
+        self._hole: Optional[QRect] = None
+
+    def _button(self, text: str, tone: str, handler) -> QPushButton:
+        b = QPushButton(text)
+        b.setCursor(Qt.PointingHandCursor)
+        b.setFocusPolicy(Qt.NoFocus)
+        b.setFont(QFont("DejaVu Sans Mono", 9, QFont.Bold))
+        b.setMinimumHeight(32)
+        b.setStyleSheet(f"""
+            QPushButton {{ background:{BEZEL}; color:{tone};
+                           border:1px solid {LINE}; border-radius:2px;
+                           padding:2px 12px; }}
+            QPushButton:hover {{ border-color:{tone}; }}
+        """)
+        b.clicked.connect(handler)
+        return b
+
+    # -- navigation --------------------------------------------------------
+    def start(self):
+        self.index = 0
+        self.setGeometry(self.parentWidget().rect())
+        self.show()
+        self.raise_()
+        self.setFocus()
+        self._show_step()
+
+    def next(self):
+        if self.index >= len(self.steps) - 1:
+            self.finish()
+        else:
+            self.index += 1
+            self._show_step()
+
+    def back(self):
+        if self.index > 0:
+            self.index -= 1
+            self._show_step()
+
+    def finish(self):
+        self.hide()
+        self._on_close()
+
+    def keyPressEvent(self, event):
+        key = event.key()
+        if key in (Qt.Key_Right, Qt.Key_Return, Qt.Key_Enter):
+            self.next()
+        elif key == Qt.Key_Left:
+            self.back()
+        elif key == Qt.Key_Escape:
+            self.finish()
+        else:
+            super().keyPressEvent(event)
+
+    # -- drawing -----------------------------------------------------------
+    def _target_rect(self, widgets: List[QWidget]) -> Optional[QRect]:
+        rect = None
+        for w in widgets:
+            if w is None or not w.isVisible():
+                continue
+            r = QRect(w.mapTo(self.parentWidget(), QPoint(0, 0)), w.size())
+            rect = r if rect is None else rect.united(r)
+        return rect.adjusted(-6, -6, 6, 6) if rect is not None else None
+
+    def _show_step(self):
+        step = self.steps[self.index]
+        if step.page is not None:
+            self._on_page(step.page)
+        last = self.index == len(self.steps) - 1
+        self.step_label.setText(f"TUTORIAL  {self.index + 1} / {len(self.steps)}")
+        self.title_label.setText(step.title)
+        self.body_label.setText(step.body)
+        self.back_btn.setEnabled(self.index > 0)
+        self.next_btn.setText("DONE ✓" if last else "NEXT ▶")
+        self.reposition()
+
+    def reposition(self):
+        """Lay out for the current step. Also called on window resize."""
+        if not self.isVisible():
+            return
+        self.setGeometry(self.parentWidget().rect())
+        self._hole = self._target_rect(self.steps[self.index].targets())
+        self.box.adjustSize()
+        bounds = self.rect().adjusted(12, 12, -12, -12)
+        self.box.move(place_callout(self._hole, self.box.size(), bounds))
+        self.update()
+
+    def paintEvent(self, _event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        shade = QPainterPath()
+        shade.addRect(QRectF(self.rect()))
+        if self._hole is not None:
+            hole = QPainterPath()
+            hole.addRoundedRect(QRectF(self._hole), 6, 6)
+            shade = shade.subtracted(hole)
+        p.fillPath(shade, QColor(0, 0, 0, 165))
+        if self._hole is not None:
+            p.setPen(QPen(QColor(CONFIRM), 3))
+            p.setBrush(Qt.NoBrush)
+            p.drawRoundedRect(QRectF(self._hole), 6, 6)
+
+
+# ---------------------------------------------------------------------------
 # Main window
 # ---------------------------------------------------------------------------
 class MainWindow(QMainWindow):
@@ -1370,6 +1584,12 @@ class MainWindow(QMainWindow):
         self._build_layout()
         self._build_shortcuts()
         self.select_page(PAGE_MAP)
+
+        self._page_before_tutorial = PAGE_MAP
+        self.tutorial = TutorialOverlay(self, self._tutorial_steps(),
+                                        on_page=self._tutorial_page,
+                                        on_close=self._close_tutorial)
+        self.tutorial.hide()
 
         # 20 Hz is plenty for a human. Sensor data arrives faster; there is no
         # reason for the interface to chase it.
@@ -1438,6 +1658,7 @@ class MainWindow(QMainWindow):
 
     def _status_strip(self) -> QWidget:
         bar = QFrame()
+        bar.setObjectName("status_strip")     # the tutorial highlights it
         bar.setStyleSheet(f"background:{PANEL}; border:1px solid {LINE};")
         row = QHBoxLayout(bar)
         row.setContentsMargins(14, 8, 14, 8)
@@ -1478,22 +1699,186 @@ class MainWindow(QMainWindow):
         self.link_label.setFont(QFont("DejaVu Sans Mono", 10))
         self.link_label.setStyleSheet(f"color:{MUTED}; border:none; padding-left:24px;")
         row.addWidget(self.link_label)
+
+        # Up here rather than in a bezel slot: it is on every page and
+        # doesn't take a function slot away from the display.
+        row.addSpacing(24)
+        self.help_button = QPushButton("? HELP")
+        self.help_button.setCursor(Qt.PointingHandCursor)
+        self.help_button.setFocusPolicy(Qt.NoFocus)   # see BezelButton
+        self.help_button.setFont(QFont("DejaVu Sans Mono", 9, QFont.Bold))
+        self.help_button.setStyleSheet(f"""
+            QPushButton {{ background:{BEZEL}; color:{CONFIRM};
+                           border:1px solid {CONFIRM}; border-radius:2px;
+                           padding:3px 12px; }}
+            QPushButton:hover {{ background:{CONFIRM}; color:{BEZEL}; }}
+        """)
+        self.help_button.clicked.connect(self.open_tutorial)
+        row.addWidget(self.help_button)
         return bar
 
     def _build_shortcuts(self):
-        for i, key in enumerate(["1", "2", "3", "4"]):
-            QShortcut(QKeySequence(key), self, lambda n=i: self.select_page(n))
+        # Every shortcut but the E-Stop goes in this list, so the tutorial can
+        # switch them off while it is open: a stray R while reading must not
+        # launch the drones. Space stays live everywhere.
+        self._shortcuts: List[QShortcut] = []
+
+        def key(seq, handler):
+            self._shortcuts.append(QShortcut(QKeySequence(seq), self, handler))
+
+        for i, k in enumerate(["1", "2", "3", "4"]):
+            key(k, lambda n=i: self.select_page(n))
         for i in range(RIGHT_SLOTS):
-            QShortcut(QKeySequence(f"F{i+1}"), self,
-                      lambda n=i: self._press_right(n))
-        QShortcut(QKeySequence("Q"), self, lambda: self._rule("CONFIRMED"))
-        QShortcut(QKeySequence("W"), self, lambda: self._rule("DISMISSED"))
-        QShortcut(QKeySequence("R"), self, self.node.launch)
+            key(f"F{i+1}", lambda n=i: self._press_right(n))
+        key("Q", lambda: self._rule("CONFIRMED"))
+        key("W", lambda: self._rule("DISMISSED"))
+        key("R", self.node.launch)
         QShortcut(QKeySequence("Space"), self, lambda: self.node.set_estop(True))
         # Fake contact for testing the interface; keyboard only.
-        QShortcut(QKeySequence("E"), self, self._simulate_contact)
+        key("E", self._simulate_contact)
         # Escape stands down an armed area draw without setting one.
-        QShortcut(QKeySequence("Escape"), self, self._cancel_draw)
+        key("Escape", self._cancel_draw)
+        key("H", self.open_tutorial)
+
+    # -- tutorial ----------------------------------------------------------
+    def _tutorial_steps(self) -> List[TutorialStep]:
+        L, R, B = self.left_buttons, self.right_buttons, self.bottom_buttons
+        k = '<span style="color:%s"><b>%%s</b></span>' % CONFIRM   # key name
+        return [
+            TutorialStep(
+                "Welcome to AeroAid",
+                "This station runs a two-drone search and rescue mission. "
+                "The <b>scout</b> flies a lawnmower search over an area you "
+                "draw, looking for people with a thermal camera and an AI "
+                "(YOLO) camera. You rule on each possible person it finds. "
+                "When you confirm one, the <b>courier</b> flies a care "
+                "package to them.<br><br>This tour shows what every button "
+                "does. Use NEXT and BACK, or the arrow keys."),
+            TutorialStep(
+                "Status strip",
+                "Always visible, whatever page is up.<br>"
+                "• <b>CONTACT n</b> blinks when a possible person needs "
+                "your decision. It is the only thing that blinks.<br>"
+                "• <b>SEARCH HOLD / IR CHECK / E-STOP</b>: why the scout "
+                "is stopped, if it is.<br>"
+                "• <b>AI OK</b>: the person detector is running.<br>"
+                "• <b>LINK OK</b>: data is arriving from the scout.",
+                lambda: [self.findChild(QFrame, "status_strip")]),
+            TutorialStep(
+                "Main display",
+                "Shows the page picked on the left. On the map: the white "
+                "arrow is the scout and its trail, the green line is the "
+                "planned search route, cyan shading is ground already "
+                "searched, and markers are contacts.",
+                lambda: [self.stack], PAGE_MAP),
+            TutorialStep(
+                f"MAP  ({k % '1'})",
+                "The overview: map, scout position, search area and "
+                "contacts. The left column picks the page and never changes, "
+                "so you can hit it without looking.",
+                lambda: [L[0]], PAGE_MAP),
+            TutorialStep(
+                f"VIS  ({k % '2'})",
+                "The scout's camera with the AI's boxes drawn on:<br>"
+                "• <span style='color:#00FF00'><b>green</b></span>: a "
+                "person, fully in view. Only these can raise a contact.<br>"
+                "• <span style='color:#FFFF00'><b>yellow (entering)</b></span>: "
+                "a person still at the edge of the frame.<br>"
+                "• <span style='color:#FFBF00'><b>amber (ignored)</b></span>: "
+                "a kangaroo or wombat. Shown, but never a contact.",
+                lambda: [L[1]]),
+            TutorialStep(
+                f"IR  ({k % '3'})",
+                "The thermal camera. Bright means warm. Body heat makes the "
+                "scout stop and look with the AI camera; a contact needs "
+                "<b>both</b> heat and the AI seeing a person.",
+                lambda: [L[2]]),
+            TutorialStep(
+                f"CNTCT  ({k % '4'})",
+                "Every contact and its ruling. The number is how many there "
+                "are; the label lights up when one is waiting for you. "
+                "This page also has <b>RESUME</b>, which restarts the search "
+                "after you confirm someone.",
+                lambda: [L[3]]),
+            TutorialStep(
+                f"Map tools  ({k % 'F1'}–{k % 'F7'})",
+                "The right column changes with the page; these are the map's.<br>"
+                "• <b>TRAIL</b>: show or hide the scout's flight path.<br>"
+                "• <b>CNTCT</b>: show or hide contact markers.<br>"
+                "• <b>PIP</b>: a small camera picture over the map.<br>"
+                "• <b>ZOOM+ / ZOOM-</b>: zoom the map.<br>"
+                "• <b>AERIAL</b>: the aerial photo under the map.<br>"
+                "A boxed label means that option is on.",
+                lambda: [b for b in R if b.text()], PAGE_MAP),
+            TutorialStep(
+                f"SET AREA  ({k % 'F6'})",
+                "Step one of every mission. Press it, then drag a box on the "
+                "map over the ground to search. You can do this before "
+                "launch. Press again (<b>CLR AREA</b>) to clear it, or "
+                f"{k % 'Esc'} to cancel while drawing.",
+                lambda: [R[5]], PAGE_MAP),
+            TutorialStep(
+                f"LAUNCH  ({k % 'R'})",
+                "Lifts both drones off the ute. The scout climbs and flies "
+                "the search area. It changes to <b>AIRBORNE</b> and can't be "
+                "undone: the drones don't land back on the ute.",
+                lambda: [B[2]]),
+            TutorialStep(
+                f"CONFIRM  ({k % 'Q'})",
+                "When CONTACT blinks, the scout holds still and the camera "
+                "pages freeze on what it saw. If it is a person, CONFIRM: "
+                "the courier flies the care package to them. The scout keeps "
+                "holding until you press RESUME on the CNTCT page.",
+                lambda: [B[0]]),
+            TutorialStep(
+                f"DISMISS  ({k % 'W'})",
+                "Not a person? DISMISS. The scout carries on, and that same "
+                "object won't be raised again, even when the scout passes "
+                "over it on a later row.",
+                lambda: [B[1]]),
+            TutorialStep(
+                f"E-STOP  ({k % 'Space'})",
+                "Stops <b>every</b> drone where it is, at any time. Space "
+                "works on every page, even with this tour open. Only a "
+                "click on <b>RESUME</b> (the same button) restarts them, so "
+                "a stray key can never set them moving.",
+                lambda: [self.estop_button]),
+            TutorialStep(
+                "Running a mission",
+                "<b>1.</b> SET AREA and drag a box over the search ground.<br>"
+                "<b>2.</b> LAUNCH.<br>"
+                "<b>3.</b> Watch the map. When CONTACT blinks, check VIS "
+                "and IR.<br>"
+                "<b>4.</b> CONFIRM a person, or DISMISS anything else.<br>"
+                "<b>5.</b> After a confirm, open CNTCT and press RESUME to "
+                "search on.<br><br>"
+                f"Press ? HELP or {k % 'H'} to see this tour again.",
+                page=PAGE_MAP),
+        ]
+
+    def open_tutorial(self):
+        if self.tutorial.isVisible():
+            return
+        self._page_before_tutorial = self.page
+        for s in self._shortcuts:
+            s.setEnabled(False)
+        self.tutorial.start()
+
+    def _tutorial_page(self, page: int):
+        self.select_page(page)
+        # Relabel now, not on the next refresh tick, so the step highlights
+        # this page's buttons rather than the last page's.
+        self._sync_bezels()
+
+    def _close_tutorial(self):
+        for s in self._shortcuts:
+            s.setEnabled(True)
+        self.select_page(self._page_before_tutorial)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, "tutorial"):
+            self.tutorial.reposition()
 
     # -- page plumbing -----------------------------------------------------
     def select_page(self, index: int):
