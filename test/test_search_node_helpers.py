@@ -612,6 +612,8 @@ def fake_frontier(search_node):
         _in_obstacle_shadow = SearchNode._in_obstacle_shadow
         _shadowed_mask = SearchNode._shadowed_mask
         _lines_clear = SearchNode._lines_clear
+        _shadowed_mask = SearchNode._shadowed_mask
+        _lines_clear = SearchNode._lines_clear
         _frontier_goal = SearchNode._frontier_goal
 
         def __init__(self):
@@ -1955,8 +1957,15 @@ class TestPathIsOnlyTheSweep:
 
 
 class TestObstacleShadow:
-    """Unknown ground behind mapped obstacle - in practice the inside of a
-    rock - must not be chased, and must not be drawn as "not checked yet".
+    """Which unknown ground sits behind the mapped face of an obstacle.
+
+    Used to ORDER the targets a look-around trip aims at - behind-the-face
+    ground last - and for nothing else. It must not be used to exclude that
+    ground or to colour it "cannot check": measured on a live costmap, the
+    test caught only 32% of an actual rock interior while condemning 86% of
+    the genuinely open ground north of the ridge. From one side the inside of
+    a rock and open ground beyond it are the same thing to the map, so no
+    local test can separate them - the information is not there.
 
     It was both. The optimistic flood counts unknown as free, so until a rock
     is mapped all the way round that flood gets into its interior round the
@@ -2048,3 +2057,50 @@ class TestObstacleShadow:
         assert node._shadowed_mask() is first      # same object, not recomputed
         node.costmap = self.rock_with_a_hollow()   # a new message
         assert node._shadowed_mask() is not first
+
+
+class TestShadowOnlyOrdersTargets:
+    """The shadow test must never write ground off.
+
+    Measured on a live costmap: used as an exclusion it condemned 86% of the
+    open ground north of the ridge - exactly the ground the look-around trips
+    exist to recover - while catching only 32% of the rock interior it was
+    aimed at. It survives as a preference and nothing more.
+    """
+
+    UNKNOWN = -1
+
+    def test_shadowed_ground_is_still_a_valid_target(self, fake_frontier):
+        """A search area lying ENTIRELY behind the mapped face, with a way
+        round at one end. Every target in it is shadowed, so if shadowing
+        excluded targets there would be nothing to aim at and the ground
+        would be abandoned - when the drone can in fact reach it by going
+        round, which is the whole point of a look-around trip.
+        """
+        grid = make_costmap(30, 30, resolution=1.0)
+        fill_rect(grid, 0, 30, 15, 30, self.UNKNOWN)
+        fill_rect(grid, 10, 30, 14, 15, LETHAL)   # wall, open at x < 10
+        fake_frontier.costmap = grid
+        fake_frontier.polygon = [(12.0, 16.0), (28.0, 16.0),
+                                 (28.0, 28.0), (12.0, 28.0)]
+        fake_frontier.flood()
+        g2, info = fake_frontier._costmap_grid()
+        solid = g2 >= INSCRIBED
+        assert fake_frontier._in_obstacle_shadow(20.5, 20.5, solid, info), \
+            'test needs the area to be behind the mapped face'
+        assert fake_frontier._frontier_goal() is not None, \
+            'ground behind the face was written off, not deprioritised'
+
+    def test_unshadowed_ground_is_preferred(self, fake_frontier):
+        """With a gap at one end, the reachable side should be aimed at
+        first - that is what cut the hopping along the rock face."""
+        grid = make_costmap(30, 30, resolution=1.0)
+        fill_rect(grid, 0, 30, 15, 30, self.UNKNOWN)
+        fill_rect(grid, 10, 30, 14, 15, LETHAL)      # wall, open at x < 10
+        fake_frontier.costmap = grid
+        fake_frontier.polygon = [(0.0, 0.0), (30.0, 0.0), (30.0, 30.0), (0.0, 30.0)]
+        fake_frontier.flood()
+        goal = fake_frontier._frontier_goal()
+        assert goal is not None
+        # the open end is at low x; the chosen vantage should be over that side
+        assert goal[0] < 15.0, f'aimed at the blocked side first: {goal}'

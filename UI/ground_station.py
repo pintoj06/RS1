@@ -99,8 +99,7 @@ COVERED     = (90, 225, 230, 70)   # RGBA, drawn over the map
 # edge of the map - on one flight that hid 478 of 619 unpainted cells.
 TO_DO       = (90, 225, 230, 22)   # reachable, not swept yet — barely there
 UNVERIFIED  = (235, 165, 40, 90)   # never confirmed reachable — AMBER, loud
-BLOCKED_GND = (120, 120, 120, 70)  # obstacle, walled off, or hidden behind
-                                   # one — grey, inert: nothing to decide
+BLOCKED_GND = (120, 120, 120, 70)  # obstacle or walled off — grey, inert
 PLANNED     = "#00FF88"            # planned sweep route — bright green.
                                    # Kept clear of ALERT's yellow-green so
                                    # an unruled contact still reads as the

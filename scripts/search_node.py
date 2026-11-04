@@ -2435,13 +2435,19 @@ class SearchNode(Node):
         order = np.argsort(np.hypot(wx - here[0], wy - here[1]))
         probes = order[np.linspace(0, order.size - 1,
                                    min(order.size, 12)).astype(int)]
+        # Try targets NOT behind the mapped face first, then the rest.
+        # Ordering, not exclusion: a cell behind the face is as likely to be
+        # open ground beyond a rock as the inside of one, and skipping it
+        # wrote off ground the drone could have reached by going round.
+        # Preferring the others still spends the early trips where they are
+        # most likely to pay, which is what cut the hopping along the face.
+        shadowed = self._shadowed_mask()
+        if shadowed is not None:
+            lit = ~shadowed[wr[probes], wc[probes]]
+            probes = np.concatenate([probes[lit], probes[~lit]])
+
         for i in probes:
             target = (wx[i], wy[i])
-            # Skip ground hidden behind mapped obstacle - in practice the
-            # inside of a rock. Going to look at it from outside teaches
-            # nothing, and it is what had the drone hopping along the face.
-            if self._in_obstacle_shadow(target[0], target[1], solid_now, info_now):
-                continue
             reach = np.hypot(ex - target[0], ey - target[1])
             near = reach <= rng
             if not near.any():
@@ -2773,19 +2779,14 @@ class SearchNode(Node):
             unverified |= (in_shape & ~blocked
                            & ~self._project(self.confirmed))
 
-        # Unknown ground behind mapped obstacle is not "not checked yet" -
-        # it is ground we cannot get a look at, and in practice it is the
-        # inside of a rock. Drawing it amber alongside ground that really is
-        # still worth a look overstated what the drone was going to do about
-        # it. Grey says "cannot check", which is the honest reading.
-        shadowed = self._shadowed_mask()
-        hidden = (self._project(shadowed, default=False)
-                  if shadowed is not None
-                  else np.zeros_like(in_shape))
-
+        # Unknown ground stays amber even when it sits behind the mapped
+        # face, because "behind the face" does not mean "cannot check": from
+        # one side, the inside of a rock and open ground beyond it are the
+        # same thing to the map. Colouring it grey claimed otherwise and
+        # measured 86% of the open ground north of the ridge condemned.
         published[in_shape] = COVER_UNVERIFIED
         published[in_shape & ~unverified] = COVER_TO_DO
-        published[blocked | (in_shape & unverified & hidden)] = COVER_BLOCKED
+        published[blocked] = COVER_BLOCKED
         published[in_shape & (self.coverage > 0)] = COVER_SEARCHED
         published = published.astype(np.int8)
         # OccupancyGrid data is a flat row-major list, same order as the array.
