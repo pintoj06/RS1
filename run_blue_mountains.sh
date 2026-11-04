@@ -48,12 +48,13 @@ HEADLESS=${HEADLESS:-false}
 # Where the casualty (person1) stands. One of these is picked at random each
 # run, with a random yaw, so the search is not always solving the same
 # problem. The first is person1's pose in worlds/large_demo.sdf. z is the
-# terrain height there. PERSON_SPOT=0..5 picks one instead of random.
+# terrain height there. PERSON_SPOT=0..4 picks one instead of random.
+# (11.46, 34.25) was dropped: the ground there is 9.7 m up, above the
+# courier's 9 m flight height, so it could never get there to deliver.
 PERSON_SPOTS=(
     "-6.36 -3.07 0.08"
     "-6.36 18.12 0.63"
     "-3.7 34.25 5.45"
-    "11.46 34.25 9.69"
     "42.37 20.97 0.23"
     "36.2 1.04 -1.12"
 )
@@ -200,7 +201,7 @@ All five stages started ($TERM_KIND).
   Both drones are sitting on the ute. In the ground station:
     1. SET AREA, then drag a box on the map (the aerial photo is shown
        until SLAM starts).
-    2. LAUNCH (bottom right, or R). The drones climb to 10 m and 8 m,
+    2. LAUNCH (bottom right, or R). The drones climb to 10 m and 9 m,
        SLAM and Nav2 come up, and the scout flies the search area.
 
   Check it worked:   ros2 node list

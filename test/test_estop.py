@@ -48,6 +48,10 @@ def search(search_node):
             self._replan_wanted = False
             self.returning = False
             self.vantage_index = None
+            self.edge_look_index = None
+            self.edge_back_index = None
+            self._dwell_until = None
+            self._goal_superseded = False
             self.statuses = []
             self.timed_out = False
             self.rejections = 0
@@ -134,6 +138,7 @@ def courier(courier_node):
     class FakeCourier:
         on_estop = CourierNode.on_estop
         goal_finished = CourierNode.goal_finished
+        release = CourierNode.release
 
         def __init__(self):
             self.estopped = False
@@ -141,12 +146,13 @@ def courier(courier_node):
             self.busy = True
             self.sent = True
             self.target = (5.0, 5.0)
-            self.released = 0
+            self.released = False       # the node's own flag
+            self.drops = 0              # how many times the package went
             self.release_pub = SimpleNamespace(publish=lambda _: self._release())
             self.get_logger = FakeLogger
 
         def _release(self):
-            self.released += 1
+            self.drops += 1
 
         def tick(self):
             CourierNode.tick(self)
@@ -159,7 +165,7 @@ class TestCourier:
         courier.on_estop(Bool(data=True))
         assert courier.goal_handle.cancelled
         courier.goal_finished(result(GoalStatus.STATUS_CANCELED))
-        assert courier.released == 0
+        assert courier.drops == 0
         assert not courier.busy
         assert not courier.sent           # so it is flown again on RESUME
 
@@ -174,7 +180,7 @@ class TestCourier:
 
     def test_normal_arrival_still_releases(self, courier):
         courier.goal_finished(result(GoalStatus.STATUS_SUCCEEDED))
-        assert courier.released == 1
+        assert courier.drops == 1
 
 
 @pytest.fixture

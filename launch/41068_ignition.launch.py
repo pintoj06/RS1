@@ -539,9 +539,9 @@ def generate_launch_description():
         # standard Parrot (see care_package_dims in care_package.urdf.xacro).
         z=PythonExpression(["'1.31' if ", large_courier, " else '1.16'"]),
         spawn_delay=9.0,
-        # 2 m below the scout. The drone has gravity off and Nav2 only
+        # 1 m below the scout. The drone has gravity off and Nav2 only
         # drives it in x/y, so it holds this height for the whole flight.
-        takeoff_altitude=8.0,
+        takeoff_altitude=9.0,
         # The courier carries the care package and drops it on the
         # confirmed contact (courier_node.py).
         care_package=PythonExpression(["'large' if ", large_courier, " else 'standard'"]),

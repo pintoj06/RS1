@@ -145,6 +145,11 @@ class YoloPersonDetector(Node):
         self.declare_parameter('publish_annotated', True)
         self.declare_parameter('annotated_topic', 'camera/person_detections_image')
         self.declare_parameter('detections_topic', 'camera/person_detections')
+        # Humans still at the frame edge ("entering"), on their own topic so
+        # they can never raise a contact. The search node reads them to fly
+        # over and get the person fully in view when the sweep would
+        # otherwise pass them by - see _on_edge_detections in search_node.py.
+        self.declare_parameter('edge_detections_topic', 'camera/edge_detections')
         # PyTorch defaults to using every CPU thread on the machine for each
         # inference call. On this shared VM (no GPU - checked earlier this
         # session) that starves everything else: verified live, with no
@@ -211,6 +216,9 @@ class YoloPersonDetector(Node):
         self.ignored_pub = self.create_publisher(
             Detection2DArray, self.get_parameter('ignored_detections_topic').value, 10
         )
+        self.edge_pub = self.create_publisher(
+            Detection2DArray, self.get_parameter('edge_detections_topic').value, 10
+        )
         self.annotated_pub = None
         if self.publish_annotated:
             self.annotated_pub = self.create_publisher(
@@ -263,6 +271,8 @@ class YoloPersonDetector(Node):
         # topic as the detector being down.
         self.detections_pub.publish(self._to_array(msg.header, matches))
         self.ignored_pub.publish(self._to_array(msg.header, ignored))
+        if entering:
+            self.edge_pub.publish(self._to_array(msg.header, entering))
         if matches:
             conf_str = ', '.join(f'{c:.2f}' for _, c, _ in matches)
             self.get_logger().info(f'{len(matches)} detection(s), confidence: {conf_str}')

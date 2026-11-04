@@ -42,6 +42,9 @@ from std_msgs.msg import Bool, ColorRGBA, Empty, String
 import tf2_ros
 # Marker = one drawing in RViz. MarkerArray = several sent together.
 from visualization_msgs.msg import Marker, MarkerArray
+# Boxes from yolo_person_detector.py. Only its edge-of-frame topic is read
+# here; contacts are the ground station's job.
+from vision_msgs.msg import Detection2DArray
 
 # Values published on the search_coverage grid. An OccupancyGrid is int8 and
 # RViz reads 0-100 as occupancy, so these double as sensible colours there.
@@ -67,6 +70,7 @@ ST_IDLE = 'IDLE'                  # no search area drawn yet
 ST_PLANNING = 'PLANNING'          # waiting on camera or costmap, or planning
 ST_SEARCHING = 'SEARCHING'        # flying sweep legs
 ST_LOOKING = 'LOOKING'            # flying to a vantage point to get a view
+ST_INVESTIGATING = 'INVESTIGATING'  # off the sweep to check a person at the frame edge
 ST_RETURNING = 'RETURNING'        # search done, flying back to base
 ST_COMPLETE = 'COMPLETE'          # finished and home
 ST_HOLD = 'HOLD'                  # paused on a contact
@@ -258,6 +262,35 @@ def make_sweep_polygon(polygon, spacing, sweep_angle=None,
     return rotate_points(waypoints, sweep_angle)
 
 
+def pixel_to_ground(u, v, width, height, hfov, altitude, x, y, yaw):
+    """Ground position seen at pixel (u, v) of the downward camera.
+
+    Same model as pixel_to_ground in UI/ground_station.py, which was checked
+    against known positions on the live feed: the camera looks straight down,
+    the top of the image is the drone's forward and the right is its right.
+    """
+    metres_per_px = 2.0 * altitude * math.tan(hfov / 2.0) / width
+    forward = (height / 2.0 - v) * metres_per_px
+    left = (width / 2.0 - u) * metres_per_px
+    c, s = math.cos(yaw), math.sin(yaw)
+    return (x + forward * c - left * s, y + forward * s + left * c)
+
+
+def distance_to_polygon_edge(x, y, polygon):
+    """Shortest distance from (x, y) to the polygon's outline, inside or out."""
+    best = math.inf
+    n = len(polygon)
+    for i in range(n):
+        x1, y1 = polygon[i]
+        x2, y2 = polygon[(i + 1) % n]
+        dx, dy = x2 - x1, y2 - y1
+        length_sq = dx * dx + dy * dy
+        t = 0.0 if length_sq == 0 else max(0.0, min(1.0, (
+            (x - x1) * dx + (y - y1) * dy) / length_sq))
+        best = min(best, math.hypot(x - (x1 + t * dx), y - (y1 + t * dy)))
+    return best
+
+
 def make_sweep(min_x, max_x, min_y, max_y, spacing):
     """Lawnmower pattern over a rectangle.
 
@@ -336,6 +369,9 @@ class SearchNode(Node):
         # world, so it cannot go stale in the way "that ground is
         # unreachable" did.
         self.looked_from = []
+        # Where edge-of-frame sightings have already been flown over and
+        # checked, so the same person-shaped rock is not visited every pass.
+        self.edge_checked = []
         # Coverage cells written off as impossible to check: unverified, with
         # no vantage point anywhere that can see them. Kept out of the
         # coverage total, or the percentage would stall short of 100% for ever
@@ -459,6 +495,11 @@ class SearchNode(Node):
         self.create_subscription(
             CameraInfo, 'camera/camera_info', self._camera_info_callback, 1
         )
+        # People the detector saw cut off by the frame edge. Its
+        # 'edge_detections_topic'; see _on_edge_detections.
+        self.create_subscription(
+            Detection2DArray, 'camera/edge_detections',
+            self._on_edge_detections, 10)
 
         # Nav2's global costmap, read so the sweep can be planned AROUND
         # obstacles rather than through them. It is a fixed, non-rolling map in
@@ -548,6 +589,33 @@ class SearchNode(Node):
         # 20% strip. That margin is what stops small position errors from
         # opening a gap of unseen ground between two legs.
         self.declare_parameter('overlap', 0.8)
+
+        # --- people at the edge of the camera, at the edge of the area ----
+        # The detector does not count a person cut off by the frame edge. In
+        # the middle of the area that is fine - the next leg overlaps this one
+        # and sees them whole - but on a boundary leg there is no next leg, so
+        # a person just over the edge would be passed by for good. There the
+        # drone flies over them, looks, and goes back to where it left the
+        # sweep. See _on_edge_detections.
+        self.declare_parameter('investigate_edges', True)
+        # "At the edge of the area" means the camera sees past the boundary:
+        # the drone is within its footprint radius of it, plus this margin.
+        self.declare_parameter('edge_band_margin', 1.0)          # metres
+        # Never detour further than this. A person at the frame edge is at
+        # most about 7 m off at 10 m altitude, so anything more is a bad
+        # projection rather than somebody to go and look at.
+        self.declare_parameter('edge_max_detour', 10.0)          # metres
+        # How long to hover over them. Long enough for a few YOLO frames (it
+        # runs at single-digit FPS on CPU) and for the ground station's
+        # thermal check to hold the search if there is body heat.
+        self.declare_parameter('edge_dwell_s', 4.0)              # seconds
+        # Stop this far short of the sighting rather than right over it. The
+        # person only has to be well inside the frame, not under the drone:
+        # the thermal camera, the narrower of the two, still sees about 4 m
+        # either side of centre at 10 m, so 2.5 m short keeps them in both.
+        self.declare_parameter('edge_stop_short', 2.5)           # metres
+        # Edge sightings this close to one already checked are the same spot.
+        self.declare_parameter('edge_spot_radius', 3.0)          # metres
 
 
 
@@ -753,6 +821,7 @@ class SearchNode(Node):
         self.plan_reachable_cells = None
         self.map_replans = 0
         self.looked_from = []
+        self.edge_checked = []
         self.unverifiable = None
         self.unverified_at_vantage = None
         self.fruitless_vantages = 0
@@ -1330,6 +1399,18 @@ class SearchNode(Node):
         if self.busy: #goal is already in flight
             self._check_stalled()
             return
+        # Hovering over an edge sighting so the cameras get a proper look.
+        # A person there raises a contact and holds the search through the
+        # ground station as usual; either way, the next waypoint is the way
+        # back to where the drone left the sweep.
+        if self._dwell_until is not None:
+            if self._now() < self._dwell_until:
+                return
+            self._dwell_until = None
+            back = self.points[self.edge_back_index]
+            self.get_logger().info(
+                f'Edge check done. Returning to ({back[0]:.1f}, '
+                f'{back[1]:.1f}) to carry on the sweep.')
         # Carry out a replan that has been asked for. It has to happen here
         # and not only in the goal-result callback: a goal Nav2 REJECTS
         # returns without ever producing a result, so a replan requested
@@ -1372,6 +1453,12 @@ class SearchNode(Node):
         self.replanning = replanning
         self.returning = returning
         self.planned = False
+        # An edge check in progress belongs to the old sequence: its two
+        # waypoints are gone with it. See _on_edge_detections.
+        self.edge_look_index = None
+        self.edge_back_index = None
+        self._dwell_until = None
+        self._goal_superseded = False
 
     def _fly_home(self):
         """Make going home an ordinary one-waypoint pass."""
@@ -1617,6 +1704,15 @@ class SearchNode(Node):
         # draw, which is indistinguishable from a fault unless it is named.
         if self.returning:
             self._set_status(ST_RETURNING, 'flying back to base')
+        elif self.edge_look_index is not None and self.index == self.edge_look_index:
+            self._set_status(
+                ST_INVESTIGATING,
+                f'person at the edge of the camera - moving over '
+                f'({x:.0f}, {y:.0f}) to check')
+        elif self.edge_back_index is not None and self.index == self.edge_back_index:
+            self._set_status(
+                ST_INVESTIGATING,
+                f'checked - back to ({x:.0f}, {y:.0f}) to carry on the sweep')
         elif self.vantage_index is not None and self.index == self.vantage_index:
             self._set_status(
                 ST_LOOKING,
@@ -1683,6 +1779,13 @@ class SearchNode(Node):
         """Stage 3: Nav2 has arrived, failed or given up"""
         self.goal_handle = None
         status = future.result().status
+        if self._goal_superseded:
+            # Cancelled to start an edge check. It may have arrived in the
+            # same instant, but the waypoint now at self.index is the edge
+            # check, so advancing would skip it.
+            self._goal_superseded = False
+            self.busy = False
+            return
         if self.timed_out:
             # We abandoned this one as unreachable. Either replan the rest of
             # the sweep against what the costmap now shows, or just skip it.
@@ -1744,10 +1847,137 @@ class SearchNode(Node):
             # tick() itself stays put if an E-Stop is still on.
             self.tick()
 
+    def _on_edge_detections(self, msg):
+        """A person cut off by the frame edge: go and look if nothing else will.
+
+        Only on a boundary leg. In the middle of the area the next leg
+        overlaps this one and sees them whole, so a detour is wasted flying;
+        at the boundary there is no next leg, and someone standing just past
+        it would never be fully in view. Then the drone flies over them, so
+        the RGB and thermal cameras (whose narrower view sits inside the RGB
+        one) can both see, hovers for edge_dwell_s, and flies back to where
+        it left the sweep. Two ordinary waypoints, so holds, E-Stops and
+        stall checks all work on them unchanged.
+        """
+        if not msg.detections or not self._edge_check_allowed():
+            return
+        best = max(msg.detections,
+                   key=lambda d: max((r.hypothesis.score for r in d.results),
+                                     default=0.0))
+        pose = self._pose_at(msg.header.stamp)
+        here = self._lookup_robot_xy()
+        if pose is None or here is None:
+            return
+        target = self._edge_target(best, pose)
+
+        # "At the edge of the area": the camera sees past the boundary.
+        band = (self._footprint_radius()
+                + float(self.get_parameter('edge_band_margin').value))
+        if distance_to_polygon_edge(here[0], here[1], self.polygon) > band:
+            return
+        radius = float(self.get_parameter('edge_spot_radius').value)
+        if any(math.hypot(target[0] - cx, target[1] - cy) < radius
+               for cx, cy in self.edge_checked):
+            return
+        detour = math.hypot(target[0] - here[0], target[1] - here[1])
+        if detour > float(self.get_parameter('edge_max_detour').value):
+            return
+        # Remembered from here on, even if it is then skipped as blocked, so
+        # a sighting that cannot be checked is not re-reported every frame.
+        self.edge_checked.append(target)
+        short = float(self.get_parameter('edge_stop_short').value)
+        move = max(0.0, detour - short)
+        frac = move / detour if detour > 0 else 0.0
+        look = (here[0] + (target[0] - here[0]) * frac,
+                here[1] + (target[1] - here[1]) * frac)
+        if self.get_parameter('avoid_obstacles').value and self._is_blocked(*look):
+            self.get_logger().info(
+                f'Person at the edge of the camera near ({target[0]:.1f}, '
+                f'{target[1]:.1f}), but the spot to look from is inside a '
+                f'mapped obstacle - not flying there.')
+            return
+        self._start_edge_check(look, here, move)
+
+    def _edge_check_allowed(self):
+        """Is the drone flying ordinary sweep legs it can step off for a bit?"""
+        if not self.get_parameter('investigate_edges').value:
+            return False
+        if not self.area_set or not self.planned or self.paused():
+            return False
+        if self.returning or self.replanning or self._replan_wanted or self.timed_out:
+            return False
+        if self.edge_look_index is not None or self._dwell_until is not None:
+            return False             # one check at a time
+        if self.index >= len(self.points):
+            return False
+        # A goal sent but not yet accepted has no handle to cancel; when it is
+        # accepted it would fly the old waypoint and then advance past the
+        # edge check. The detector sends another frame in well under a second.
+        if self.busy and self.goal_handle is None:
+            return False
+        return True
+
+    def _pose_at(self, stamp):
+        """(x, y, yaw) of the drone when a camera frame was taken, else the
+        latest. The detector runs about a second behind, by which time the
+        drone has moved on."""
+        for when in (rclpy.time.Time.from_msg(stamp), rclpy.time.Time()):
+            try:
+                tf = self.tf_buffer.lookup_transform(
+                    self.map_frame, self.base_frame, when)
+            except Exception:
+                continue
+            q = tf.transform.rotation
+            yaw = math.atan2(2.0 * (q.w * q.z + q.x * q.y),
+                             1.0 - 2.0 * (q.y ** 2 + q.z ** 2))
+            return tf.transform.translation.x, tf.transform.translation.y, yaw
+        return None
+
+    def _edge_target(self, detection, pose):
+        """Where on the ground the detection's box centre is."""
+        hfov, _ = self._camera_fov()
+        width = self.cam_width or float(self.get_parameter('fallback_image_width').value)
+        height = self.cam_height or float(self.get_parameter('fallback_image_height').value)
+        return pixel_to_ground(
+            detection.bbox.center.position.x, detection.bbox.center.position.y,
+            width, height, hfov, self._camera_altitude(), *pose)
+
+    def _start_edge_check(self, target, here, detour):
+        """Step off the sweep: to look at the sighting, then back to here."""
+        at = self.index
+        self.points[at:at] = [target, here]
+        # Everything after the insert has moved along by two.
+        if self.home_index is not None and self.home_index >= at:
+            self.home_index += 2
+        if self.vantage_index is not None and self.vantage_index >= at:
+            self.vantage_index += 2
+        self.edge_look_index = at
+        self.edge_back_index = at + 1
+        self.get_logger().warn(
+            f'Possible person at the edge of the camera, at the edge of the '
+            f'search area. Flying {detour:.1f} m to ({target[0]:.1f}, '
+            f'{target[1]:.1f}) to get them in view, then back to ({here[0]:.1f}, '
+            f'{here[1]:.1f}).')
+        self._publish_path()
+        if self.goal_handle is not None:
+            # goal_finished sees this and leaves the index alone, so the next
+            # tick flies the edge check.
+            self._goal_superseded = True
+            self.goal_handle.cancel_goal_async()
+
     def next_waypoint(self):
         completed_index = self.index
         self.index +=1
         self.busy = False
+        if completed_index == self.edge_look_index:
+            self._dwell_until = self._now() + float(
+                self.get_parameter('edge_dwell_s').value)
+            self._set_status(ST_INVESTIGATING,
+                             'over the edge sighting - looking for a person')
+        elif completed_index == self.edge_back_index:
+            self.get_logger().info('Back on the sweep after the edge check.')
+            self.edge_look_index = None
+            self.edge_back_index = None
         if self.index >=len(self.points):
             if self.home_index is not None and completed_index == self.home_index:
                 self.get_logger().info('Sweep complete and returned to spawn.')

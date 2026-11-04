@@ -1246,7 +1246,8 @@ class MapPage(QWidget):
         # line on the screen: it is what tells "finished" apart from "gone to
         # get a view" apart from "something has broken".
         STATE_COLOUR = {
-            "SEARCHING": CONFIRM, "LOOKING": ALERT, "RETURNING": TEXT,
+            "SEARCHING": CONFIRM, "LOOKING": ALERT, "INVESTIGATING": ALERT,
+            "RETURNING": TEXT,
             "COMPLETE": CONFIRM, "HOLD": ALERT, "ESTOP": ALERT,
             "UNSEARCHABLE": ALERT, "PLANNING": MUTED, "IDLE": MUTED,
         }

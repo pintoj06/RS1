@@ -907,6 +907,10 @@ def planning_node(search_node):
             self.status_detail = ''
             self.returning = False
             self.vantage_index = None
+            self.edge_look_index = None
+            self.edge_back_index = None
+            self._dwell_until = None
+            self._goal_superseded = False
             self.last_coverage_log = 0.0
             self._map_wait_started = None
             self.t = 0.0                # what _now() reads; tests move it
@@ -1332,6 +1336,10 @@ class TestPendingReplanAlwaysRuns:
                 self._replan_wanted = False
                 self.returning = False
                 self.vantage_index = None
+                self.edge_look_index = None
+                self.edge_back_index = None
+                self._dwell_until = None
+                self._goal_superseded = False
                 self.statuses = []
                 self.status_state = None
                 self.status_detail = ''
