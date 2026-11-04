@@ -14,6 +14,7 @@
 #   SIM_WAIT=45 LARGE_COURIER=false ./run_blue_mountains.sh
 #   HEADLESS=true ./run_blue_mountains.sh     no Gazebo window, faster
 #   PERSON_SPOT=3 ./run_blue_mountains.sh     casualty at a fixed spot
+#   NIGHT=true ./run_blue_mountains.sh        dark world, thermal-led search
 
 set -u
 
@@ -44,6 +45,11 @@ SIM_WAIT=${SIM_WAIT:-30}
 # shows the map and both camera feeds; drawing the Blue Mountains scene a
 # second time for the window is a big share of the load on a laptop.
 HEADLESS=${HEADLESS:-false}
+
+# NIGHT=true: a dark world where only the thermal camera can see. Heat holds
+# the search and switches on the scout's floodlight so the RGB detector can
+# confirm (night_mode in UI/ground_station.py).
+NIGHT=${NIGHT:-false}
 
 # Where the casualty (person1) stands. One of these is picked at random each
 # run, with a random yaw, so the search is not always solving the same
@@ -158,6 +164,20 @@ if ! grep -q "<pose>$PERSON_X $PERSON_Y $PERSON_Z 0 0 $PERSON_YAW</pose>" "$WORL
     exit 1
 fi
 
+if [[ "$NIGHT" == true ]]; then
+    echo "     night mode: dark world, scout floodlight on thermal hits"
+    # Near-black ambient and sky, and a sun dimmed to moonlight. Only the
+    # sun's own <light> block is touched.
+    sed -i -e 's|<ambient>.*</ambient>|<ambient>0.03 0.03 0.04 1</ambient>|' \
+        -e 's|<background>.*</background>|<background>0 0 0 1</background>|' \
+        -e '/<light name="sun"/,/<\/light>/{s|<intensity>.*</intensity>|<intensity>0.05</intensity>|}' \
+        "$WORLD_FILE"
+    if ! grep -q "<intensity>0.05</intensity>" "$WORLD_FILE"; then
+        echo "Could not darken $WORLD_FILE - has the sun's <light> changed?" >&2
+        exit 1
+    fi
+fi
+
 echo "1/5  Simulation (Blue Mountains) + scout + courier + Nav2"
 tab "sim" "ros2 launch $PKG 41068_ignition.launch.py \
     world:=$WORLD world_file:=$WORLD_FILE parrot:=true courier:=true \
@@ -169,7 +189,8 @@ sleep "$SIM_WAIT"
 
 echo "2/5  Ground station"
 tab "gui" "ros2 run $PKG ground_station.py --ros-args \
-    -r __ns:=/$SCOUT -p robot_name:=$SCOUT -p aerial_map:=$AERIAL_MAP $TF_REMAP"
+    -r __ns:=/$SCOUT -p robot_name:=$SCOUT -p aerial_map:=$AERIAL_MAP \
+    -p night_mode:=$NIGHT $TF_REMAP"
 
 sleep 2
 

@@ -146,8 +146,20 @@ class TestThermalDetection:
         assert not frame[10, 10].any()
 
     def test_threshold_is_inclusive(self, detect):
-        kelvin = np.full((100, 100), 305.0, dtype=np.float32)
-        assert detect(kelvin, np.zeros((100, 100, 3), np.uint8)) is not None
+        kelvin = np.full((200, 200), 290.0, dtype=np.float32)
+        kelvin[80:120, 80:120] = 305.0            # 1600 px, clear of the edges
+        assert detect(kelvin, np.zeros((200, 200, 3), np.uint8)) is not None
+
+    def test_body_at_frame_edge_is_ignored_until_fully_in_view(self, detect):
+        # The run that prompted this: 604 px of a person just entering the
+        # frame held the search with them at the edge, where the RGB
+        # detector won't count them, so the check timed out and missed them.
+        kelvin = np.full((480, 720), 290.0, dtype=np.float32)
+        kelvin[0:30, 300:340] = 310.0             # 1200 px, cut off at the top
+        assert detect(kelvin, np.zeros((480, 720, 3), np.uint8)) is None
+        kelvin[:] = 290.0
+        kelvin[60:90, 300:340] = 310.0            # same body, fully in view
+        assert detect(kelvin, np.zeros((480, 720, 3), np.uint8)) is not None
 
 
 class TestContactRadius:

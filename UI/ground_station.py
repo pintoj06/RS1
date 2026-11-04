@@ -50,6 +50,7 @@ from geometry_msgs.msg import Point32, PointStamped, PolygonStamped
 from nav_msgs.msg import Odometry, OccupancyGrid, Path
 from sensor_msgs.msg import Image
 from std_msgs.msg import Bool, String
+from ros_gz_interfaces.msg import Light
 from vision_msgs.msg import Detection2DArray
 import tf2_ros
 
@@ -157,6 +158,20 @@ def match_one_to_one(points, anchors, gate: float) -> dict:
     return matched
 
 
+EDGE_MARGIN = 0.05   # fraction of the frame; detector's edge_margin_frac
+
+
+def box_region(mask: np.ndarray, bbox, width: int, height: int,
+               pad: float = 0.25) -> Tuple[slice, slice]:
+    """Rows and columns of the thermal mask under a YOLO box (RGB pixels,
+    image width x height), padded by `pad` of the box size."""
+    sx, sy = mask.shape[1] / width, mask.shape[0] / height
+    cx, cy = bbox.center.position.x, bbox.center.position.y
+    hw, hh = bbox.size_x * (0.5 + pad), bbox.size_y * (0.5 + pad)
+    return (slice(int(max(cy - hh, 0) * sy), int((cy + hh) * sy) + 1),
+            slice(int(max(cx - hw, 0) * sx), int((cx + hw) * sx) + 1))
+
+
 def box_on_heat(mask: Optional[np.ndarray], bbox, width: int, height: int,
                 min_px: int = 20, pad: float = 0.25) -> bool:
     """True if a YOLO box (RGB pixels, image width x height) covers body heat
@@ -170,12 +185,7 @@ def box_on_heat(mask: Optional[np.ndarray], bbox, width: int, height: int,
     """
     if mask is None:
         return False
-    sx, sy = mask.shape[1] / width, mask.shape[0] / height
-    cx, cy = bbox.center.position.x, bbox.center.position.y
-    hw, hh = bbox.size_x * (0.5 + pad), bbox.size_y * (0.5 + pad)
-    x1, x2 = int(max(cx - hw, 0) * sx), int((cx + hw) * sx) + 1
-    y1, y2 = int(max(cy - hh, 0) * sy), int((cy + hh) * sy) + 1
-    return np.count_nonzero(mask[y1:y2, x1:x2]) >= min_px
+    return np.count_nonzero(mask[box_region(mask, bbox, width, height, pad)]) >= min_px
 
 
 @dataclass
@@ -350,6 +360,7 @@ class GroundStationNode(Node):
         # class (kangaroo, wombat) in it. Never raises a contact; only lets
         # an animal's heat signature skip or end the RGB check early.
         self.animal_hit: Optional[Tuple[str, float]] = None
+        self.animal_boxes: list = []     # bboxes from the frame of animal_hit
         self._detections_time = 0.0
         # (peak kelvin, hot pixel count) for the latest frame, None if nothing.
         self.thermal_hit: Optional[Tuple[float, int]] = None
@@ -485,6 +496,18 @@ class GroundStationNode(Node):
         self.hold_pub = self.create_publisher(Bool, "search/hold", hold_qos)
         self.holding = False
         self.hold_pub.publish(Bool(data=False))
+
+        # Night mode (NIGHT=true in run_blue_mountains.sh): the world is dark,
+        # so the scout's floodlight follows the search hold. Heat holds the
+        # search, the light comes on, and the RGB detector can then see what
+        # the thermal camera found; it goes off when the search resumes.
+        self.declare_parameter("night_mode", False)
+        self.night_mode = bool(self.get_parameter("night_mode").value)
+        self.light_pub = self.create_publisher(Light, "flashlight", 10)
+        if self.night_mode:
+            # Re-sent each second: nothing latches on the Gazebo side, so a
+            # message sent before the bridge connects would be lost.
+            self.create_timer(1.0, lambda: self._send_light(self.holding))
 
         # Tells the courier drone where to fly. Transient local so a courier
         # started after the confirm still gets the last confirmed position.
@@ -633,15 +656,32 @@ class GroundStationNode(Node):
                     for d in msg.detections for r in d.results), default=None)
         if best is not None:
             self.animal_hit = (best[1], time.monotonic())
+            self.animal_boxes = [d.bbox for d in msg.detections]
 
     def fresh_animal_only(self) -> Optional[str]:
         """Class name of an animal seen in the last rgb_fresh_s with no human
         seen in that time, else None. A human always wins: an animal next to
-        a person must never stop the person being checked."""
+        a person must never stop the person being checked.
+
+        Also None while there is body heat outside the animals' boxes: that
+        heat is something else (a person the detector hasn't seen yet, e.g.
+        beside the wombat), so the check must carry on."""
         if self.animal_hit is None or self.fresh_rgb_hit() is not None:
             return None
         name, seen = self.animal_hit
-        return name if time.monotonic() - seen < self.rgb_fresh_s else None
+        if time.monotonic() - seen >= self.rgb_fresh_s:
+            return None
+        if self.thermal_mask is not None:
+            if self.rgb_frame is not None:
+                height, width = self.rgb_frame.shape[:2]
+            else:
+                width, height = 720, 480      # parrot.gazebo.xacro rgbd_camera
+            rest = self.thermal_mask.copy()
+            for b in self.animal_boxes:
+                rest[box_region(rest, b, width, height)] = False
+            if np.count_nonzero(rest) >= self.person_min_pixels // 4:
+                return None
+        return name
 
     def detector_alive(self) -> bool:
         return time.monotonic() - self._detections_time < self.detector_stale_s
@@ -679,20 +719,32 @@ class GroundStationNode(Node):
         Each dismissed track claims the one hot blob nearest it (within the
         track gate) and that blob is left out, so the heat of a person the
         operator already ruled out doesn't hold the search again, while
-        anyone else's heat still counts."""
+        anyone else's heat still counts.
+
+        A blob touching the frame edge is left out too: it is a body only
+        partly in view, and holding there leaves the person at the edge of
+        the RGB frame, where the detector rightly won't count them. The
+        search flies on until the whole body is in view."""
         hot = kelvin >= self.person_min_k
-        dismissed = self.tracker.dismissed()
-        if dismissed and stamp is not None and hot.any():
-            n, labels, _, centroids = cv2.connectedComponentsWithStats(
+        if hot.any():
+            n, labels, stats, centroids = cv2.connectedComponentsWithStats(
                 hot.astype(np.uint8))
             h, w = hot.shape
-            blobs = [self.ground_point(centroids[i][0], centroids[i][1],
-                                       w, h, self.thermal_hfov, stamp)
-                     for i in range(1, n)]
-            claimed = match_one_to_one(
-                blobs, [(t.x, t.y) for t in dismissed], self.tracker.gate)
-            for i in claimed:
-                hot[labels == i + 1] = False
+            # Same margin as the detector's edge_margin_frac default.
+            mx, my = EDGE_MARGIN * w, EDGE_MARGIN * h
+            drop = {i for i in range(1, n)
+                    if stats[i][0] < mx or stats[i][1] < my
+                    or stats[i][0] + stats[i][2] > w - mx
+                    or stats[i][1] + stats[i][3] > h - my}
+            dismissed = self.tracker.dismissed()
+            if dismissed and stamp is not None:
+                blobs = [self.ground_point(centroids[i][0], centroids[i][1],
+                                           w, h, self.thermal_hfov, stamp)
+                         for i in range(1, n)]
+                drop |= {i + 1 for i in match_one_to_one(
+                    blobs, [(t.x, t.y) for t in dismissed], self.tracker.gate)}
+            for i in drop:
+                hot[labels == i] = False
         self.thermal_mask = hot
         count = int(np.count_nonzero(hot))
         if count < self.person_min_pixels:
@@ -869,6 +921,32 @@ class GroundStationNode(Node):
         self.holding = hold
         self.hold_pub.publish(Bool(data=hold))
         self.get_logger().info("Search HOLD" if hold else "Search resumed")
+        if self.night_mode:
+            self._send_light(hold)
+
+    def _send_light(self, on: bool):
+        """Switch the scout's floodlight. Gazebo replaces the whole light
+        with this message, so every field must match the <light> in
+        parrot.gazebo.xacro; only the brightness changes."""
+        msg = Light()
+        msg.name = "flashlight"
+        msg.type = Light.SPOT
+        msg.pose.position.z = -0.15
+        msg.direction.z = -1.0
+        level = 1.0 if on else 0.0
+        msg.diffuse.r = msg.diffuse.g = msg.diffuse.b = level
+        msg.diffuse.a = 1.0
+        msg.specular.r = msg.specular.g = msg.specular.b = 0.3 * level
+        msg.specular.a = 1.0
+        msg.range = 40.0
+        msg.attenuation_constant = 0.2
+        msg.attenuation_linear = 0.01
+        msg.attenuation_quadratic = 0.0
+        msg.spot_inner_angle = 1.3
+        msg.spot_outer_angle = 1.6
+        msg.spot_falloff = 1.0
+        msg.intensity = 3.0 * level
+        self.light_pub.publish(msg)
 
     def set_estop(self, stop: bool):
         if stop == self.estopped:

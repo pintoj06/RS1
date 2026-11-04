@@ -300,3 +300,29 @@ class TestRuling:
         c.track_id = track.id
         ground_station.MainWindow._rule(win, "CONFIRMED")
         assert not track.dismissed
+
+
+class TestNightFloodlight:
+    """Night mode: the scout's floodlight follows the search hold."""
+
+    def node(self, ground_station, night):
+        sent = []
+        node = SimpleNamespace(
+            night_mode=night, holding=False, get_logger=FakeLogger,
+            hold_pub=SimpleNamespace(publish=lambda m: None),
+            light_pub=SimpleNamespace(publish=sent.append))
+        cls = ground_station.GroundStationNode
+        node._send_light = lambda on: cls._send_light(node, on)
+        return node, sent, lambda hold: cls.set_hold(node, hold)
+
+    def test_light_on_while_held_off_on_resume(self, ground_station):
+        node, sent, set_hold = self.node(ground_station, night=True)
+        set_hold(True)
+        set_hold(False)
+        assert [m.intensity > 0 for m in sent] == [True, False]
+        assert sent[0].name == 'flashlight' and sent[0].direction.z == -1.0
+
+    def test_day_mode_never_touches_the_light(self, ground_station):
+        node, sent, set_hold = self.node(ground_station, night=False)
+        set_hold(True)
+        assert sent == []
