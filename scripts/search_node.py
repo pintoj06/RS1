@@ -19,7 +19,8 @@ from action_msgs.msg import GoalStatus
 # Point is a plain (x, y, z) location. Markers are built out of lists of these.
 # PolygonStamped carries the search area the operator draws in the ground
 # station: a list of corners plus the frame they were measured in.
-from geometry_msgs.msg import Point, PolygonStamped, PoseStamped
+from geometry_msgs.msg import (Point, PointStamped, PolygonStamped,
+                               PoseStamped)
 from nav2_msgs.action import NavigateToPose
 # OccupancyGrid is the standard ROS "2D grid of values" message. RViz draws it
 # as a coloured overlay, so we use it to show which ground has been searched.
@@ -490,6 +491,13 @@ class SearchNode(Node):
         # Latched: a ground station started or restarted later still learns
         # what the scout is doing instead of showing nothing.
         self.status_pub = self.create_publisher(String, 'search_status', path_qos)
+        # Where the drone is going to look, on its own topic rather than as
+        # the last pose of search_path. It is not a sweep leg and must not be
+        # drawn as one, but the ground station still needs it to show the
+        # trip. Latched, and only drawn while the status says LOOKING, so a
+        # stale value from an earlier plan is never shown.
+        self.vantage_pub = self.create_publisher(
+            PointStamped, 'search_vantage', path_qos)
         self.status_state = None
         self.status_detail = ''
         self.coverage_timer = self.create_timer(0.5, self.update_coverage)
@@ -1172,6 +1180,7 @@ class SearchNode(Node):
             self.looked_from.append(vantage)
             self.home_index = None
             self.vantage_index = len(self.points) - 1
+            self._publish_vantage(vantage)
             self.get_logger().info(
                 f'{unseen:.0f} m2 of the area cannot be judged reachable or '
                 f'not from here. Ending this pass at ({vantage[0]:.1f}, '
@@ -2606,17 +2615,38 @@ class SearchNode(Node):
             return False
         return bool(self.coverage[row, col] > 0)
 
+    def _publish_vantage(self, point):
+        """Tell the ground station where the look-around trip is headed."""
+        msg = PointStamped()
+        msg.header.frame_id = self.map_frame
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.point.x, msg.point.y = float(point[0]), float(point[1])
+        self.vantage_pub.publish(msg)
+
     def _publish_path(self):
-        """Publish the planned sweep so the ground station can draw it.
+        """Publish the planned SWEEP so the ground station can draw it.
 
         Sent once per plan rather than on a timer: the route only changes when
         the sweep is replanned, and the publisher is latched so a ground
         station starting later still receives it.
+
+        The sweep legs only. A trailing go-and-look trip or the leg home is
+        not part of the search pattern and must not be drawn as one: the
+        vantage point sits outside the area by design - 33 m out, in one case
+        - and drawing it in the same green dashes as the lawnmower made it
+        look like a waypoint had been planned miles off target. The trip is
+        reported on search_status while it is flown, and the ground station
+        draws it as its own amber leg.
         """
+        legs = self.points
+        cut = self.vantage_index if self.vantage_index is not None else self.home_index
+        if cut is not None:
+            legs = self.points[:cut]
+
         msg = Path()
         msg.header.frame_id = self.map_frame
         msg.header.stamp = self.get_clock().now().to_msg()
-        for x, y in self.points:
+        for x, y in legs:
             pose = PoseStamped()
             pose.header = msg.header
             pose.pose.position.x = float(x)

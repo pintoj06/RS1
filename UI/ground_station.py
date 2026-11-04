@@ -390,6 +390,10 @@ class GroundStationNode(Node):
         # green path vanish and the drone fly out of the box with no way to
         # tell a finished search from a look-around trip from a crash.
         self.search_state: Optional[str] = None
+        # Where a go-and-look trip is headed. Its own value, not the last pose
+        # of search_path: it is not a sweep leg, and drawing it as one made a
+        # waypoint 33 m outside the area look like a planning fault.
+        self.vantage_xy: Optional[Tuple[float, float]] = None
         self.search_detail = ""
 
         self.drone_xy: Optional[Tuple[float, float]] = None
@@ -441,6 +445,8 @@ class GroundStationNode(Node):
                               durability=QoSDurabilityPolicy.TRANSIENT_LOCAL)
         self.create_subscription(Path, "search_path", self._on_path, path_qos)
         self.create_subscription(String, "search_status", self._on_status, path_qos)
+        self.create_subscription(PointStamped, "search_vantage",
+                                 self._on_vantage, path_qos)
 
         self.decision_pub = self.create_publisher(String, "operator/decision", 10)
 
@@ -768,6 +774,17 @@ class GroundStationNode(Node):
         state, _, detail = msg.data.partition("|")
         self.search_state = state.strip() or None
         self.search_detail = detail.strip()
+
+    def _on_vantage(self, msg) -> None:
+        """Store where the scout is going to look, shifted into this frame."""
+        try:
+            tf = self.tf_buffer.lookup_transform(
+                self.map_frame, msg.header.frame_id,
+                rclpy.time.Time(), timeout=Duration(seconds=0.05))
+        except Exception:
+            return
+        self.vantage_xy = (msg.point.x + tf.transform.translation.x,
+                           msg.point.y + tf.transform.translation.y)
 
     def _on_path(self, msg: Path):
         """Store the scout's planned sweep, shifted into this map's frame.
@@ -1182,9 +1199,10 @@ class MapPage(QWidget):
         # disappears. Draw the leg from the drone to it in amber instead, or
         # it reads as the drone flying off for no reason.
         if (self.show_path and self.node.search_state == "LOOKING"
-                and self.node.search_path and self.node.drone_xy is not None):
+                and self.node.vantage_xy is not None
+                and self.node.drone_xy is not None):
             a = self._world_to_widget(*self.node.drone_xy)
-            b = self._world_to_widget(*self.node.search_path[-1])
+            b = self._world_to_widget(*self.node.vantage_xy)
             p.setPen(QPen(QColor(ALERT), 2, Qt.DotLine))
             p.drawLine(a, b)
             p.setBrush(QColor(ALERT))

@@ -862,6 +862,7 @@ def planning_node(search_node):
                       'plan_sweep', '_blocked_test', '_skip_searched_ground',
                       '_choose_spacing', '_nothing_to_sweep', '_finish_plan',
                       '_log_plan', '_review_map', '_publish_coverage',
+                      '_publish_vantage',
                       '_maybe_return_home', '_after_last_waypoint',
                       '_start_pass', '_fly_home', '_coverage_summary'):
             locals()[_name] = getattr(SearchNode, _name)
@@ -901,6 +902,8 @@ def planning_node(search_node):
             self.coverage = np.zeros((self.cov_rows, self.cov_cols), dtype=np.int8)
             self.cells_in_shape = 0
             self.map_frame = 'parrot1_odom'
+            self.vantages = []
+            self.vantage_pub = SimpleNamespace(publish=self.vantages.append)
             self.statuses = []
             self.status_state = None
             self.status_detail = ''
@@ -1878,3 +1881,66 @@ class TestTinyRemaindersAreNotChased:
         node._nothing_to_sweep()
         assert any('never verified' in m for m in node.logged), node.logged[-3:]
         assert node.unverifiable is not None
+
+
+class TestPathIsOnlyTheSweep:
+    """A waypoint 33 m outside the search area, drawn in the same green
+    dashes as the lawnmower, read as a planning fault. It was the vantage
+    point: a go-and-look trip, published as the last pose of search_path.
+
+    search_path is the sweep legs and nothing else. The trip goes out on its
+    own topic, and the ground station draws it as its own amber leg while the
+    status says LOOKING.
+    """
+
+    def box(self):
+        return [(0.0, 0.0), (20.0, 0.0), (20.0, 20.0), (0.0, 20.0)]
+
+    def published(self, node):
+        node._publish_path()
+        return [(round(p.pose.position.x, 2), round(p.pose.position.y, 2))
+                for p in node.sent[-1].poses]
+
+    @pytest.fixture
+    def node(self, planning_node, search_node):
+        grid = make_costmap(60, 60, resolution=0.5, origin=(-5.0, -5.0))
+        n = planning_node(self.box(), grid)
+        n.sent = []
+        n.path_pub = SimpleNamespace(publish=n.sent.append)
+        # the shared fixture stubs _publish_path out; this class is testing it
+        n._publish_path = search_node.SearchNode._publish_path.__get__(n)
+        return n
+
+    def test_the_vantage_point_is_not_in_the_path(self, node):
+        grid = make_costmap(60, 60, resolution=0.5, origin=(-5.0, -5.0))
+        fill_rect(grid, 0, 60, 30, 60, -1)       # top half never observed
+        node.costmap = grid
+        node.inside_mask = node._build_inside_mask()
+        node.cells_to_search = int(node.inside_mask.sum())
+        assert node.plan_sweep() is True
+        assert node.vantage_index is not None, 'test needs a vantage point'
+        vantage = node.points[node.vantage_index]
+        assert vantage not in self.published(node), \
+            'the go-and-look trip is being drawn as a sweep leg'
+
+    def test_it_goes_out_on_its_own_topic(self, node):
+        grid = make_costmap(60, 60, resolution=0.5, origin=(-5.0, -5.0))
+        fill_rect(grid, 0, 60, 30, 60, -1)
+        node.costmap = grid
+        node.inside_mask = node._build_inside_mask()
+        node.cells_to_search = int(node.inside_mask.sum())
+        node.plan_sweep()
+        assert node.vantages, 'nothing published on search_vantage'
+        pt = node.vantages[-1].point
+        assert (pt.x, pt.y) == node.points[node.vantage_index]
+
+    def test_the_way_home_is_not_a_sweep_leg_either(self, node):
+        node.plan_sweep()
+        assert node.home_index is not None
+        assert (0.0, 0.0) not in self.published(node)
+
+    def test_the_sweep_legs_themselves_are_published(self, node):
+        node.plan_sweep()
+        legs = self.published(node)
+        assert legs, 'no sweep legs published at all'
+        assert len(legs) == node.home_index
