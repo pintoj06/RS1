@@ -130,6 +130,7 @@ def make_node(ground_station, project=None):
         rgb_hfov=1.4, thermal_hfov=THERMAL_FOV, person_min_k=305.0,
         person_min_pixels=600, rgb_hit=None, rgb_hit_xy=None,
         rgb_hit_track=None, _detections_time=0.0,
+        thermal_mask=np.ones((H, W), bool),     # heat everywhere by default
     )
     node.ground_point = project or (lambda u, v, w, h, fov, stamp: (u / 100, v / 100))
     return node
@@ -140,11 +141,59 @@ def detections(*boxes):
     for u, v, score in boxes:
         d = Detection2D()
         d.bbox.center.position.x, d.bbox.center.position.y = float(u), float(v)
+        d.bbox.size_x, d.bbox.size_y = 40.0, 40.0
         r = ObjectHypothesisWithPose()
         r.hypothesis.class_id, r.hypothesis.score = 'Human', float(score)
         d.results.append(r)
         msg.detections.append(d)
     return msg
+
+
+class TestHumanMustBeOnTheHeat:
+    """A contact's heat and its YOLO human must be the same object: a false
+    human on one side of the frame plus a wombat's heat on the other is not
+    a person."""
+
+    def run(self, ground_station, node, msg):
+        ground_station.GroundStationNode._on_detections(node, msg)
+
+    def heat_at(self, x1, y1, x2, y2):
+        mask = np.zeros((H, W), bool)
+        mask[y1:y2, x1:x2] = True
+        return mask
+
+    def test_human_on_heat_counts(self, ground_station):
+        node = make_node(ground_station)
+        node.thermal_mask = self.heat_at(380, 180, 420, 220)
+        self.run(ground_station, node, detections((400, 200, 0.9)))
+        assert node.rgb_hit is not None
+
+    def test_human_away_from_heat_is_not_a_hit(self, ground_station):
+        node = make_node(ground_station)
+        node.thermal_mask = self.heat_at(600, 380, 640, 420)   # wombat, far side
+        self.run(ground_station, node, detections((100, 100, 0.9)))
+        assert node.rgb_hit is None
+
+    def test_only_the_human_on_heat_counts(self, ground_station):
+        node = make_node(ground_station)
+        node.thermal_mask = self.heat_at(380, 180, 420, 220)
+        self.run(ground_station, node,
+                 detections((100, 100, 0.95), (400, 200, 0.6)))
+        assert node.rgb_hit[0] == pytest.approx(0.6)
+
+    def test_no_thermal_yet_means_no_hit(self, ground_station):
+        node = make_node(ground_station)
+        node.thermal_mask = None
+        self.run(ground_station, node, detections((400, 200, 0.9)))
+        assert node.rgb_hit is None
+
+    def test_scales_when_thermal_resolution_differs(self, ground_station):
+        node = make_node(ground_station)
+        mask = np.zeros((H // 2, W // 2), bool)      # half-size thermal image
+        mask[90:110, 190:210] = True                 # = RGB (400, 200)
+        node.thermal_mask = mask
+        self.run(ground_station, node, detections((400, 200, 0.9)))
+        assert node.rgb_hit is not None
 
 
 class TestYoloAfterDismiss:

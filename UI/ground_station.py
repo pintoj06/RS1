@@ -157,6 +157,27 @@ def match_one_to_one(points, anchors, gate: float) -> dict:
     return matched
 
 
+def box_on_heat(mask: Optional[np.ndarray], bbox, width: int, height: int,
+                min_px: int = 20, pad: float = 0.25) -> bool:
+    """True if a YOLO box (RGB pixels, image width x height) covers body heat
+    in the thermal mask, so a contact's heat and human are the same object.
+    The box is padded by `pad` of its size for the small time offset between
+    the two cameras' frames.
+
+    shortcut: assumes the thermal and RGB cameras share mount and FOV
+    (parrot.gazebo.xacro), so pixels line up after scaling; if they ever
+    differ, compare ground positions instead.
+    """
+    if mask is None:
+        return False
+    sx, sy = mask.shape[1] / width, mask.shape[0] / height
+    cx, cy = bbox.center.position.x, bbox.center.position.y
+    hw, hh = bbox.size_x * (0.5 + pad), bbox.size_y * (0.5 + pad)
+    x1, x2 = int(max(cx - hw, 0) * sx), int((cx + hw) * sx) + 1
+    y1, y2 = int(max(cy - hh, 0) * sy), int((cy + hh) * sy) + 1
+    return np.count_nonzero(mask[y1:y2, x1:x2]) >= min_px
+
+
 @dataclass
 class Track:
     id: int
@@ -332,6 +353,8 @@ class GroundStationNode(Node):
         self._detections_time = 0.0
         # (peak kelvin, hot pixel count) for the latest frame, None if nothing.
         self.thermal_hit: Optional[Tuple[float, int]] = None
+        # Body-heat pixels of the latest thermal frame (dismissed heat removed).
+        self.thermal_mask: Optional[np.ndarray] = None
 
         self.bridge = CvBridge()
         self.rgb_frame: Optional[np.ndarray] = None
@@ -587,6 +610,8 @@ class GroundStationNode(Node):
         for d, xy, track in zip(msg.detections, points, tracks):
             if track is not None and track.dismissed:
                 continue      # the operator already ruled this one out
+            if not box_on_heat(self.thermal_mask, d.bbox, width, height):
+                continue      # heat elsewhere in frame (e.g. a wombat) doesn't back this box
             for r in d.results:
                 if best is None or r.hypothesis.score > best[0]:
                     best = (r.hypothesis.score, xy,
@@ -668,6 +693,7 @@ class GroundStationNode(Node):
                 blobs, [(t.x, t.y) for t in dismissed], self.tracker.gate)
             for i in claimed:
                 hot[labels == i + 1] = False
+        self.thermal_mask = hot
         count = int(np.count_nonzero(hot))
         if count < self.person_min_pixels:
             return None
