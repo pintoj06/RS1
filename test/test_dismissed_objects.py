@@ -42,9 +42,10 @@ class TestPixelToGround:
         assert gy > 0                      # forward is now +y
 
     def test_matches_live_thermal_frame(self, ground_station):
-        # Measured on the running sim: scout at (-8.72, -1.90), z 9.95,
-        # yaw 0; the wombat's blob centred at pixel (437.1, 171.8). The
-        # wombat is at (-7.5, -3.1) in large_demo.sdf.
+        # Measured on the running sim, when the thermal camera was 60 deg
+        # (THERMAL_FOV): scout at (-8.72, -1.90), z 9.95, yaw 0; the wombat's
+        # blob centred at pixel (437.1, 171.8). The wombat is at (-7.5, -3.1)
+        # in large_demo.sdf.
         gx, gy = self.project(ground_station, 437.1, 171.8,
                               alt=9.95 - 0.05, x=-8.72, y=-1.90)
         assert math.hypot(gx + 7.5, gy + 3.1) < 0.3

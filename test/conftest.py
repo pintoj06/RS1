@@ -76,3 +76,19 @@ def set_cell(grid, col, row, value):
     data = list(grid.data)
     data[row * grid.info.width + col] = value
     grid.data = data
+
+
+def fill_rect(grid, col0, col1, row0, row1, value):
+    """Set a block of cells in one pass.
+
+    set_cell copies the whole data list each call, which is fine for a cell or
+    two and ruinous in a loop: filling a 300x300 costmap one cell at a time
+    took 87 seconds of a test run. Ranges are half-open, like slices.
+    """
+    data = list(grid.data)
+    w = grid.info.width
+    for row in range(row0, row1):
+        base = row * w
+        data[base + col0:base + col1] = [value] * (col1 - col0)
+    grid.data = data
+    return grid

@@ -202,6 +202,25 @@ local_costmap:
           # publishes. The obstacle layer then silently receives nothing and
           # the costmap stays empty no matter what the ranges are set to.
           topic: /parrot1/scan
+          # Treat an infinite reading as "clear all the way out", not as no
+          # reading at all.
+          #
+          # This is the difference between the costmap knowing where the open
+          # ground is and not knowing. Measured on a live scan at survey
+          # altitude: 276 of 360 rays (76.7%) come back inf, because over open
+          # ground there is nothing within 40 m to hit. With this false - the
+          # default - Nav2 DISCARDS those readings: no obstacle marked, and no
+          # raytrace clearing along the ray either. So three rays in four
+          # contribute nothing and the ground under them stays unknown for
+          # ever. Only the 23% that hit something cleared their own paths,
+          # which left the confirmed-reachable region about 600 m2 (a 14 m
+          # equivalent radius) out of a 40 m sensor, and the sweep could only
+          # plan legs in whichever corner of the search area that fan reached.
+          #
+          # With it true an inf reading clears out to range_max and marks
+          # nothing, which is exactly right for a downward drone over open
+          # ground.
+          inf_is_valid: true
           max_obstacle_height: 30.0
           clearing: true
           marking: true
@@ -244,10 +263,25 @@ global_costmap:
       # rolling one, and this keeps the cell count (and so the publish load)
       # about the same. Still far finer than the 0.25 m drone footprint.
       resolution: 0.15
-      # Treat never-observed cells as free. At survey altitude the lidar sees
-      # nothing, so everything is unobserved; leaving this true stops the
-      # planner from routing anywhere.
-      track_unknown_space: false
+      # Mark never-observed cells as UNKNOWN (-1) rather than free (0).
+      #
+      # This matters more than it looks. With it false, "never looked at" and
+      # "looked at and found clear" are both stored as 0, so nothing can tell
+      # them apart - and the search node's reason for not flying at ground it
+      # cannot reach depends entirely on telling them apart. The interior of a
+      # rock is never observed (the lidar only ever sees the near face), so
+      # with this false the inside of the mountain reads as open ground and
+      # the sweep plants waypoints in it. Measured on a live costmap: the
+      # footprint of Meehni summit came back 78.8% "clear", 0% unknown.
+      #
+      # The comment that used to justify false said the lidar saw nothing at
+      # survey altitude. That was true when written, but only because the
+      # obstacle layer was subscribed to a topic nothing published (see the
+      # scan topic note below). The lidar reaches the costmap now.
+      #
+      # Safe to turn on because planner_server's GridBased has
+      # allow_unknown: true, so Nav2 still routes through unexplored space.
+      track_unknown_space: true
       plugins:
       # static_layer removed - it is the layer that requires a SLAM map.
       # obstacle_layer still reads the live lidar, so anything actually
@@ -257,6 +291,12 @@ global_costmap:
       obstacle_layer:
         plugin: nav2_costmap_2d::ObstacleLayer
         enabled: true
+        # Needed as well as the costmap-level setting above, not instead of
+        # it. This layer keeps its own grid, and that grid defaults to FREE
+        # space; updateWithMax then writes any non-unknown layer value over
+        # the master's unknown, so a free-by-default layer would wipe the
+        # unknown straight back out again across the whole map.
+        track_unknown_space: true
         observation_sources: scan
         scan:
           # ABSOLUTE topic name. The costmap node sits in the namespace
@@ -265,6 +305,25 @@ global_costmap:
           # publishes. The obstacle layer then silently receives nothing and
           # the costmap stays empty no matter what the ranges are set to.
           topic: /parrot1/scan
+          # Treat an infinite reading as "clear all the way out", not as no
+          # reading at all.
+          #
+          # This is the difference between the costmap knowing where the open
+          # ground is and not knowing. Measured on a live scan at survey
+          # altitude: 276 of 360 rays (76.7%) come back inf, because over open
+          # ground there is nothing within 40 m to hit. With this false - the
+          # default - Nav2 DISCARDS those readings: no obstacle marked, and no
+          # raytrace clearing along the ray either. So three rays in four
+          # contribute nothing and the ground under them stays unknown for
+          # ever. Only the 23% that hit something cleared their own paths,
+          # which left the confirmed-reachable region about 600 m2 (a 14 m
+          # equivalent radius) out of a 40 m sensor, and the sweep could only
+          # plan legs in whichever corner of the search area that fan reached.
+          #
+          # With it true an inf reading clears out to range_max and marks
+          # nothing, which is exactly right for a downward drone over open
+          # ground.
+          inf_is_valid: true
           max_obstacle_height: 30.0
           clearing: true
           marking: true

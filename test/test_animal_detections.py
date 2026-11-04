@@ -92,15 +92,6 @@ class TestFullyInFrame:
     def test_zero_margin_only_rejects_off_frame(self, detector):
         assert detector.fully_in_frame([0, 0, 720, 480], 720, 480, 0.0)
 
-    def test_thermal_view_is_inside_the_margin(self):
-        # Thermal (60 deg) and RGB (80 deg) share a mount, so the thermal
-        # view's edge sits this far in from the RGB edge. It must be more
-        # than the margin, or a person who triggered the thermal check could
-        # be stuck as "entering" for the whole hold.
-        import math
-        inset = (1 - math.tan(math.radians(30)) / math.tan(0.7)) / 2
-        assert inset > 0.05
-
 
 def node_with(ground_station, rgb_hit=None, animal_hit=None):
     node = SimpleNamespace(rgb_hit=rgb_hit, animal_hit=animal_hit, rgb_fresh_s=1.5,

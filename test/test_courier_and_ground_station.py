@@ -65,6 +65,56 @@ class TestContactToOwnFrame:
         assert (x, y) == pytest.approx((10.0, 1.0), abs=1e-9)
 
 
+
+class TestScoutCostmapRelay:
+    """The courier plans round what the scout has mapped, not only round what
+    its own 10 m lidar can see."""
+
+    @pytest.fixture
+    def relay(self, courier_node):
+        from conftest import FakeParams, make_costmap
+        sent = []
+        clock = SimpleNamespace(t=0.0)
+        courier = SimpleNamespace(
+            map_frame='parrot2_odom',
+            _scout_costmap_sent=None,
+            scout_costmap_pub=SimpleNamespace(publish=sent.append),
+            get_parameter=FakeParams(scout_costmap_period=2.0),
+            get_logger=FakeLogger,
+            get_clock=lambda: SimpleNamespace(
+                now=lambda: rclpy.time.Time(nanoseconds=int(clock.t * 1e9))),
+        )
+        run = courier_node.CourierNode.relay_scout_costmap
+
+        def scout_map():
+            grid = make_costmap(4, 4, resolution=0.15, origin=(-30.0, -25.0))
+            grid.header.frame_id = 'parrot1_odom'
+            return grid
+        return SimpleNamespace(run=lambda m: run(courier, m), sent=sent,
+                               clock=clock, scout_map=scout_map)
+
+    def test_relabelled_into_the_couriers_frame(self, relay):
+        """Same world coordinates; only the label changes. There is no TF
+        between the two robots' trees for Nav2 to convert with."""
+        grid = relay.scout_map()
+        relay.run(grid)
+        assert len(relay.sent) == 1
+        out = relay.sent[0]
+        assert out.header.frame_id == 'parrot2_odom'
+        assert out.info.origin.position.x == -30.0
+        assert out.info.origin.position.y == -25.0
+        assert list(out.data) == list(grid.data)
+
+    def test_throttled(self, relay):
+        relay.run(relay.scout_map())
+        relay.clock.t = 0.2                 # the scout's next 5 Hz frame
+        relay.run(relay.scout_map())
+        assert len(relay.sent) == 1
+        relay.clock.t = 2.1
+        relay.run(relay.scout_map())
+        assert len(relay.sent) == 2
+
+
 @pytest.fixture
 def detect(ground_station):
     station = SimpleNamespace(person_min_k=305.0, person_min_pixels=600,
@@ -108,3 +158,79 @@ class TestContactRadius:
         assert near(window, 3.0, 3.0, spots)          # 4.2 m away
         assert not near(window, 4.0, 4.0, spots)      # 5.7 m away
         assert not near(window, 1.0, 1.0, [])
+
+
+class TestReleaseRadius:
+    """The package drops once the courier is within release_radius of the
+    contact, not only when Nav2 calls the goal reached at 0.25 m."""
+
+    @pytest.fixture
+    def courier(self, courier_node):
+        from action_msgs.msg import GoalStatus
+        from conftest import FakeParams
+        Courier = courier_node.CourierNode
+
+        class Fake:
+            check_release = Courier.check_release
+            release = Courier.release
+            goal_finished = Courier.goal_finished
+
+            def __init__(self):
+                self.target = (10.0, 0.0)
+                self.at = (0.0, 0.0)
+                self.busy = True
+                self.sent = True
+                self.released = False
+                self.estopped = False
+                self.drops = 0
+                self.cancelled = False
+                handle = SimpleNamespace(cancel_goal_async=self._cancel)
+                self.goal_handle = handle
+                self.release_pub = SimpleNamespace(publish=self._drop)
+                self.get_parameter = FakeParams(release_radius=1.5)
+                self.get_logger = FakeLogger
+
+            def _drop(self, _msg):
+                self.drops += 1
+
+            def _cancel(self):
+                self.cancelled = True
+
+            def own_xy(self):
+                return self.at
+
+        fake = Fake()
+        fake.result = lambda status: SimpleNamespace(
+            result=lambda: SimpleNamespace(status=status))
+        fake.GoalStatus = GoalStatus
+        return fake
+
+    def test_holds_on_to_it_while_far_off(self, courier):
+        courier.at = (8.0, 0.0)              # 2 m out
+        courier.check_release()
+        assert courier.drops == 0 and not courier.cancelled
+
+    def test_drops_inside_the_radius_and_stops_there(self, courier):
+        courier.at = (8.6, 0.5)              # 1.49 m out
+        courier.check_release()
+        assert courier.drops == 1
+        assert courier.cancelled             # hovers, no creeping in
+        courier.check_release()
+        assert courier.drops == 1            # once only
+
+    def test_the_cancel_is_not_reported_as_a_miss(self, courier):
+        courier.at = (9.0, 0.0)
+        courier.check_release()
+        courier.goal_finished(courier.result(courier.GoalStatus.STATUS_CANCELED))
+        assert courier.released and courier.sent   # no retry either
+        assert courier.drops == 1
+
+    def test_arriving_still_drops_if_the_check_missed_it(self, courier):
+        courier.goal_finished(courier.result(courier.GoalStatus.STATUS_SUCCEEDED))
+        assert courier.drops == 1
+
+    def test_not_while_estopped(self, courier):
+        courier.at = (9.5, 0.0)
+        courier.estopped = True
+        courier.check_release()
+        assert courier.drops == 0

@@ -11,6 +11,8 @@ from action_msgs.msg import GoalStatus
 # PointStamped is what the ground station publishes for a confirmed contact.
 from geometry_msgs.msg import Point, PointStamped, PoseStamped
 from nav2_msgs.action import NavigateToPose
+# The scout's global costmap, relayed into this robot's frame for Nav2.
+from nav_msgs.msg import OccupancyGrid
 from rclpy.action import ActionClient
 # Duration is used to put a time limit on TF lookups so they can't block.
 from rclpy.duration import Duration
@@ -48,6 +50,12 @@ class CourierNode(Node):
         # worlds/large_demo.sdf. Keep in step with that pose.
         self.declare_parameter('target_world_x', -6.36)
         self.declare_parameter('target_world_y', -3.07)
+        # Drop the care package once this close to the contact, rather than
+        # waiting for Nav2 to call the goal reached (0.25 m). The package
+        # lands within a metre or two of the person either way, and the last
+        # stretch is the slow, fiddly one - often next to rock, where Nav2
+        # can spend a long time creeping in or give up altogether.
+        self.declare_parameter('release_radius', 1.5)   # metres
 
         robot_name = self.get_parameter('robot_name').value
         scout_name = self.get_parameter('scout_name').value
@@ -75,6 +83,7 @@ class CourierNode(Node):
         self.target = None  # (x, y) in this robot's own odom frame, once confirmed
         self.sent = False   # set True once the delivery goal has been sent
         self.busy = False
+        self.released = False   # the care package has been dropped
         # E-Stop from the ground station: cancel the flight and hover until
         # RESUME, then fly the same delivery again.
         self.estopped = False
@@ -86,6 +95,9 @@ class CourierNode(Node):
         # DetachableJoint in Gazebo (config/gazebo_bridge_parrot2.yaml); the
         # package then falls onto the contact.
         self.release_pub = self.create_publisher(Empty, 'care_package/detach', 10)
+        # 10 Hz: at 1 m/s the drone moves 0.1 m between checks, so it is
+        # never far inside release_radius when the package goes.
+        self.release_timer = self.create_timer(0.1, self.check_release)
 
         # Same latched QoS the ground station publishes with, so this still
         # gets the message even if it starts listening after a confirm.
@@ -132,6 +144,29 @@ class CourierNode(Node):
             lambda msg: self.store_scout_tf(msg, static=True),
             QoSProfile(depth=100, durability=QoSDurabilityPolicy.TRANSIENT_LOCAL))
 
+        # The scout's map, for planning round what it has already seen. The
+        # courier's own lidar only reaches 10 m, so on its own it plans a
+        # straight line to the contact and finds the mountain on arrival.
+        # The scout has usually flown past that mountain by then and mapped
+        # it. Its global costmap is relayed, frame relabelled, to the topic
+        # the static_layer in nav2_params_parrot2*.yaml reads.
+        self.declare_parameter('scout_costmap_topic', f'/{scout_name}/global_costmap/costmap')
+        # The scout publishes at 5 Hz and Nav2 rebuilds the static layer on
+        # every message, so pass on at most one this often. Obstacles do not
+        # move; a few seconds' delay on a newly mapped face changes nothing.
+        self.declare_parameter('scout_costmap_period', 2.0)   # seconds
+        # Both are latched: Nav2 publishes its costmap transient-local, and
+        # Nav2's static layer only listens transient-local.
+        map_qos = QoSProfile(depth=1,
+                             reliability=QoSReliabilityPolicy.RELIABLE,
+                             durability=QoSDurabilityPolicy.TRANSIENT_LOCAL)
+        self.scout_costmap_pub = self.create_publisher(
+            OccupancyGrid, 'scout_costmap', map_qos)
+        self._scout_costmap_sent = None
+        self.create_subscription(
+            OccupancyGrid, self.get_parameter('scout_costmap_topic').value,
+            self.relay_scout_costmap, map_qos)
+
         # Publisher for the blue breadcrumb trail of where the drone has been.
         self.trail_pub = self.create_publisher(Marker, 'courier_trail', 10)
 
@@ -167,6 +202,29 @@ class CourierNode(Node):
                 self.scout_tf_buffer.set_transform_static(t, 'scout_tf')
             else:
                 self.scout_tf_buffer.set_transform(t, 'scout_tf')
+
+    def relay_scout_costmap(self, msg):
+        """Pass the scout's costmap on to this robot's Nav2, in this robot's frame.
+
+        Relabelling the frame is all the conversion there is: every drone's
+        odom frame is the Gazebo world frame (see the note in __init__), so a
+        cell at (x, y) in parrot1_odom is at the same (x, y) in parrot2_odom.
+        Nav2's static layer would otherwise look for a parrot1_odom ->
+        parrot2_odom transform, and none exists - each robot has its own TF.
+        """
+        now = self.get_clock().now()
+        period = float(self.get_parameter('scout_costmap_period').value)
+        if (self._scout_costmap_sent is not None
+                and (now - self._scout_costmap_sent).nanoseconds < period * 1e9):
+            return
+        if self._scout_costmap_sent is None:
+            self.get_logger().info(
+                f'Got the scout\'s map ({msg.info.width} x {msg.info.height} '
+                f'cells at {msg.info.resolution:.2f} m); planning round what '
+                f'it has seen.')
+        self._scout_costmap_sent = now
+        msg.header.frame_id = self.map_frame
+        self.scout_costmap_pub.publish(msg)
 
     def on_confirmed_point(self, msg):
         """Called when the operator confirms a contact on the ground station.
@@ -295,18 +353,54 @@ class CourierNode(Node):
         result_future = goal_handle.get_result_async()
         result_future.add_done_callback(self.goal_finished)
 
+    def check_release(self):
+        """Drop the package as soon as the drone is within release_radius."""
+        if self.released or not self.busy or self.estopped or self.target is None:
+            return
+        here = self.own_xy()
+        if here is None:
+            return
+        dist = math.hypot(self.target[0] - here[0], self.target[1] - here[1])
+        if dist > float(self.get_parameter('release_radius').value):
+            return
+        self.release(f'{dist:.1f} m from the contact')
+        # Hover where it dropped instead of creeping the last metre in.
+        # goal_finished sees self.released and does not count this as a miss.
+        if self.goal_handle is not None:
+            self.goal_handle.cancel_goal_async()
+
+    def release(self, where):
+        self.released = True
+        self.release_pub.publish(Empty())
+        self.get_logger().info(f'Care package released, {where}.')
+
+    def own_xy(self):
+        """This drone's (x, y) in its odom frame, or None before TF arrives."""
+        try:
+            t = self.tf_buffer.lookup_transform(
+                self.map_frame, self.base_frame, rclpy.time.Time())
+        except Exception:
+            return None
+        return t.transform.translation.x, t.transform.translation.y
+
     def goal_finished(self, future):
         """Stage 3: Nav2 has arrived, failed or given up"""
         self.goal_handle = None
         self.busy = False
+        if self.released:
+            # Dropped on the way in (check_release) and the goal cancelled,
+            # or arrived just after. Either way the delivery is done.
+            self.get_logger().info('Delivery complete. Hovering over the contact.')
+            return
         if self.estopped:
             # Cancelled by the E-Stop: not delivered, so fly it again on
             # RESUME instead of giving up. The package stays on board.
             self.sent = False
             return
         if future.result().status == GoalStatus.STATUS_SUCCEEDED:
-            self.release_pub.publish(Empty())
-            self.get_logger().info('Arrived. Care package released.')
+            # Only if the 10 Hz check has not already: Nav2's goal tolerance
+            # is tighter than release_radius, so this is a backstop.
+            self.release('on arrival')
         else:
             self.get_logger().warn('Could not reach the delivery point.')
 
@@ -366,7 +460,7 @@ class CourierNode(Node):
         dot.pose.position.z = 0.2
         dot.pose.orientation.w = 1.0
         # Yellow while waiting for the scout / flying there, green once delivered.
-        if self.sent and not self.busy:
+        if self.released:
             dot.color = ColorRGBA(r=0.0, g=1.0, b=0.0, a=1.0)
         else:
             dot.color = ColorRGBA(r=1.0, g=1.0, b=0.0, a=1.0)

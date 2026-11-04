@@ -40,7 +40,8 @@ from typing import Callable, List, Optional, Tuple
 import numpy as np
 
 import rclpy
-from rclpy.duration import Duration
+from rclpy.executors import (ShutdownException, SingleThreadedExecutor,
+                             TimeoutException)
 from rclpy.node import Node
 from rclpy.qos import (QoSDurabilityPolicy, QoSHistoryPolicy, QoSProfile,
                        QoSReliabilityPolicy, qos_profile_sensor_data)
@@ -92,6 +93,15 @@ MAP_WALL    = (18, 18, 18)      # obstacle — #121212
 # it is reassurance, not a thing demanding a decision, and must not compete
 # with a contact marker.
 COVERED     = (90, 225, 230, 70)   # RGBA, drawn over the map
+# Ground inside the area the scout has NOT settled. Three outcomes, and they
+# are not interchangeable: "still to do", "I could not reach it" and "I never
+# worked out WHETHER I could reach it". The third is the one that needs a
+# decision from the operator, so it is the one drawn boldly. Collapsing all
+# three into "no colour" drew unknown ground exactly like empty space off the
+# edge of the map - on one flight that hid 478 of 619 unpainted cells.
+TO_DO       = (90, 225, 230, 22)   # reachable, not swept yet — barely there
+UNVERIFIED  = (235, 165, 40, 90)   # never confirmed reachable — AMBER, loud
+BLOCKED_GND = (120, 120, 120, 70)  # obstacle or walled off — grey, inert
 PLANNED     = "#00FF88"            # planned sweep route — bright green.
                                    # Kept clear of ALERT's yellow-green so
                                    # an unruled contact still reads as the
@@ -286,7 +296,7 @@ class GroundStationNode(Node):
         self.declare_parameter("track_gate", 2.0)
         self.declare_parameter("track_timeout_s", 10.0)
         self.declare_parameter("rgb_hfov", 1.4)
-        self.declare_parameter("thermal_hfov", 1.0472)
+        self.declare_parameter("thermal_hfov", 1.4)
         self.declare_parameter("flight_altitude", 10.0)
         self.tracker = GroundTracker(
             float(self.get_parameter("track_gate").value),
@@ -370,8 +380,19 @@ class GroundStationNode(Node):
         self.coverage_image: Optional[np.ndarray] = None      # RGBA
         self.coverage_bounds: Optional[Tuple[float, float, float, float]] = None
         self.coverage_percent: Optional[float] = None
+        # Progress reported three ways, because one number cannot say it.
+        # "100% searched" with a third of the box unreachable is true and
+        # badly misleading: a reader takes it to mean the box was checked.
+        self.coverage_assigned: Optional[float] = None   # % of the box drawn
+        self.coverage_gap_m2 = 0.0                       # not checked, m2
+        self.coverage_gap_reason = ""                    # and why
         # Planned sweep route, in the map frame once transformed.
         self.search_path: List[Tuple[float, float]] = []
+        # What the scout says it is doing. Without it the operator watches the
+        # green path vanish and the drone fly out of the box with no way to
+        # tell a finished search from a look-around trip from a crash.
+        self.search_state: Optional[str] = None
+        self.search_detail = ""
 
         self.drone_xy: Optional[Tuple[float, float]] = None
         self.drone_yaw = 0.0
@@ -379,7 +400,15 @@ class GroundStationNode(Node):
 
         self.base_frame = f"{self.robot_name}_base_link"
         self.tf_buffer = tf2_ros.Buffer()
-        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
+        # On its own thread. /tf is by far the busiest topic here, and pumped
+        # through the Qt timer with everything else it queued up and arrived
+        # seconds late - so the drone marker trailed the real drone, and a
+        # contact raised at the marker landed where the drone used to be.
+        # The buffer is thread-safe, and nothing else runs on that thread.
+        # It also means lookups never need a timeout: the latest transform is
+        # already in the buffer or it is not, so the GUI never waits on one.
+        self.tf_listener = tf2_ros.TransformListener(
+            self.tf_buffer, self, spin_thread=True)
 
         # SLAM publishes the map transient-local. A default subscription
         # receives nothing at all, with no error  this QoS is required.
@@ -421,6 +450,7 @@ class GroundStationNode(Node):
                               reliability=QoSReliabilityPolicy.RELIABLE,
                               durability=QoSDurabilityPolicy.TRANSIENT_LOCAL)
         self.create_subscription(Path, "search_path", self._on_path, path_qos)
+        self.create_subscription(String, "search_status", self._on_status, path_qos)
 
         self.decision_pub = self.create_publisher(String, "operator/decision", 10)
 
@@ -689,14 +719,20 @@ class GroundStationNode(Node):
         try:
             tf = self.tf_buffer.lookup_transform(
                 self.map_frame, msg.header.frame_id,
-                rclpy.time.Time(), timeout=Duration(seconds=0.05))
+                rclpy.time.Time())
         except Exception:
             return
 
         grid = np.asarray(msg.data, dtype=np.int8).reshape(h, w)
 
+        # Must match the COVER_* constants in scripts/search_node.py.
+        SEARCHED, BLOCKED_V, UNVERIFIED_V, TO_DO_V = 100, 50, 25, 0
+
         rgba = np.zeros((h, w, 4), dtype=np.uint8)
-        rgba[grid > 0] = COVERED            # everything else stays transparent
+        rgba[grid == TO_DO_V] = TO_DO
+        rgba[grid == BLOCKED_V] = BLOCKED_GND
+        rgba[grid == UNVERIFIED_V] = UNVERIFIED
+        rgba[grid == SEARCHED] = COVERED    # outside the area stays clear
         # Row 0 of an OccupancyGrid is the bottom of the world, row 0 of an
         # image is the top - same flip the SLAM map does.
         self.coverage_image = np.flipud(rgba).copy()
@@ -706,12 +742,42 @@ class GroundStationNode(Node):
         oy = msg.info.origin.position.y + tf.transform.translation.y
         self.coverage_bounds = (ox, oy, ox + w * res, oy + h * res)
 
-        # Percentage of the cells the scout counts as searchable. It already
-        # leaves obstacles and unreachable ground out of its grid, so this is
-        # progress against what can actually be flown, not the whole box.
-        searched = int(np.count_nonzero(grid > 0))
-        total = int(np.count_nonzero(grid >= 0))
-        self.coverage_percent = (100.0 * searched / total) if total else None
+        # Three figures, from the one grid. Everything with a value at all
+        # is inside the area the operator drew; -1 is outside it and says
+        # nothing, which is why the 5 m pad around the shape cannot skew this.
+        cell = res * res
+        searched = int(np.count_nonzero(grid == SEARCHED))
+        to_do = int(np.count_nonzero(grid == TO_DO_V))
+        unverified = int(np.count_nonzero(grid == UNVERIFIED_V))
+        blocked = int(np.count_nonzero(grid == BLOCKED_V))
+        assigned = searched + to_do + unverified + blocked
+
+        # Progress against what can actually be flown - the "am I done?"
+        # number, which does reach 100%.
+        reachable = searched + to_do
+        self.coverage_percent = (100.0 * searched / reachable) if reachable else None
+        # Progress against what was ASSIGNED - the honest one, which does not
+        # reach 100% when part of the box is rock.
+        self.coverage_assigned = (100.0 * searched / assigned) if assigned else None
+        self.coverage_gap_m2 = (unverified + blocked) * cell
+        if unverified and blocked:
+            self.coverage_gap_reason = "unknown + terrain"
+        elif unverified:
+            self.coverage_gap_reason = "never verified"
+        elif blocked:
+            self.coverage_gap_reason = "enclosed by terrain"
+        else:
+            self.coverage_gap_reason = ""
+
+    def _on_status(self, msg) -> None:
+        """Store the scout's own account of what it is doing.
+
+        Sent as "STATE|detail" so the state can drive the colour while the
+        detail carries the specifics (which waypoint, how far off, why).
+        """
+        state, _, detail = msg.data.partition("|")
+        self.search_state = state.strip() or None
+        self.search_detail = detail.strip()
 
     def _on_path(self, msg: Path):
         """Store the scout's planned sweep, shifted into this map's frame.
@@ -725,7 +791,7 @@ class GroundStationNode(Node):
         try:
             tf = self.tf_buffer.lookup_transform(
                 self.map_frame, msg.header.frame_id,
-                rclpy.time.Time(), timeout=Duration(seconds=0.05))
+                rclpy.time.Time())
         except Exception:
             return
         dx = tf.transform.translation.x
@@ -743,8 +809,7 @@ class GroundStationNode(Node):
         """
         try:
             tf = self.tf_buffer.lookup_transform(
-                self.map_frame, self.base_frame, rclpy.time.Time(),
-                timeout=Duration(seconds=0.05))
+                self.map_frame, self.base_frame, rclpy.time.Time())
             x = tf.transform.translation.x
             y = tf.transform.translation.y
         except Exception:
@@ -757,8 +822,7 @@ class GroundStationNode(Node):
             # looked up in odom is already relative to it.
             try:
                 tf = self.tf_buffer.lookup_transform(
-                    self.odom_frame, self.base_frame, rclpy.time.Time(),
-                    timeout=Duration(seconds=0.05))
+                    self.odom_frame, self.base_frame, rclpy.time.Time())
             except Exception:
                 return  # normal at startup, before transforms flow
             x = tf.transform.translation.x
@@ -1121,6 +1185,19 @@ class MapPage(QWidget):
         # The planned sweep, under the trail so the line the drone actually
         # flew reads on top of the one it meant to. Where the route jumps
         # around an obstacle the gap is visible, which is the point.
+        # A go-and-look trip has no sweep pattern to draw - often a single
+        # waypoint, outside the search area - so the green path legitimately
+        # disappears. Draw the leg from the drone to it in amber instead, or
+        # it reads as the drone flying off for no reason.
+        if (self.show_path and self.node.search_state == "LOOKING"
+                and self.node.search_path and self.node.drone_xy is not None):
+            a = self._world_to_widget(*self.node.drone_xy)
+            b = self._world_to_widget(*self.node.search_path[-1])
+            p.setPen(QPen(QColor(ALERT), 2, Qt.DotLine))
+            p.drawLine(a, b)
+            p.setBrush(QColor(ALERT))
+            p.drawEllipse(b, 4, 4)
+
         if self.show_path and len(self.node.search_path) > 1:
             pts = [self._world_to_widget(x, y) for x, y in self.node.search_path]
             p.setPen(QPen(QColor(PLANNED), 2, Qt.DashLine))
@@ -1166,11 +1243,45 @@ class MapPage(QWidget):
         # How much of the searchable ground has been swept. The one number
         # that answers "is this area done?", so it stays on screen rather than
         # living only in the search node's terminal.
+        # What the scout is doing, in its own words. The single most useful
+        # line on the screen: it is what tells "finished" apart from "gone to
+        # get a view" apart from "something has broken".
+        STATE_COLOUR = {
+            "SEARCHING": CONFIRM, "LOOKING": ALERT, "INVESTIGATING": ALERT,
+            "RETURNING": TEXT,
+            "COMPLETE": CONFIRM, "HOLD": ALERT, "ESTOP": ALERT,
+            "UNSEARCHABLE": ALERT, "PLANNING": MUTED, "IDLE": MUTED,
+        }
+        if self.node.search_state and not self.draw_mode:
+            p.setFont(QFont("DejaVu Sans Mono", 11, QFont.Bold))
+            p.setPen(QColor(STATE_COLOUR.get(self.node.search_state, TEXT)))
+            p.drawText(18, 28, self.node.search_state)
+            if self.node.search_detail:
+                p.setFont(QFont("DejaVu Sans Mono", 9))
+                p.setPen(QColor(MUTED))
+                p.drawText(18, 44, self.node.search_detail[:68])
+
         if self.show_coverage and self.node.coverage_percent is not None:
-            p.setPen(QColor(CONFIRM if self.node.coverage_percent >= 99.5 else TEXT))
             p.setFont(QFont("DejaVu Sans Mono", 10, QFont.Bold))
-            p.drawText(18, self.height() - 18,
-                       f"SEARCHED  {self.node.coverage_percent:5.1f}%")
+            done = self.node.coverage_percent >= 99.5
+            y = self.height() - 18
+            gap = self.node.coverage_gap_m2
+            # Bottom line last: the gap is the thing a reader must not be
+            # able to miss, so it sits under the percentages in amber rather
+            # than being implied by the difference between them.
+            if gap >= 0.5:
+                p.setPen(QColor(ALERT))
+                p.drawText(18, y, f"NOT CHECKED {gap:6.0f} m\u00b2  "
+                                  f"{self.node.coverage_gap_reason}")
+                y -= 16
+            if self.node.coverage_assigned is not None:
+                p.setPen(QColor(TEXT))
+                p.drawText(18, y,
+                           f"OF AREA ASSIGNED {self.node.coverage_assigned:5.1f}%")
+                y -= 16
+            p.setPen(QColor(CONFIRM if done else TEXT))
+            p.drawText(18, y, f"SEARCHED  {self.node.coverage_percent:5.1f}%"
+                              f"{'  of reachable' if gap >= 0.5 else ''}")
 
         if self.draw_mode and self._drag_a is None:
             p.setPen(QColor(ALERT))
@@ -2032,8 +2143,9 @@ class MainWindow(QMainWindow):
         human seen together there (e.g. on a later sweep row) still raise a
         contact, so a person the detector missed once can still be found.
 
-        The contact goes at the drone's position; the cameras look down from
-        close above, so that is within a few metres. No checks while a
+        The contact goes where the RGB detection projects onto the ground,
+        using the drone's pose when that frame was taken, and falls back to
+        the drone's position if it could not be projected. No checks while a
         contact is waiting for a ruling (the drone is already holding), or for
         dismiss_cooldown_s after a dismiss. A hit near a confirmed contact is
         the same person and is ignored, so RESUME doesn't re-trigger on them.
@@ -2070,7 +2182,12 @@ class MainWindow(QMainWindow):
             self.ir_page.frozen = (self.node.thermal_frame if heat is not None
                                    else self._check_ir_frame)
             self._check_until = None
-            self._raise_contact(x, y, rgb_conf=rgb_conf,
+            # At the person, not the drone. obj is the detection projected
+            # onto the ground from the pose at the moment the image was
+            # taken; drone_xy is where the drone is now, which after the
+            # detector's delay can be several metres further along the leg.
+            cx, cy = obj if obj else (x, y)
+            self._raise_contact(cx, cy, rgb_conf=rgb_conf,
                                 thermal_conf=thermal_conf)
             return
 
@@ -2172,6 +2289,37 @@ class MainWindow(QMainWindow):
         self._sync_bezels()
 
 
+def pump_ros(executor, budget_s: float = 0.015):
+    """Run every ROS callback that is waiting, then hand back to Qt.
+
+    rclpy.spin_once(node) runs ONE callback per call - it adds and removes the
+    node each time, which throws away the rest of the ready set. At one call
+    per 20 ms tick that is 50 callbacks a second for three camera feeds,
+    odometry and the rest, so the queues filled and everything shown was
+    seconds old. This drains the lot each tick instead. The budget keeps a
+    burst of camera frames from freezing the window; whatever is left over
+    runs on the next tick.
+
+    One empty wait is not proof the queues are empty: rclpy reports nothing
+    ready on every other wait after running a callback, so stop only after
+    two in a row.
+    """
+    deadline = time.monotonic() + budget_s
+    empty = 0
+    while time.monotonic() < deadline and empty < 2:
+        try:
+            handler, _, _ = executor.wait_for_ready_callbacks(timeout_sec=0)
+        except TimeoutException:
+            empty += 1
+            continue
+        except ShutdownException:
+            return
+        empty = 0
+        handler()
+        if handler.exception() is not None:
+            raise handler.exception()
+
+
 def main():
     rclpy.init()
     node = GroundStationNode()
@@ -2181,10 +2329,10 @@ def main():
     window = MainWindow(node)
     window.show()
 
-    # spin_once with a zero timeout drains whatever ROS messages are waiting
-    # and returns immediately, so the GUI never stalls.
+    executor = SingleThreadedExecutor()
+    executor.add_node(node)
     ros_timer = QTimer()
-    ros_timer.timeout.connect(lambda: rclpy.spin_once(node, timeout_sec=0))
+    ros_timer.timeout.connect(lambda: pump_ros(executor))
     ros_timer.start(20)
 
     try:
