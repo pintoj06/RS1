@@ -40,7 +40,8 @@ from typing import Callable, List, Optional, Tuple
 import numpy as np
 
 import rclpy
-from rclpy.duration import Duration
+from rclpy.executors import (ShutdownException, SingleThreadedExecutor,
+                             TimeoutException)
 from rclpy.node import Node
 from rclpy.qos import (QoSDurabilityPolicy, QoSHistoryPolicy, QoSProfile,
                        QoSReliabilityPolicy, qos_profile_sensor_data)
@@ -398,7 +399,15 @@ class GroundStationNode(Node):
 
         self.base_frame = f"{self.robot_name}_base_link"
         self.tf_buffer = tf2_ros.Buffer()
-        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
+        # On its own thread. /tf is by far the busiest topic here, and pumped
+        # through the Qt timer with everything else it queued up and arrived
+        # seconds late - so the drone marker trailed the real drone, and a
+        # contact raised at the marker landed where the drone used to be.
+        # The buffer is thread-safe, and nothing else runs on that thread.
+        # It also means lookups never need a timeout: the latest transform is
+        # already in the buffer or it is not, so the GUI never waits on one.
+        self.tf_listener = tf2_ros.TransformListener(
+            self.tf_buffer, self, spin_thread=True)
 
         # SLAM publishes the map transient-local. A default subscription
         # receives nothing at all, with no error  this QoS is required.
@@ -709,7 +718,7 @@ class GroundStationNode(Node):
         try:
             tf = self.tf_buffer.lookup_transform(
                 self.map_frame, msg.header.frame_id,
-                rclpy.time.Time(), timeout=Duration(seconds=0.05))
+                rclpy.time.Time())
         except Exception:
             return
 
@@ -781,7 +790,7 @@ class GroundStationNode(Node):
         try:
             tf = self.tf_buffer.lookup_transform(
                 self.map_frame, msg.header.frame_id,
-                rclpy.time.Time(), timeout=Duration(seconds=0.05))
+                rclpy.time.Time())
         except Exception:
             return
         dx = tf.transform.translation.x
@@ -799,8 +808,7 @@ class GroundStationNode(Node):
         """
         try:
             tf = self.tf_buffer.lookup_transform(
-                self.map_frame, self.base_frame, rclpy.time.Time(),
-                timeout=Duration(seconds=0.05))
+                self.map_frame, self.base_frame, rclpy.time.Time())
             x = tf.transform.translation.x
             y = tf.transform.translation.y
         except Exception:
@@ -813,8 +821,7 @@ class GroundStationNode(Node):
             # looked up in odom is already relative to it.
             try:
                 tf = self.tf_buffer.lookup_transform(
-                    self.odom_frame, self.base_frame, rclpy.time.Time(),
-                    timeout=Duration(seconds=0.05))
+                    self.odom_frame, self.base_frame, rclpy.time.Time())
             except Exception:
                 return  # normal at startup, before transforms flow
             x = tf.transform.translation.x
@@ -1750,8 +1757,9 @@ class MainWindow(QMainWindow):
         human seen together there (e.g. on a later sweep row) still raise a
         contact, so a person the detector missed once can still be found.
 
-        The contact goes at the drone's position; the cameras look down from
-        close above, so that is within a few metres. No checks while a
+        The contact goes where the RGB detection projects onto the ground,
+        using the drone's pose when that frame was taken, and falls back to
+        the drone's position if it could not be projected. No checks while a
         contact is waiting for a ruling (the drone is already holding), or for
         dismiss_cooldown_s after a dismiss. A hit near a confirmed contact is
         the same person and is ignored, so RESUME doesn't re-trigger on them.
@@ -1788,7 +1796,12 @@ class MainWindow(QMainWindow):
             self.ir_page.frozen = (self.node.thermal_frame if heat is not None
                                    else self._check_ir_frame)
             self._check_until = None
-            self._raise_contact(x, y, rgb_conf=rgb_conf,
+            # At the person, not the drone. obj is the detection projected
+            # onto the ground from the pose at the moment the image was
+            # taken; drone_xy is where the drone is now, which after the
+            # detector's delay can be several metres further along the leg.
+            cx, cy = obj if obj else (x, y)
+            self._raise_contact(cx, cy, rgb_conf=rgb_conf,
                                 thermal_conf=thermal_conf)
             return
 
@@ -1890,6 +1903,37 @@ class MainWindow(QMainWindow):
         self._sync_bezels()
 
 
+def pump_ros(executor, budget_s: float = 0.015):
+    """Run every ROS callback that is waiting, then hand back to Qt.
+
+    rclpy.spin_once(node) runs ONE callback per call - it adds and removes the
+    node each time, which throws away the rest of the ready set. At one call
+    per 20 ms tick that is 50 callbacks a second for three camera feeds,
+    odometry and the rest, so the queues filled and everything shown was
+    seconds old. This drains the lot each tick instead. The budget keeps a
+    burst of camera frames from freezing the window; whatever is left over
+    runs on the next tick.
+
+    One empty wait is not proof the queues are empty: rclpy reports nothing
+    ready on every other wait after running a callback, so stop only after
+    two in a row.
+    """
+    deadline = time.monotonic() + budget_s
+    empty = 0
+    while time.monotonic() < deadline and empty < 2:
+        try:
+            handler, _, _ = executor.wait_for_ready_callbacks(timeout_sec=0)
+        except TimeoutException:
+            empty += 1
+            continue
+        except ShutdownException:
+            return
+        empty = 0
+        handler()
+        if handler.exception() is not None:
+            raise handler.exception()
+
+
 def main():
     rclpy.init()
     node = GroundStationNode()
@@ -1899,10 +1943,10 @@ def main():
     window = MainWindow(node)
     window.show()
 
-    # spin_once with a zero timeout drains whatever ROS messages are waiting
-    # and returns immediately, so the GUI never stalls.
+    executor = SingleThreadedExecutor()
+    executor.add_node(node)
     ros_timer = QTimer()
-    ros_timer.timeout.connect(lambda: rclpy.spin_once(node, timeout_sec=0))
+    ros_timer.timeout.connect(lambda: pump_ros(executor))
     ros_timer.start(20)
 
     try:

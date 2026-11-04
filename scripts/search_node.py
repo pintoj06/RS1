@@ -321,6 +321,9 @@ class SearchNode(Node):
         # unobserved ground as clear. See _confirmed_from / _reachable_from.
         self.confirmed = None
         self.possible = None
+        # When plan_sweep() started waiting for the lidar to map enough ground
+        # to plan from, or None if it is not waiting. See _too_little_mapped.
+        self._map_wait_started = None
         # How much of the area was confirmed reachable when the current path
         # was built, in coverage cells. _review_map() compares the live figure
         # against this to spot ground that has opened up or closed off since.
@@ -657,6 +660,17 @@ class SearchNode(Node):
         # drone lapping between "something left to look at" and "no there
         # isn't" for several seconds at the end of a run, commanding nothing.
         self.declare_parameter('min_unverified_area', 2.0)      # m2
+        # Do not plan until the lidar has confirmed at least this much clear
+        # ground around the drone. Planning on the first costmap, while the
+        # drone is still lifting off the ute, found no frontier to look from,
+        # took that as proof the whole area could not be seen, and wrote it
+        # all off: the drone flew one waypoint home and called the search
+        # done. At survey height the confirmed region is thousands of m2.
+        self.declare_parameter('min_confirmed_area', 50.0)      # m2
+        # Stop waiting for that after this long and plan anyway, so a drone
+        # that really is boxed in still does something. _finish_plan will not
+        # write ground off while the map is this thin, so nothing is lost.
+        self.declare_parameter('map_wait_timeout', 30.0)        # seconds
         # How much unverified ground one trip has to resolve to count as
         # progress, as a fraction of the area the operator drew.
         self.declare_parameter('vantage_progress_fraction', 0.02)
@@ -959,12 +973,50 @@ class SearchNode(Node):
             return False
 
         blocked = self._blocked_test(avoiding)
+        if not self._map_ready_to_plan():
+            return False
         chosen = self._choose_spacing(blocked)
         if chosen is None:               # no legs: a different question
             return self._nothing_to_sweep()
         predicted, footprint, source = chosen
         self._finish_plan()
         self._log_plan(avoiding, predicted, footprint, source)
+        return True
+
+    def _too_little_mapped(self):
+        """Has the lidar confirmed too little clear ground to judge anything?
+
+        On the ute, and for the first second or so of the climb, the confirmed
+        region is a few square metres round the drone. Nothing can be planned
+        or ruled out from that - there is no frontier yet, which is not the
+        same as there being nowhere to look from.
+        """
+        if self.confirmed is None or self.costmap is None:
+            return False
+        res = self.costmap.info.resolution
+        area = int(np.count_nonzero(self.confirmed)) * res * res
+        return area < float(self.get_parameter('min_confirmed_area').value)
+
+    def _map_ready_to_plan(self):
+        """Wait, up to map_wait_timeout, for enough of a map to plan from."""
+        if not self._too_little_mapped():
+            self._map_wait_started = None
+            return True
+        if self._map_wait_started is None:
+            self._map_wait_started = self._now()
+        waited = self._now() - self._map_wait_started
+        limit = float(self.get_parameter('map_wait_timeout').value)
+        if waited < limit:
+            self.get_logger().info(
+                'Waiting for the lidar to map the ground around the drone '
+                'before planning - from the pad it has seen too little to '
+                'tell open ground from rock...')
+            return False
+        self.get_logger().warn(
+            f'Still almost nothing mapped after {waited:.0f} s - planning '
+            f'anyway. Unmapped ground stays in the search rather than being '
+            f'written off.')
+        self._map_wait_started = None
         return True
 
     def _blocked_test(self, avoiding):
@@ -1181,7 +1233,17 @@ class SearchNode(Node):
             # flying home with a gap in the search is the one outcome the
             # operator must never be left to guess at.
             unseen = self._unverified_cells() * self.coverage_resolution ** 2
-            if unseen > 0:
+            if unseen > 0 and self._too_little_mapped():
+                # No vantage point because there is no frontier yet, not
+                # because every one has been tried. Writing the ground off on
+                # that is how a whole area once vanished at take-off. Keep it
+                # in the target: _review_map and _after_last_waypoint come
+                # back for it once there is a map to look from.
+                self.get_logger().warn(
+                    f'{unseen:.0f} m2 of the search area cannot be judged yet '
+                    f'- too little has been mapped to find anywhere to look '
+                    f'from. Keeping it in the search for when there is.')
+            elif unseen > 0:
                 self.get_logger().warn(
                     f'{unseen:.0f} m2 of the search area could not be checked: '
                     f'nowhere the drone can reach has a view of it, so it is '

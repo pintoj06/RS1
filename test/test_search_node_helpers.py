@@ -863,7 +863,8 @@ def planning_node(search_node):
                       '_choose_spacing', '_nothing_to_sweep', '_finish_plan',
                       '_log_plan', '_review_map', '_publish_coverage',
                       '_maybe_return_home', '_after_last_waypoint',
-                      '_start_pass', '_fly_home', '_coverage_summary'):
+                      '_start_pass', '_fly_home', '_coverage_summary',
+                      '_too_little_mapped', '_map_ready_to_plan'):
             locals()[_name] = getattr(SearchNode, _name)
         del _name
         # Still a staticmethod here, or self would be passed as its first
@@ -907,6 +908,8 @@ def planning_node(search_node):
             self.returning = False
             self.vantage_index = None
             self.last_coverage_log = 0.0
+            self._map_wait_started = None
+            self.t = 0.0                # what _now() reads; tests move it
             from builtin_interfaces.msg import Time as _T
             self.get_clock = lambda: SimpleNamespace(
                 now=lambda: SimpleNamespace(to_msg=lambda: _T()))
@@ -930,12 +933,19 @@ def planning_node(search_node):
                 fallback_camera_hfov=1.0472,
                 fallback_image_width=720,
                 fallback_image_height=480,
+                # Off by default so the small test maps here still plan;
+                # TestWaitsForAMapBeforePlanning turns it on.
+                min_confirmed_area=0.0,
+                map_wait_timeout=30.0,
             )
             self.inside_mask = self._build_inside_mask()
             self.cells_to_search = int(np.count_nonzero(self.inside_mask))
 
         def _lookup_robot_xy(self):
             return self.at
+
+        def _now(self):
+            return self.t
 
         def _set_status(self, state, detail=''):
             self.statuses.append((state, detail))
@@ -1878,3 +1888,64 @@ class TestTinyRemaindersAreNotChased:
         node._nothing_to_sweep()
         assert any('never verified' in m for m in node.logged), node.logged[-3:]
         assert node.unverifiable is not None
+
+
+class TestWaitsForAMapBeforePlanning:
+    """Measured in flight: the operator drew the area before LAUNCH, and the
+    node planned about a second after the first costmap, with the drone
+    still lifting off the ute. Nothing was confirmed clear, so there was no
+    frontier to look from, and _finish_plan took that as proof the area could
+    not be seen from anywhere: 264 m2 written off, target 0 cells, one
+    waypoint home and "Sweep complete" - the drone hovered over the truck.
+    """
+
+    def box(self):
+        return [(10.0, 10.0), (20.0, 10.0), (20.0, 20.0), (10.0, 20.0)]
+
+    def on_the_pad(self, planning_node):
+        """Nothing observed yet: the lidar on the ute has seen no clear ground."""
+        grid = make_costmap(60, 60, resolution=0.5, origin=(-5.0, -5.0),
+                            fill=-1)
+        node = planning_node(self.box(), grid)
+        node.get_parameter.values['min_confirmed_area'] = 50.0
+        return node
+
+    def test_waits_instead_of_planning_from_the_pad(self, planning_node):
+        node = self.on_the_pad(planning_node)
+        target = node.cells_to_search
+        assert node.plan_sweep() is False
+        assert not node.planned
+        assert node.unverifiable is None
+        assert node.cells_to_search == target
+        assert any('Waiting for the lidar' in m for m in node.logged)
+
+    def test_plans_once_the_lidar_has_seen_enough(self, planning_node):
+        node = self.on_the_pad(planning_node)
+        assert node.plan_sweep() is False
+        # Climbed to survey height: the ground round the drone is mapped.
+        fill_rect(node.costmap, 0, 60, 0, 60, 0)
+        assert node.plan_sweep() is True
+        assert node.points and node.points[0] != (0.0, 0.0)
+        assert node._map_wait_started is None
+
+    def test_gives_up_waiting_but_keeps_the_ground(self, planning_node):
+        """After the timeout it plans anyway - and the safety net in
+        _finish_plan stops that plan writing the area off."""
+        node = self.on_the_pad(planning_node)
+        target = node.cells_to_search
+        assert node.plan_sweep() is False
+        node.t = 31.0
+        assert node.plan_sweep() is True
+        assert node.cells_to_search == target, 'the area was written off'
+        assert node.unverifiable is None
+        assert any('cannot be judged yet' in m for m in node.logged)
+
+    def test_too_little_mapped(self, planning_node):
+        import numpy as np
+        node = self.on_the_pad(planning_node)
+        assert not node._too_little_mapped()        # no flood yet: no verdict
+        node.confirmed = np.zeros((60, 60), dtype=bool)
+        node.confirmed[:14, :14] = True             # 196 cells x 0.25 = 49 m2
+        assert node._too_little_mapped()
+        node.confirmed[:15, :14] = True             # 210 cells = 52.5 m2
+        assert not node._too_little_mapped()

@@ -221,15 +221,21 @@ global_costmap:
       global_frame: parrot2_odom
       robot_base_frame: parrot2_base_link
       use_sim_time: true
-      # A costmap that travels with the drone rather than being sized from a
-      # stored map. This is Nav2's standard outdoor/GPS configuration and it
-      # works at any altitude, with or without lidar returns.
-      rolling_window: true
-      width: 50
-      height: 50
+      # FIXED, not rolling, and the same bounds as the scout's (see
+      # nav2_params_parrot1.yaml). The rolling window was 50 x 50 m centred on
+      # the drone, so a contact more than 25 m away in x or y was off the map
+      # and the planner refused it outright ("worldToMap failed") - the
+      # courier never left the ute for four of the six casualty spots.
+      # parrot2_odom starts at the ute like parrot1_odom, so these bounds
+      # cover the same terrain (x -22..51, y -12..39) with margin.
+      rolling_window: false
+      origin_x: -30.0
+      origin_y: -25.0
+      width: 80
+      height: 80
       # Large courier (3x Parrot): body is 1.0 x 1.14 m, plus ~5 cm margin each side.
       footprint: '[ [0.55, 0.62], [0.55, -0.62], [-0.55, -0.62], [-0.55, 0.62] ]'
-      resolution: 0.1
+      resolution: 0.15  # as the scout: keeps the cell count near the old 50 m map
       # Treat never-observed cells as free. At survey altitude the lidar sees
       # nothing, so everything is unobserved; leaving this true stops the
       # planner from routing anywhere.
