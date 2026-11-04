@@ -295,7 +295,7 @@ class GroundStationNode(Node):
         self.declare_parameter("track_gate", 2.0)
         self.declare_parameter("track_timeout_s", 10.0)
         self.declare_parameter("rgb_hfov", 1.4)
-        self.declare_parameter("thermal_hfov", 1.0472)
+        self.declare_parameter("thermal_hfov", 1.4)
         self.declare_parameter("flight_altitude", 10.0)
         self.tracker = GroundTracker(
             float(self.get_parameter("track_gate").value),

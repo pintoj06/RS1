@@ -137,9 +137,9 @@ class YoloPersonDetector(Node):
         # from every edge, as a fraction of the image size. A box touching
         # the edge is a person half in view, which makes for evidence the
         # operator can't judge, so it is drawn as "entering" and not
-        # published. Safe for the thermal check: the thermal camera's 60 deg
-        # view sits inside the RGB camera's 80 deg one, ~15% in from each
-        # edge, so anything that triggered the check is already well inside.
+        # published. The thermal camera has the same 80 deg view as the RGB
+        # one, so heat at the very edge can start the thermal check while
+        # the person is still "entering" here.
         self.declare_parameter('edge_margin_frac', 0.05)
         self.declare_parameter('device', 'cpu')
         self.declare_parameter('publish_annotated', True)
