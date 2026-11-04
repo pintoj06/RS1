@@ -107,6 +107,10 @@ PLANNED     = "#00FF88"            # planned sweep route — bright green.
                                    # Kept clear of ALERT's yellow-green so
                                    # an unruled contact still reads as the
                                    # one thing wanting a decision.
+COURIER     = "#FFD23F"            # courier and its route to the contact —
+                                   # warm yellow, kept off ALERT's
+                                   # yellow-green so it never reads as a
+                                   # contact wanting a decision.
 
 PAGE_MAP, PAGE_VIS, PAGE_IR, PAGE_CONTACTS = range(4)
 
@@ -422,6 +426,20 @@ class GroundStationNode(Node):
         self.coverage_gap_reason = ""                    # and why
         # Planned sweep route, in the map frame once transformed.
         self.search_path: List[Tuple[float, float]] = []
+        # The courier's route to a confirmed contact, as Nav2 planned it, and
+        # where the courier is now - both in this map's frame. Nav2 replans
+        # about once a second while it is flying and stops when it is not
+        # (arrived, dropped, E-Stopped), so a route older than
+        # courier_plan_timeout_s is no longer being flown and is not drawn.
+        self.declare_parameter("courier_name", "parrot2")
+        self.declare_parameter("courier_plan_timeout_s", 3.0)
+        self.courier_name = str(self.get_parameter("courier_name").value)
+        self.courier_plan_timeout_s = float(
+            self.get_parameter("courier_plan_timeout_s").value)
+        self.courier_path: List[Tuple[float, float]] = []
+        self.courier_path_time = 0.0
+        self.courier_xy: Optional[Tuple[float, float]] = None
+        self.courier_yaw = 0.0
         # What the scout says it is doing. Without it the operator watches the
         # green path vanish and the drone fly out of the box with no way to
         # tell a finished search from a look-around trip from a crash.
@@ -484,6 +502,12 @@ class GroundStationNode(Node):
                               reliability=QoSReliabilityPolicy.RELIABLE,
                               durability=QoSDurabilityPolicy.TRANSIENT_LOCAL)
         self.create_subscription(Path, "search_path", self._on_path, path_qos)
+        # The courier's Nav2 planner output and its position. Absolute, since
+        # this node runs in the scout's namespace.
+        self.create_subscription(Path, f"/{self.courier_name}/plan",
+                                 self._on_courier_plan, 10)
+        self.create_subscription(Odometry, f"/{self.courier_name}/odometry",
+                                 self._on_courier_odometry, 10)
         self.create_subscription(String, "search_status", self._on_status, path_qos)
 
         self.decision_pub = self.create_publisher(String, "operator/decision", 10)
@@ -876,6 +900,59 @@ class GroundStationNode(Node):
         dy = tf.transform.translation.y
         self.search_path = [(p.pose.position.x + dx, p.pose.position.y + dy)
                             for p in msg.poses]
+
+    def _odom_to_map_shift(self) -> Tuple[float, float]:
+        """Offset from the scout's odom frame to this map's frame.
+
+        Zero before SLAM starts: until then the view is drawn in odom, as
+        _poll_pose explains.
+        """
+        try:
+            tf = self.tf_buffer.lookup_transform(
+                self.map_frame, self.odom_frame, rclpy.time.Time())
+        except Exception:
+            return 0.0, 0.0
+        return tf.transform.translation.x, tf.transform.translation.y
+
+    def _on_courier_plan(self, msg: Path):
+        """Store the courier's planned route in this map's frame.
+
+        The courier's odom frame and the scout's are both the Gazebo world
+        frame (see courier_node.py), so the courier's plan is already in the
+        scout's odom frame and needs only the same shift as search_path.
+        """
+        dx, dy = self._odom_to_map_shift()
+        self.courier_path = [(p.pose.position.x + dx, p.pose.position.y + dy)
+                             for p in msg.poses]
+        self.courier_path_time = time.monotonic()
+
+    def _on_courier_odometry(self, msg: Odometry):
+        # Raw Gazebo odometry is world pose, i.e. the shared odom frame.
+        dx, dy = self._odom_to_map_shift()
+        self.courier_xy = (msg.pose.pose.position.x + dx,
+                           msg.pose.pose.position.y + dy)
+        # The shift is translation only, so the heading carries straight over.
+        q = msg.pose.pose.orientation
+        self.courier_yaw = np.arctan2(2.0 * (q.w * q.z + q.x * q.y),
+                                      1.0 - 2.0 * (q.y ** 2 + q.z ** 2))
+
+    def courier_route(self) -> List[Tuple[float, float]]:
+        """What is left of the courier's route, from where it is now.
+
+        Empty when no route is being flown. The plan is up to a second old
+        and starts where the courier was then, so it is cut at the point
+        nearest the courier and joined to its live position.
+        """
+        if (len(self.courier_path) < 2 or time.monotonic()
+                - self.courier_path_time > self.courier_plan_timeout_s):
+            return []
+        if self.courier_xy is None:
+            return list(self.courier_path)
+        cx, cy = self.courier_xy
+        nearest = min(range(len(self.courier_path)),
+                      key=lambda i: (self.courier_path[i][0] - cx) ** 2
+                      + (self.courier_path[i][1] - cy) ** 2)
+        return [self.courier_xy] + self.courier_path[nearest + 1:]
 
     def _poll_pose(self):
         """Ask TF where the drone is, in the map's own frame.
@@ -1322,6 +1399,22 @@ class MapPage(QWidget):
             for a, b in zip(pts, pts[1:]):
                 p.drawLine(a, b)
 
+        # The courier's route to the contact, the part still ahead of it.
+        # Dash-dot so it is not read as the scout's dashed sweep, and over
+        # the trail so it is not lost under it. The contact marker drawn next
+        # sits at its far end.
+        route = self.node.courier_route() if self.show_path else []
+        if route:
+            pts = [self._world_to_widget(x, y) for x, y in route]
+            p.save()
+            p.setPen(QPen(QColor(COURIER), 2, Qt.DashDotLine))
+            for a, b in zip(pts, pts[1:]):
+                p.drawLine(a, b)
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(COURIER))
+            p.drawEllipse(pts[-1], 4, 4)
+            p.restore()
+
         if self.show_contacts:
             for c in self.contacts:
                 if c.status == "DISMISSED":
@@ -1334,15 +1427,14 @@ class MapPage(QWidget):
                 p.setPen(QPen(colour, 1))
                 p.drawText(QPointF(pos.x() + 15, pos.y() + 4), f"{c.id:02d}")
 
+        # Both drones as the same arrow, told apart by colour: the courier
+        # first, so the scout's arrow is on top where they overlap on the ute.
+        if self.node.courier_xy is not None:
+            self._draw_drone(p, self.node.courier_xy, self.node.courier_yaw,
+                             COURIER, BASE)
         if self.node.drone_xy:
-            pos = self._world_to_widget(*self.node.drone_xy)
-            p.save()
-            p.translate(pos)
-            p.rotate(-np.degrees(self.node.drone_yaw))
-            p.setBrush(QColor(DRONE))
-            p.setPen(QPen(QColor(TEXT), 1))
-            p.drawPolygon(QPointF(12, 0), QPointF(-7, 7), QPointF(-7, -7))
-            p.restore()
+            self._draw_drone(p, self.node.drone_xy, self.node.drone_yaw,
+                             DRONE, TEXT)
 
         # How much of the searchable ground has been swept. The one number
         # that answers "is this area done?", so it stays on screen rather than
@@ -1395,6 +1487,18 @@ class MapPage(QWidget):
         if self.PIP_MODES[self.pip_mode][1]:
             self._draw_pips(p)
 
+    def _draw_drone(self, p: QPainter, xy: Tuple[float, float], yaw: float,
+                    fill: str, outline: str):
+        """An arrow at xy pointing along yaw. save/restore so its brush does
+        not leak into whatever is drawn after it."""
+        p.save()
+        p.translate(self._world_to_widget(*xy))
+        p.rotate(-np.degrees(yaw))
+        p.setBrush(QColor(fill))
+        p.setPen(QPen(QColor(outline), 1))
+        p.drawPolygon(QPointF(12, 0), QPointF(-7, 7), QPointF(-7, -7))
+        p.restore()
+
     def _draw_area(self, p: QPainter):
         """Dashed amber while dragging, solid green once committed and sent.
         The live dimensions matter: an operator sizing a search box needs to
@@ -1442,6 +1546,10 @@ class MapPage(QWidget):
                 pw, ph, Qt.KeepAspectRatio, Qt.SmoothTransformation)
             p.drawPixmap(x, y, pix)
             p.setPen(QPen(QColor(LINE), 1))
+            # A border only: drawRect fills with the current brush, and a
+            # brush left set by anything drawn earlier would paint over the
+            # picture.
+            p.setBrush(Qt.NoBrush)
             p.drawRect(x, y, pix.width(), pix.height())
             p.setPen(QColor(MUTED))
             p.setFont(QFont("DejaVu Sans Mono", 8))
@@ -2023,7 +2131,10 @@ class MainWindow(QMainWindow):
                 "• <b>PIP</b>: a small camera picture over the map.<br>"
                 "• <b>ZOOM+ / ZOOM-</b>: zoom the map.<br>"
                 "• <b>AERIAL</b>: the aerial photo under the map.<br>"
-                "A boxed label means that option is on.",
+                "A boxed label means that option is on.<br>"
+                "The white arrow is the scout, the yellow arrow the "
+                "<b>courier</b>. While the courier flies to a confirmed "
+                "person, its route ahead is the yellow dash-dot line.",
                 lambda: [b for b in R if b.text()], PAGE_MAP),
             TutorialStep(
                 f"SET AREA  ({k % 'F6'})",
