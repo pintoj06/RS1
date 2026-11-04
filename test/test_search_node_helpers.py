@@ -366,6 +366,7 @@ def fake_review(search_node):
         def __init__(self):
             self.costmap = None
             self.confirmed = self.possible = None
+            self._shadow_cache = self._shadow_cache_for = None
             # A 10x10 m area as 10x10 one-metre coverage cells, origin (0, 0).
             self.coverage_resolution = 1.0
             self.cov_rows = self.cov_cols = 10
@@ -608,11 +609,15 @@ def fake_frontier(search_node):
         _is_reachable = SearchNode._is_reachable
         _polygon_mask_costmap = SearchNode._polygon_mask_costmap
         _line_of_sight = SearchNode._line_of_sight
+        _in_obstacle_shadow = SearchNode._in_obstacle_shadow
+        _shadowed_mask = SearchNode._shadowed_mask
+        _lines_clear = SearchNode._lines_clear
         _frontier_goal = SearchNode._frontier_goal
 
         def __init__(self):
             self.costmap = None
             self.confirmed = self.possible = None
+            self._shadow_cache = self._shadow_cache_for = None
             self.polygon = [(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)]
             self.looked_from = []
             self.at = (0.5, 0.5)
@@ -853,7 +858,9 @@ def planning_node(search_node):
     class PlanningNode:
         for _name in ('_is_blocked', '_costmap_grid', '_flood', '_reachable_from',
                       '_confirmed_from', '_is_reachable', '_project',
-                      '_polygon_mask_costmap', '_line_of_sight', '_frontier_goal',
+                      '_polygon_mask_costmap', '_line_of_sight',
+                      '_frontier_goal', '_in_obstacle_shadow',
+                      '_shadowed_mask', '_lines_clear',
                       '_unverified_cells', '_worth_looking',
                       '_write_off_unverified',
                       '_build_inside_mask', '_refresh_searchable',
@@ -877,6 +884,7 @@ def planning_node(search_node):
             self.cam_fx = self.cam_fy = 360.0
             self.cam_width, self.cam_height = 720, 480
             self.confirmed = self.possible = None
+            self._shadow_cache = self._shadow_cache_for = None
             self.unverifiable = None
             self.looked_from = []
             self.unverified_at_vantage = None
@@ -1944,3 +1952,99 @@ class TestPathIsOnlyTheSweep:
         legs = self.published(node)
         assert legs, 'no sweep legs published at all'
         assert len(legs) == node.home_index
+
+
+class TestObstacleShadow:
+    """Unknown ground behind mapped obstacle - in practice the inside of a
+    rock - must not be chased, and must not be drawn as "not checked yet".
+
+    It was both. The optimistic flood counts unknown as free, so until a rock
+    is mapped all the way round that flood gets into its interior round the
+    ends of the mapped face. The nearest unverified cell was then an interior
+    cell, the vantage point landed on the near face where nothing can be seen,
+    and the drone hopped along the face until the patience counter stopped it.
+    Measured on a live costmap: 44% of the cells being targeted sat behind
+    mapped rock.
+
+    Depth into unknown does NOT separate the two cases - shadowed and
+    unshadowed cells had almost the same median depth, 2.9 m against 2.6 m.
+    What separates them is whether a straight line from the nearest known-free
+    ground reaches the cell without crossing mapped obstacle.
+    """
+
+    UNKNOWN = -1
+
+    def rock_with_a_hollow(self):
+        """A mapped wall across the middle; unknown behind it, and unknown
+        off to the side that nothing blocks."""
+        grid = make_costmap(40, 40, resolution=1.0)
+        fill_rect(grid, 0, 40, 20, 40, self.UNKNOWN)   # everything above y=20
+        fill_rect(grid, 10, 30, 19, 20, LETHAL)        # a wall at y=19, x 10..30
+        return grid
+
+    @pytest.fixture
+    def node(self, search_node):
+        SearchNode = search_node.SearchNode
+
+        class N:
+            for _n in ('_is_blocked', '_costmap_grid', '_flood', '_reachable_from',
+                       '_confirmed_from', '_is_reachable', '_polygon_mask_costmap',
+                       '_line_of_sight', '_lines_clear', '_shadowed_mask',
+                       '_in_obstacle_shadow'):
+                locals()[_n] = getattr(SearchNode, _n)
+            del _n
+
+            def __init__(self):
+                self.costmap = None
+                self.confirmed = self.possible = None
+                self._shadow_cache = self._shadow_cache_for = None
+                self.polygon = [(0.0, 0.0), (40.0, 0.0), (40.0, 40.0), (0.0, 40.0)]
+                self.get_parameter = FakeParams(
+                    obstacle_cost_threshold=INSCRIBED,
+                    observation_gap_fill=0.0)
+
+            def flood(self, at):
+                self.confirmed = self._confirmed_from(at)
+                self.possible = self._reachable_from(at)
+        return N()
+
+    def test_ground_behind_the_wall_is_shadowed(self, node):
+        node.costmap = self.rock_with_a_hollow()
+        node.flood((20.5, 5.5))
+        grid, info = node._costmap_grid()
+        solid = grid >= INSCRIBED
+        # directly behind the wall
+        assert node._in_obstacle_shadow(20.5, 25.5, solid, info)
+
+    def test_ground_merely_unvisited_is_not_shadowed(self, node):
+        """Unknown off to the side, with nothing mapped in between. It is just
+        as deep in unknown, and must still be chased."""
+        node.costmap = self.rock_with_a_hollow()
+        node.flood((20.5, 5.5))
+        grid, info = node._costmap_grid()
+        solid = grid >= INSCRIBED
+        assert not node._in_obstacle_shadow(3.5, 25.5, solid, info)
+
+    def test_depth_alone_would_not_separate_them(self, node):
+        """The point of the test: both sample points sit the same distance
+        into unknown, and only one of them is behind something."""
+        import numpy as np
+        from scipy import ndimage
+        node.costmap = self.rock_with_a_hollow()
+        node.flood((20.5, 5.5))
+        d = ndimage.distance_transform_edt(~node.confirmed)
+        behind = d[25, 20]
+        beside = d[25, 3]
+        assert abs(behind - beside) < 4.0, (behind, beside)
+
+    def test_no_floods_means_no_claim(self, node):
+        node.costmap = self.rock_with_a_hollow()
+        assert node._shadowed_mask() is None
+
+    def test_the_mask_is_cached_per_costmap(self, node):
+        node.costmap = self.rock_with_a_hollow()
+        node.flood((20.5, 5.5))
+        first = node._shadowed_mask()
+        assert node._shadowed_mask() is first      # same object, not recomputed
+        node.costmap = self.rock_with_a_hollow()   # a new message
+        assert node._shadowed_mask() is not first

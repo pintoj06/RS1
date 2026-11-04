@@ -322,6 +322,8 @@ class SearchNode(Node):
         # unobserved ground as clear. See _confirmed_from / _reachable_from.
         self.confirmed = None
         self.possible = None
+        self._shadow_cache = None
+        self._shadow_cache_for = None
         # How much of the area was confirmed reachable when the current path
         # was built, in coverage cells. _review_map() compares the live figure
         # against this to spot ground that has opened up or closed off since.
@@ -2247,6 +2249,81 @@ class SearchNode(Node):
         np.clip(rows, 0, info.height - 1, out=rows)
         return ~(solid[rows, cols] & inside).any(axis=1)
 
+    def _in_obstacle_shadow(self, tx, ty, solid, info):
+        """Is this point hidden behind mapped obstacle? See _shadowed_mask."""
+        mask = self._shadowed_mask()
+        if mask is None:
+            return False
+        res = info.resolution
+        col = int((tx - info.origin.position.x) / res)
+        row = int((ty - info.origin.position.y) / res)
+        if not (0 <= col < info.width and 0 <= row < info.height):
+            return False
+        return bool(mask[row, col])
+
+    def _lines_clear(self, x0, y0, x1, y1, solid, info):
+        """Clear straight line from each (x0, y0) to its own (x1, y1)?
+
+        The pairwise form of _line_of_sight, so the whole map can be tested
+        in one go rather than a point at a time. Unknown cells do not block:
+        only mapped obstacle does.
+        """
+        res = info.resolution
+        if x0.size == 0:
+            return np.zeros(0, dtype=bool)
+        far = float(np.max(np.hypot(x1 - x0, y1 - y0)))
+        n = int(max(8, min(160, far / res)))
+        t = np.linspace(0.0, 1.0, n)[None, :]
+        px = x0[:, None] + (x1 - x0)[:, None] * t
+        py = y0[:, None] + (y1 - y0)[:, None] * t
+        cols = ((px - info.origin.position.x) / res).astype(np.int32)
+        rows = ((py - info.origin.position.y) / res).astype(np.int32)
+        inside = ((cols >= 0) & (cols < info.width)
+                  & (rows >= 0) & (rows < info.height))
+        np.clip(cols, 0, info.width - 1, out=cols)
+        np.clip(rows, 0, info.height - 1, out=rows)
+        return ~(solid[rows, cols] & inside).any(axis=1)
+
+    def _shadowed_mask(self):
+        """Unknown ground that sits behind mapped obstacle, for the whole map.
+
+        For each unknown cell, the straight line from the NEAREST known-free
+        ground to it. Inside a rock that line starts hard against the mapped
+        face and crosses it at once; for ground that is merely far away and
+        never visited it runs through unknown only. That is the distinction
+        that matters, and depth into unknown does not make it - measured on a
+        live costmap, shadowed and unshadowed cells had almost the same median
+        depth (2.9 m against 2.6 m) while being 44% and 56% of the total.
+
+        Cached per costmap message: it costs one distance transform and one
+        vectorised sight-line pass, and both the target choice and the
+        overlay want the answer.
+        """
+        if self.confirmed is None or self.possible is None or self.costmap is None:
+            return None
+        if self._shadow_cache_for is self.costmap:
+            return self._shadow_cache
+        unknown = self.possible & ~self.confirmed
+        grid, info = self._costmap_grid()
+        out = np.zeros_like(unknown)
+        if unknown.any() and self.confirmed.any():
+            solid = grid >= self.get_parameter('obstacle_cost_threshold').value
+            res = info.resolution
+            ox, oy = info.origin.position.x, info.origin.position.y
+            # nearest known-free cell for every cell, in one pass
+            _, (nr, nc) = ndimage.distance_transform_edt(
+                ~self.confirmed, return_indices=True)
+            ur, uc = np.nonzero(unknown)
+            x1 = ox + (uc + 0.5) * res
+            y1 = oy + (ur + 0.5) * res
+            x0 = ox + (nc[ur, uc] + 0.5) * res
+            y0 = oy + (nr[ur, uc] + 0.5) * res
+            clear = self._lines_clear(x0, y0, x1, y1, solid, info)
+            out[ur[~clear], uc[~clear]] = True
+        self._shadow_cache_for = self.costmap
+        self._shadow_cache = out
+        return out
+
     def _frontier_goal(self):
         """Somewhere to fly to in order to SEE ground we cannot yet judge.
 
@@ -2360,6 +2437,11 @@ class SearchNode(Node):
                                    min(order.size, 12)).astype(int)]
         for i in probes:
             target = (wx[i], wy[i])
+            # Skip ground hidden behind mapped obstacle - in practice the
+            # inside of a rock. Going to look at it from outside teaches
+            # nothing, and it is what had the drone hopping along the face.
+            if self._in_obstacle_shadow(target[0], target[1], solid_now, info_now):
+                continue
             reach = np.hypot(ex - target[0], ey - target[1])
             near = reach <= rng
             if not near.any():
@@ -2691,9 +2773,19 @@ class SearchNode(Node):
             unverified |= (in_shape & ~blocked
                            & ~self._project(self.confirmed))
 
+        # Unknown ground behind mapped obstacle is not "not checked yet" -
+        # it is ground we cannot get a look at, and in practice it is the
+        # inside of a rock. Drawing it amber alongside ground that really is
+        # still worth a look overstated what the drone was going to do about
+        # it. Grey says "cannot check", which is the honest reading.
+        shadowed = self._shadowed_mask()
+        hidden = (self._project(shadowed, default=False)
+                  if shadowed is not None
+                  else np.zeros_like(in_shape))
+
         published[in_shape] = COVER_UNVERIFIED
         published[in_shape & ~unverified] = COVER_TO_DO
-        published[blocked] = COVER_BLOCKED
+        published[blocked | (in_shape & unverified & hidden)] = COVER_BLOCKED
         published[in_shape & (self.coverage > 0)] = COVER_SEARCHED
         published = published.astype(np.int8)
         # OccupancyGrid data is a flat row-major list, same order as the array.
