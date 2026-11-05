@@ -324,6 +324,16 @@ class SearchNode(Node):
         self.possible = None
         self._shadow_cache = None
         self._shadow_cache_for = None
+        # What has EVER been reachable, and ever confirmed reachable, on the
+        # coverage grid. Both floods run from the drone's current position,
+        # so ground it has already flown over can drop out of them simply
+        # because it has moved on - and then the overlay paints searched
+        # ground as unverified and the "cannot be searched" figure climbs on
+        # its own. Seen in one run going 9% -> 68% while the drone searched.
+        # Ground is added as the map improves and only removed when it turns
+        # out to be rock, never because the viewpoint changed.
+        self.ever_reachable = None
+        self.ever_confirmed = None
         # How much of the area was confirmed reachable when the current path
         # was built, in coverage cells. _review_map() compares the live figure
         # against this to spot ground that has opened up or closed off since.
@@ -695,10 +705,17 @@ class SearchNode(Node):
         # you cannot bridge a missing 31 m by making walls fatter. The SLAM
         # map sealed at every width from 0.3 m to 1.0 m.
         self.declare_parameter('use_slam_walls', True)
-        # Treat a gap narrower than twice this as no way through: the drone
-        # is 0.25 m across and keeps 0.6 m of inflation, so it needs about
-        # 1.5 m to pass. Applied only to the walled-in test.
-        self.declare_parameter('slam_wall_inflate', 0.75)       # metres
+        # Close gaps narrower than twice this in SLAM's walls, so a hole the
+        # drone could not fit through is not read as a way in.
+        #
+        # Deliberately small. The costmap already inflates obstacles by 0.6 m,
+        # and 0.75 m here on top of that grew every wall by 1.35 m - enough to
+        # pinch shut the corridors around the mountain once its outline
+        # closed. The reachable region then fragmented, ground the drone had
+        # already flown over fell outside it, and the overlay showed searched
+        # ground as unverified. This only has to bridge the gaps BETWEEN
+        # laser returns, not stand in for the drone's width.
+        self.declare_parameter('slam_wall_inflate', 0.2)        # metres
         # How much unverified ground one trip has to resolve to count as
         # progress, as a fraction of the area the operator drew.
         self.declare_parameter('vantage_progress_fraction', 0.02)
@@ -795,6 +812,8 @@ class SearchNode(Node):
         self.map_replans = 0
         self.looked_from = []
         self.unverifiable = None
+        self.ever_reachable = None
+        self.ever_confirmed = None
         self.unverified_at_vantage = None
         self.fruitless_vantages = 0
 
@@ -1111,6 +1130,8 @@ class SearchNode(Node):
             # taking off and finding out afterwards.
             self.spacing = footprint * overlap
             radius = self._footprint_radius()
+            best_seen = -1.0
+            best = (self.spacing, [], 0.0)
             for attempt in range(6):
                 self.points = make_sweep_polygon(
                     self.polygon, self.spacing, is_blocked=blocked,
@@ -1118,6 +1139,16 @@ class SearchNode(Node):
                 predicted = self._predicted_coverage(self.points, radius)
                 if predicted >= 0.999:
                     break
+                # Tightening only helps when the gap is a spacing problem. If
+                # the shortfall is ground that cannot be reached at all, every
+                # attempt scores the same and the loop just spams the log and
+                # triples the number of legs for nothing.
+                if attempt and predicted <= best_seen + 0.005:
+                    self.spacing, self.points, predicted = best
+                    break
+                if predicted > best_seen:
+                    best_seen = predicted
+                    best = (self.spacing, self.points, predicted)
                 self.get_logger().warn(
                     f'Spacing {self.spacing:.2f} m would leave '
                     f'{100 * (1 - predicted):.1f}% of the area unsearched - '
@@ -1900,6 +1931,42 @@ class SearchNode(Node):
                     inside = not inside
         return inside
 
+    def _reach_picture(self):
+        """(ever reachable, ever confirmed) on the coverage grid.
+
+        Falls back to the live floods before anything has accumulated, so the
+        very first plan still has an answer. After that the accumulated
+        picture is used, which is what stops the searchable area wobbling as
+        the drone moves.
+        """
+        reach, conf = self.ever_reachable, self.ever_confirmed
+        if reach is None and self.possible is not None and self.costmap is not None:
+            reach = self._project(self.possible)
+        if conf is None and self.confirmed is not None and self.costmap is not None:
+            conf = self._project(self.confirmed)
+        return reach, conf
+
+    def _remember_reachable(self):
+        """Fold the current floods into what has EVER been reachable.
+
+        Both floods are computed from where the drone is standing, so taking
+        them at face value makes the searchable area wobble as it flies. This
+        keeps the union instead: ground is added as the map improves, and is
+        only taken away by _build_inside_mask when the costmap says it is
+        rock, which is real information rather than a change of viewpoint.
+        """
+        shape = (self.cov_rows, self.cov_cols)
+        for name, flood in (('ever_reachable', self.possible),
+                            ('ever_confirmed', self.confirmed)):
+            have = getattr(self, name)
+            if have is not None and have.shape != shape:
+                have = None                    # the area was redrawn
+            if flood is None or self.costmap is None:
+                setattr(self, name, have)
+                continue
+            now = self._project(flood)
+            setattr(self, name, now.copy() if have is None else (have | now))
+
     def _build_inside_mask(self):
         """Boolean grid marking which coverage cells are worth searching.
 
@@ -1915,7 +1982,9 @@ class SearchNode(Node):
         """
         avoiding = (bool(self.get_parameter('avoid_obstacles').value)
                     and self.costmap is not None)
-        possible = self.possible if avoiding else None
+        # Reachability accumulates; it does not come and go with the drone.
+        self._remember_reachable()
+        reach = self._reach_picture()[0] if avoiding else None
         mask = np.zeros((self.cov_rows, self.cov_cols), dtype=bool)
         # Kept alongside the searchable mask so the overlay can say WHY a cell
         # is not being searched instead of just leaving it blank. Accounting
@@ -1938,8 +2007,7 @@ class SearchNode(Node):
                 if avoiding and self._is_blocked(cell_x, cell_y):
                     blocked_mask[row, col] = True
                     continue
-                if possible is not None and not self._is_reachable(
-                        cell_x, cell_y, possible):
+                if reach is not None and not reach[row, col]:
                     blocked_mask[row, col] = True      # walled off, no way in
                     continue
                 if self.unverifiable is not None and self.unverifiable[row, col]:
@@ -2621,10 +2689,10 @@ class SearchNode(Node):
         conclusion rather than a guess - and it is reported to the operator in
         square metres at the same time, never applied quietly.
         """
-        if self.possible is None or self.confirmed is None:
+        reach, conf = self._reach_picture()
+        if reach is None or conf is None:
             return
-        gone = self.inside_mask & self._project(self.possible) \
-            & ~self._project(self.confirmed)
+        gone = self.inside_mask & reach & ~conf
         if self.unverifiable is None:
             self.unverifiable = gone
         else:
@@ -2652,11 +2720,10 @@ class SearchNode(Node):
         This is what tells "the area is rock" apart from "we have not looked
         at the area yet", which are very different things to report.
         """
-        if self.possible is None or self.confirmed is None:
+        reach, conf = self._reach_picture()
+        if reach is None or conf is None:
             return 0
-        maybe = self._project(self.possible)
-        sure = self._project(self.confirmed)
-        return int(np.count_nonzero(self.inside_mask & maybe & ~sure))
+        return int(np.count_nonzero(self.inside_mask & reach & ~conf))
 
     def _review_map(self):
         """Re-derive what is reachable, and replan when the answer changes.
@@ -2961,9 +3028,9 @@ class SearchNode(Node):
 
         # Inside the area and not confirmed reachable: the honest "unknown".
         unverified = in_shape & ~blocked & ~self.inside_mask
-        if self.confirmed is not None:
-            unverified |= (in_shape & ~blocked
-                           & ~self._project(self.confirmed))
+        _, conf = self._reach_picture()
+        if conf is not None:
+            unverified |= in_shape & ~blocked & ~conf
 
         # Unknown ground stays amber even when it sits behind the mapped
         # face, because "behind the face" does not mean "cannot check": from

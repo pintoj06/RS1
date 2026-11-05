@@ -371,11 +371,13 @@ def fake_review(search_node):
         _is_reachable = SearchNode._is_reachable
         _project = SearchNode._project
         _unverified_cells = SearchNode._unverified_cells
+        _reach_picture = SearchNode._reach_picture
         _review_map = SearchNode._review_map
 
         def __init__(self):
             self.costmap = None
             self.confirmed = self.possible = None
+            self.ever_reachable = self.ever_confirmed = None
             self._shadow_cache = self._shadow_cache_for = None
             # A 10x10 m area as 10x10 one-metre coverage cells, origin (0, 0).
             self.coverage_resolution = 1.0
@@ -633,6 +635,7 @@ def fake_frontier(search_node):
         def __init__(self):
             self.costmap = None
             self.confirmed = self.possible = None
+            self.ever_reachable = self.ever_confirmed = None
             self._shadow_cache = self._shadow_cache_for = None
             self.polygon = [(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)]
             self.looked_from = []
@@ -879,7 +882,9 @@ def planning_node(search_node):
                       '_nearest_known', '_lines_clear',
                       '_unverified_cells', '_worth_looking',
                       '_write_off_unverified',
-                      '_build_inside_mask', '_refresh_searchable',
+                      '_build_inside_mask', '_remember_reachable',
+                      '_reach_picture',
+                      '_refresh_searchable',
                       '_predicted_coverage', '_already_searched',
                       '_camera_fov', '_camera_altitude', '_footprint_radius',
                       'plan_sweep', '_blocked_test', '_skip_searched_ground',
@@ -904,6 +909,7 @@ def planning_node(search_node):
             self.cam_fx = self.cam_fy = 360.0
             self.cam_width, self.cam_height = 720, 480
             self.confirmed = self.possible = None
+            self.ever_reachable = self.ever_confirmed = None
             self._shadow_cache = self._shadow_cache_for = None
             self.unverifiable = None
             self.looked_from = []
@@ -2027,6 +2033,7 @@ class TestObstacleShadow:
             def __init__(self):
                 self.costmap = None
                 self.confirmed = self.possible = None
+                self.ever_reachable = self.ever_confirmed = None
                 self._shadow_cache = self._shadow_cache_for = None
                 self.polygon = [(0.0, 0.0), (40.0, 0.0), (40.0, 40.0), (0.0, 40.0)]
                 self.get_parameter = FakeParams(
@@ -2511,3 +2518,76 @@ class TestSlamWallsSealWhatTheCostmapCannot:
         shifted = node._slam_walls()
         assert not np.array_equal(walls_at_zero, shifted), \
             'the TF offset was ignored'
+
+
+class TestAccountingDoesNotWobble:
+    """In one run the "cannot be searched" figure climbed 9% -> 68% while the
+    drone was searching, and already-searched ground went back to amber.
+
+    Both floods are computed from where the drone is STANDING. When the
+    mountain's outline closed, the free space around it became corridors, and
+    moving on could drop ground the drone had already flown over out of the
+    reachable set. The overlay then repainted it as unverified and the
+    percentage fell. The ground had not changed; the viewpoint had.
+    """
+
+    def box(self):
+        return [(0.0, 0.0), (20.0, 0.0), (20.0, 20.0), (0.0, 20.0)]
+
+    def test_ground_once_reachable_stays_counted(self, planning_node):
+        import numpy as np
+        grid = make_costmap(60, 60, resolution=0.5, origin=(-5.0, -5.0))
+        node = planning_node(self.box(), grid)
+        node.possible = np.ones((60, 60), dtype=bool)
+        node.confirmed = np.ones((60, 60), dtype=bool)
+        node._remember_reachable()
+        before = int(node._build_inside_mask().sum())
+        assert before > 0
+
+        # the drone moves on and the flood from its new position reaches far
+        # less - the ground has not changed
+        node.possible = np.zeros((60, 60), dtype=bool)
+        node.confirmed = np.zeros((60, 60), dtype=bool)
+        node._remember_reachable()
+        after = int(node._build_inside_mask().sum())
+        assert after == before, \
+            f'searchable area collapsed from {before} to {after} because the drone moved'
+
+    def test_rock_still_removes_ground(self, planning_node):
+        """It must not become a ratchet that ignores real discoveries."""
+        import numpy as np
+        grid = make_costmap(60, 60, resolution=0.5, origin=(-5.0, -5.0))
+        node = planning_node(self.box(), grid)
+        node.possible = np.ones((60, 60), dtype=bool)
+        node.confirmed = np.ones((60, 60), dtype=bool)
+        node._remember_reachable()
+        before = int(node._build_inside_mask().sum())
+
+        fill_rect(grid, 20, 40, 20, 40, LETHAL)     # a rock is discovered
+        node.costmap = grid
+        after = int(node._build_inside_mask().sum())
+        assert after < before, 'newly mapped rock was not removed'
+
+    def test_a_new_area_starts_the_accounting_again(self, planning_node):
+        import numpy as np
+        grid = make_costmap(60, 60, resolution=0.5, origin=(-5.0, -5.0))
+        node = planning_node(self.box(), grid)
+        node.possible = np.ones((60, 60), dtype=bool)
+        node._remember_reachable()
+        assert node.ever_reachable is not None
+        node.ever_reachable = None          # what on_area_request does
+        node.ever_confirmed = None
+        node.possible = None
+        assert node._reach_picture() == (None, None)
+
+    def test_the_accumulator_follows_a_resized_grid(self, planning_node):
+        """A redrawn area gives a different coverage grid; a stale mask of the
+        wrong shape must not be carried over."""
+        import numpy as np
+        grid = make_costmap(60, 60, resolution=0.5, origin=(-5.0, -5.0))
+        node = planning_node(self.box(), grid)
+        node.possible = np.ones((60, 60), dtype=bool)
+        node._remember_reachable()
+        node.ever_reachable = np.ones((3, 3), dtype=bool)   # wrong shape
+        node._remember_reachable()
+        assert node.ever_reachable.shape == (node.cov_rows, node.cov_cols)
