@@ -97,7 +97,8 @@ def node_with(ground_station, rgb_hit=None, animal_hit=None):
     node = SimpleNamespace(rgb_hit=rgb_hit, animal_hit=animal_hit, rgb_fresh_s=1.5,
                            rgb_hit_xy=None, rgb_hit_track=None,
                            thermal_mask=None, animal_boxes=[], rgb_frame=None,
-                           person_min_pixels=600)
+                           person_min_pixels=600,
+                           thermal_enabled=True, rgb_enabled=True)
     cls = ground_station.GroundStationNode
     node.fresh_rgb_hit = lambda: cls.fresh_rgb_hit(node)
     node.fresh_animal_only = lambda: cls.fresh_animal_only(node)

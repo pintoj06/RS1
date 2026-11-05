@@ -131,6 +131,7 @@ def make_node(ground_station, project=None):
         person_min_pixels=600, rgb_hit=None, rgb_hit_xy=None,
         rgb_hit_track=None, _detections_time=0.0,
         thermal_mask=np.ones((H, W), bool),     # heat everywhere by default
+        thermal_enabled=True, rgb_enabled=True,  # SETUP page defaults
     )
     node.ground_point = project or (lambda u, v, w, h, fov, stamp: (u / 100, v / 100))
     return node
@@ -309,6 +310,8 @@ class TestNightFloodlight:
         sent = []
         node = SimpleNamespace(
             night_mode=night, holding=False, get_logger=FakeLogger,
+            # What the node picks when flashlight_mode is left unset.
+            flashlight_mode='THERMAL' if night else 'OFF',
             hold_pub=SimpleNamespace(publish=lambda m: None),
             light_pub=SimpleNamespace(publish=sent.append))
         cls = ground_station.GroundStationNode

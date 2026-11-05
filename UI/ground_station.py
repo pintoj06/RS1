@@ -17,7 +17,7 @@ Slot allocation is deliberate and fixed:
     E-STOP         bottom right, on every page. Stops every drone where it is;
                    only its own RESUME restarts them
 
-Keyboard equivalents: 1-4 left, F1-F6 right, Q/W/R bottom, Esc cancels an
+Keyboard equivalents: 1-5 left, F1-F7 right, Q/W/R bottom, Esc cancels an
 area drag, Space E-Stops (stop only - resuming takes a click on RESUME, so a
 stray key can never set the drones moving). E raises a fake contact for
 testing the interface.
@@ -47,6 +47,7 @@ from rclpy.qos import (QoSDurabilityPolicy, QoSHistoryPolicy, QoSProfile,
                        QoSReliabilityPolicy, qos_profile_sensor_data)
 
 from action_msgs.srv import CancelGoal
+from rcl_interfaces.msg import ParameterDescriptor
 from geometry_msgs.msg import (Point32, PointStamped, PolygonStamped,
                                Twist)
 from nav_msgs.msg import Odometry, OccupancyGrid, Path
@@ -114,7 +115,12 @@ COURIER     = "#FFD23F"            # courier and its route to the contact —
                                    # yellow-green so it never reads as a
                                    # contact wanting a decision.
 
-PAGE_MAP, PAGE_VIS, PAGE_IR, PAGE_CONTACTS = range(4)
+PAGE_MAP, PAGE_VIS, PAGE_IR, PAGE_CONTACTS, PAGE_SETTINGS = range(5)
+
+# The scout's flashlight: always off, always on, or on while the search holds
+# (THERMAL - heat holds the search, so the light comes on for the RGB check).
+FLASHLIGHT_MODES = ("OFF", "ON", "THERMAL")
+HEAT_STEP_K = 0.5    # one press of HEAT+ / HEAT- on the SETUP page
 
 # Six option select buttons down the right bezel. The map page fills all six;
 # other pages leave the spare slots blank rather than reflowing, so a given
@@ -546,11 +552,52 @@ class GroundStationNode(Node):
         # the thermal camera found; it goes off when the search resumes.
         self.declare_parameter("night_mode", False)
         self.night_mode = bool(self.get_parameter("night_mode").value)
+        # The operator can change all of the settings below on the SETUP
+        # page; these parameters only pick where they start.
+        #
+        # flashlight_mode: OFF, ON, or THERMAL (on exactly while the search
+        # holds, which is what night mode does). Empty picks THERMAL at night
+        # and OFF by day.
+        # Any type: the command line reads on / off / ON / OFF as YAML
+        # booleans, which a plain string parameter refuses with a crash.
+        self.declare_parameter("flashlight_mode", "",
+                               ParameterDescriptor(dynamic_typing=True))
+        mode = self.get_parameter("flashlight_mode").value
+        if isinstance(mode, bool):
+            mode = "ON" if mode else "OFF"
+        mode = str(mode).upper()
+        if mode not in FLASHLIGHT_MODES:
+            if mode:
+                self.get_logger().warn(
+                    f"flashlight_mode '{mode}' is not one of "
+                    f"{', '.join(FLASHLIGHT_MODES)}; using the default.")
+            mode = "THERMAL" if self.night_mode else "OFF"
+        self.flashlight_mode = mode
+        # Whether the light needs re-sending each second. Off until it is
+        # used, so a day run that never touches the light publishes nothing
+        # to it, as before this setting existed.
+        self._light_active = mode != "OFF"
         self.light_pub = self.create_publisher(Light, "flashlight", 10)
-        if self.night_mode:
-            # Re-sent each second: nothing latches on the Gazebo side, so a
-            # message sent before the bridge connects would be lost.
-            self.create_timer(1.0, lambda: self._send_light(self.holding))
+        # Re-sent each second: nothing latches on the Gazebo side, so a
+        # message sent before the bridge connects would be lost.
+        self.create_timer(1.0, self._resend_light)
+
+        # Which detectors may raise a contact. Both on is the normal rule:
+        # body heat AND a YOLO human. Thermal off (e.g. a hot day, when the
+        # ground is as warm as a person) means a YOLO human alone raises a
+        # contact; YOLO off means body heat alone does. At least one stays on.
+        self.declare_parameter("thermal_detection", True)
+        self.declare_parameter("rgb_detection", True)
+        self.thermal_enabled = bool(self.get_parameter("thermal_detection").value)
+        self.rgb_enabled = bool(self.get_parameter("rgb_detection").value)
+        if not (self.thermal_enabled or self.rgb_enabled):
+            self.get_logger().warn(
+                "thermal_detection and rgb_detection are both off, so nothing "
+                "could raise a contact. Turning thermal detection back on.")
+            self.thermal_enabled = True
+        # Ground position of the hot area in thermal_hit, for a contact
+        # raised on heat alone (YOLO off).
+        self.thermal_hit_xy: Optional[Tuple[float, float]] = None
 
         # Tells the courier drone where to fly. Transient local so a courier
         # started after the confirm still gets the last confirmed position.
@@ -697,6 +744,8 @@ class GroundStationNode(Node):
     def _on_detections(self, msg: Detection2DArray):
         now = time.monotonic()
         self._detections_time = now
+        if not self.rgb_enabled:
+            return            # still alive (above), but its boxes count for nothing
         if self.rgb_frame is not None:
             height, width = self.rgb_frame.shape[:2]
         else:
@@ -711,7 +760,8 @@ class GroundStationNode(Node):
         for d, xy, track in zip(msg.detections, points, tracks):
             if track is not None and track.dismissed:
                 continue      # the operator already ruled this one out
-            if not box_on_heat(self.thermal_mask, d.bbox, width, height):
+            if (self.thermal_enabled
+                    and not box_on_heat(self.thermal_mask, d.bbox, width, height)):
                 continue      # heat elsewhere in frame (e.g. a wombat) doesn't back this box
             for r in d.results:
                 if best is None or r.hypothesis.score > best[0]:
@@ -724,12 +774,14 @@ class GroundStationNode(Node):
 
     def fresh_rgb_hit(self) -> Optional[float]:
         """Confidence of a human seen in the last rgb_fresh_s, else None."""
-        if self.rgb_hit is None:
+        if self.rgb_hit is None or not self.rgb_enabled:
             return None
         conf, seen = self.rgb_hit
         return conf if time.monotonic() - seen < self.rgb_fresh_s else None
 
     def _on_animal_detections(self, msg: Detection2DArray):
+        if not self.rgb_enabled:
+            return
         best = max(((r.hypothesis.score, r.hypothesis.class_id)
                     for d in msg.detections for r in d.results), default=None)
         if best is not None:
@@ -778,8 +830,14 @@ class GroundStationNode(Node):
                 scaled = (kelvin - self.thermal_min_k) * (255.0 / span)
                 mono = np.clip(scaled, 0, 255).astype(np.uint8)
                 frame = cv2.applyColorMap(mono, cv2.COLORMAP_INFERNO)
-                self.thermal_hit = self._detect_person(kelvin, frame,
-                                                       msg.header.stamp)
+                if self.thermal_enabled:
+                    self.thermal_hit = self._detect_person(kelvin, frame,
+                                                           msg.header.stamp)
+                else:
+                    # Still shown on the IR page, but never holds or backs
+                    # anything.
+                    self.thermal_hit = self.thermal_mask = None
+                    self.thermal_hit_xy = None
                 self.thermal_frame = frame
             elif msg.encoding in ("mono8", "8UC1"):
                 mono = self.bridge.imgmsg_to_cv2(msg, "mono8")
@@ -824,9 +882,17 @@ class GroundStationNode(Node):
             for i in drop:
                 hot[labels == i] = False
         self.thermal_mask = hot
+        self.thermal_hit_xy = None
         count = int(np.count_nonzero(hot))
         if count < self.person_min_pixels:
             return None
+        if stamp is not None:
+            # Where the heat is on the ground, for a contact raised on heat
+            # alone when YOLO is switched off.
+            rows, cols = np.nonzero(hot)
+            self.thermal_hit_xy = self.ground_point(
+                float(cols.mean()), float(rows.mean()), hot.shape[1],
+                hot.shape[0], self.thermal_hfov, stamp)
         x, y, w, h = cv2.boundingRect(hot.astype(np.uint8))
         cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 214), 2)  # ALERT
         return float(kelvin[hot].max()), count
@@ -1108,8 +1174,67 @@ class GroundStationNode(Node):
         self.holding = hold
         self.hold_pub.publish(Bool(data=hold))
         self.get_logger().info("Search HOLD" if hold else "Search resumed")
-        if self.night_mode:
+        if self.flashlight_mode == "THERMAL":
             self._send_light(hold)
+
+    # -- operator settings (SETUP page) ------------------------------------
+    def light_on(self) -> bool:
+        """Whether the flashlight should be lit right now."""
+        return (self.flashlight_mode == "ON"
+                or (self.flashlight_mode == "THERMAL" and self.holding))
+
+    def _resend_light(self):
+        if self._light_active:
+            self._send_light(self.light_on())
+
+    def set_flashlight_mode(self, mode: str):
+        if mode not in FLASHLIGHT_MODES or mode == self.flashlight_mode:
+            return
+        self.flashlight_mode = mode
+        self._light_active = True
+        self._send_light(self.light_on())
+        self.get_logger().info(f"Setting: flashlight {mode}")
+
+    def set_person_min_k(self, kelvin: float):
+        """Body-heat threshold, kept inside the thermal display range so the
+        IR page can still show what the threshold picks out."""
+        kelvin = round(min(max(kelvin, self.thermal_min_k), self.thermal_max_k), 1)
+        if kelvin == self.person_min_k:
+            return
+        self.person_min_k = kelvin
+        self.get_logger().info(
+            f"Setting: minimum body heat {kelvin:.1f} K ({kelvin - 273.15:.1f} C)")
+
+    def set_thermal_detection(self, on: bool) -> bool:
+        """False, and no change, if this would leave no detector on."""
+        if not on and not self.rgb_enabled:
+            self.get_logger().warn(
+                "Thermal detection stays on: YOLO is off, and with both off "
+                "nothing could raise a contact.")
+            return False
+        if on != self.thermal_enabled:
+            self.thermal_enabled = on
+            # Heat seen before the switch must not hold or back anything.
+            self.thermal_hit = self.thermal_mask = self.thermal_hit_xy = None
+            self.get_logger().info(
+                f"Setting: thermal detection {'ON' if on else 'OFF'}")
+        return True
+
+    def set_rgb_detection(self, on: bool) -> bool:
+        """False, and no change, if this would leave no detector on."""
+        if not on and not self.thermal_enabled:
+            self.get_logger().warn(
+                "YOLO detection stays on: thermal is off, and with both off "
+                "nothing could raise a contact.")
+            return False
+        if on != self.rgb_enabled:
+            self.rgb_enabled = on
+            self.rgb_hit = self.rgb_hit_xy = self.rgb_hit_track = None
+            self.animal_hit = None
+            self.animal_boxes = []
+            self.get_logger().info(
+                f"Setting: YOLO detection {'ON' if on else 'OFF'}")
+        return True
 
     def _send_light(self, on: bool):
         """Switch the scout's floodlight. Gazebo replaces the whole light
@@ -1809,6 +1934,86 @@ class ContactsPage(QWidget):
         return self.list.currentRow()
 
 
+class SettingsPage(QWidget):
+    """Detection and flashlight settings. A readout only: the values are
+    changed with the right column, like every other page's options, so the
+    page works the same with a gloved finger or the F keys."""
+
+    LIGHT_TEXT = {
+        "OFF": "never on",
+        "ON": "on all the time",
+        "THERMAL": "on while the search holds to check body heat",
+    }
+
+    def __init__(self, node: GroundStationNode):
+        super().__init__()
+        self.node = node
+        self.setStyleSheet(f"background:{BASE};")
+        box = QVBoxLayout(self)
+        box.setContentsMargins(40, 30, 40, 30)
+        self.text = QLabel("")
+        self.text.setTextFormat(Qt.RichText)
+        self.text.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+        self.text.setWordWrap(True)
+        self.text.setStyleSheet(f"color:{TEXT}; border:none;"
+                                f"font-family:'DejaVu Sans Mono'; font-size:11pt;")
+        box.addWidget(self.text)
+        box.addStretch(1)
+        self.refresh()
+
+    def describe(self) -> str:
+        n = self.node
+        on = f'<span style="color:{CONFIRM}"><b>ON</b></span>'
+        off = f'<span style="color:{RED}"><b>OFF</b></span>'
+
+        def row(key, name, value, note):
+            return (f'<tr><td style="color:{MUTED}; padding:10px 18px 10px 0">'
+                    f'{key}</td><td style="padding:10px 18px 10px 0"><b>{name}'
+                    f'</b></td><td style="padding:10px 18px 10px 0">{value}</td>'
+                    f'<td style="color:{MUTED}; padding:10px 0">{note}</td></tr>')
+
+        lit = "lit now" if n.light_on() else "dark now"
+        if n.thermal_enabled and n.rgb_enabled:
+            rule = ("A contact needs body heat <b>and</b> the AI seeing a "
+                    "person on it.")
+        elif n.rgb_enabled:
+            rule = ("Thermal off: the AI seeing a person raises a contact "
+                    "on its own.")
+        else:
+            rule = ("AI off: body heat raises a contact on its own. Animals "
+                    "are warm too - dismiss them.")
+        notes = []
+        if n.flashlight_mode == "THERMAL" and not n.thermal_enabled:
+            notes.append("With thermal off, THERMAL only lights the "
+                         "flashlight while a contact holds the search.")
+        if n.person_min_k > 310.0:
+            notes.append("The threshold is above body heat (310 K): people "
+                         "may not register at all.")
+        return (
+            f'<p style="color:{MUTED}">SETUP — press the buttons on the right '
+            f'(F1–F5). Changes apply at once.</p>'
+            '<table cellspacing="0">'
+            + row("F1", "FLASHLIGHT", n.flashlight_mode,
+                  f"{self.LIGHT_TEXT[n.flashlight_mode]} ({lit})")
+            + row("F2/F3", "MIN BODY HEAT",
+                  f"{n.person_min_k:.1f} K ({n.person_min_k - 273.15:.1f} °C)",
+                  "thermal pixels this warm count as body heat")
+            + row("F4", "THERMAL DETECT", on if n.thermal_enabled else off,
+                  "body heat holds the search for a check")
+            + row("F5", "AI (YOLO) DETECT", on if n.rgb_enabled else off,
+                  "the RGB camera's person detector")
+            + '</table>'
+            f'<p>{rule}</p>'
+            # Not ALERT: that colour is kept for an unruled contact.
+            + "".join(f'<p style="color:{RED}">{t}</p>' for t in notes)
+            + f'<p style="color:{MUTED}">At least one detector stays on.</p>')
+
+    def refresh(self):
+        text = self.describe()
+        if text != self.text.text():     # rich text relayout is not free
+            self.text.setText(text)
+
+
 # ---------------------------------------------------------------------------
 # Tutorial
 # ---------------------------------------------------------------------------
@@ -2065,12 +2270,13 @@ class MainWindow(QMainWindow):
         self.vis_page = VideoPage(node, "display", "No camera feed")
         self.ir_page = VideoPage(node, "thermal", "No thermal feed")
         self.contacts_page = ContactsPage()
+        self.settings_page = SettingsPage(node)
 
         self.map_page.on_area_set = self._set_area
 
         self.stack = QStackedWidget()
         for page in (self.map_page, self.vis_page, self.ir_page,
-                     self.contacts_page):
+                     self.contacts_page, self.settings_page):
             self.stack.addWidget(page)
         self.stack.setStyleSheet(f"border:1px solid {LINE};")
 
@@ -2104,7 +2310,7 @@ class MainWindow(QMainWindow):
 
         grid.addWidget(self._status_strip(), 0, 0, 1, 3)
 
-        self.left_buttons = [BezelButton(f"L{i+1}") for i in range(4)]
+        self.left_buttons = [BezelButton(f"L{i+1}") for i in range(5)]
         left = QVBoxLayout()
         left.setSpacing(8)
         left.addStretch(1)
@@ -2188,6 +2394,12 @@ class MainWindow(QMainWindow):
         self.ai_label.setStyleSheet(f"color:{RED}; border:none; padding-left:24px;")
         row.addWidget(self.ai_label)
 
+        # Empty unless thermal detection is switched off (SETUP page).
+        self.ir_label = QLabel("")
+        self.ir_label.setFont(QFont("DejaVu Sans Mono", 10))
+        self.ir_label.setStyleSheet(f"color:{MUTED}; border:none; padding-left:24px;")
+        row.addWidget(self.ir_label)
+
         self.link_label = QLabel("LINK ---")
         self.link_label.setFont(QFont("DejaVu Sans Mono", 10))
         self.link_label.setStyleSheet(f"color:{MUTED}; border:none; padding-left:24px;")
@@ -2219,7 +2431,7 @@ class MainWindow(QMainWindow):
         def key(seq, handler):
             self._shortcuts.append(QShortcut(QKeySequence(seq), self, handler))
 
-        for i, k in enumerate(["1", "2", "3", "4"]):
+        for i, k in enumerate(["1", "2", "3", "4", "5"]):
             key(k, lambda n=i: self.select_page(n))
         for i in range(RIGHT_SLOTS):
             key(f"F{i+1}", lambda n=i: self._press_right(n))
@@ -2293,6 +2505,16 @@ class MainWindow(QMainWindow):
                 "This page also has <b>RESUME</b>, which restarts the search "
                 "after you confirm someone.",
                 lambda: [L[3]]),
+            TutorialStep(
+                f"SETUP  ({k % '5'})",
+                "Detection settings, changed with the right column:<br>"
+                "• <b>LIGHT</b>: the scout's flashlight OFF, ON, or THERMAL "
+                "(on while it stops to check body heat).<br>"
+                "• <b>HEAT+ / HEAT-</b>: how warm counts as body heat.<br>"
+                "• <b>IR DET / AI DET</b>: switch a detector off, e.g. "
+                "thermal on a hot day, and the other raises contacts on its "
+                "own. One always stays on.",
+                lambda: [L[4]]),
             TutorialStep(
                 f"Map tools  ({k % 'F1'}–{k % 'F7'})",
                 "The right column changes with the page; these are the map's.<br>"
@@ -2405,7 +2627,26 @@ class MainWindow(QMainWindow):
             ]
         if self.page == PAGE_CONTACTS:
             return [("RESUME", self._resume_search, False)] + [blank] * (RIGHT_SLOTS - 1)
+        if self.page == PAGE_SETTINGS:
+            n = self.node
+            return [
+                (f"LIGHT\n{n.flashlight_mode}", self._cycle_flashlight,
+                 n.flashlight_mode != "OFF"),
+                (f"HEAT+\n{n.person_min_k:.1f}K",
+                 lambda: n.set_person_min_k(n.person_min_k + HEAT_STEP_K), False),
+                ("HEAT-", lambda: n.set_person_min_k(n.person_min_k - HEAT_STEP_K),
+                 False),
+                ("IR DET", lambda: n.set_thermal_detection(not n.thermal_enabled),
+                 n.thermal_enabled),
+                ("AI DET", lambda: n.set_rgb_detection(not n.rgb_enabled),
+                 n.rgb_enabled),
+            ] + [blank] * (RIGHT_SLOTS - 5)
         return [blank] * RIGHT_SLOTS
+
+    def _cycle_flashlight(self):
+        modes = FLASHLIGHT_MODES
+        i = modes.index(self.node.flashlight_mode)
+        self.node.set_flashlight_mode(modes[(i + 1) % len(modes)])
 
     def _press_right(self, slot: int):
         actions = self._right_actions()
@@ -2427,7 +2668,8 @@ class MainWindow(QMainWindow):
         pending = sum(1 for c in self.contacts if c.status == "UNCONFIRMED")
         labels = [("MAP", TEXT), ("VIS", TEXT), ("IR", TEXT),
                   (f"CNTCT\n{len(self.contacts):02d}",
-                   ALERT if pending else TEXT)]
+                   ALERT if pending else TEXT),
+                  ("SETUP", TEXT)]
         for i, (btn, (label, tone)) in enumerate(zip(self.left_buttons, labels)):
             btn.configure(label, tone, boxed=(i == self.page))
 
@@ -2498,12 +2740,19 @@ class MainWindow(QMainWindow):
         self._update_hold()
 
     def _raise_contact(self, x: float, y: float, rgb_conf: float,
-                       thermal_conf: float):
-        obj = self.node.rgb_hit_xy or (None, None)
+                       thermal_conf: float, from_rgb: bool = True):
+        """from_rgb False: raised on heat alone (YOLO off), so the object is
+        the hot area and there is no YOLO track to dismiss with it."""
+        if from_rgb:
+            obj = self.node.rgb_hit_xy or (None, None)
+            track = self.node.rgb_hit_track
+        else:
+            obj = self.node.thermal_hit_xy or (None, None)
+            track = None
         self.contacts.insert(0, Contact(
             id=self._next_id, x=x, y=y,
             rgb_confidence=rgb_conf, thermal_confidence=thermal_conf,
-            obj_x=obj[0], obj_y=obj[1], track_id=self.node.rgb_hit_track))
+            obj_x=obj[0], obj_y=obj[1], track_id=track))
         self._next_id += 1
         self._select_newest = True
         self._update_hold()
@@ -2535,7 +2784,18 @@ class MainWindow(QMainWindow):
         contact is waiting for a ruling (the drone is already holding), or for
         dismiss_cooldown_s after a dismiss. A hit near a confirmed contact is
         the same person and is ignored, so RESUME doesn't re-trigger on them.
+
+        The SETUP page can switch one detector off. Thermal off: a YOLO human
+        raises the contact on its own. YOLO off: body heat raises it on its
+        own, at the heat's ground position (animals included - the operator
+        dismisses those).
         """
+        thermal_on, rgb_on = self.node.thermal_enabled, self.node.rgb_enabled
+        if self._check_until is not None and not (thermal_on and rgb_on):
+            # A detector was switched off mid-check: the check needs both,
+            # so it is over. With YOLO off, the heat raises a contact below.
+            self._check_until = None
+            self._update_hold()
         if any(c.status == "UNCONFIRMED" for c in self.contacts):
             return
         now = time.monotonic()
@@ -2553,19 +2813,24 @@ class MainWindow(QMainWindow):
         checking = self._check_until is not None
         rgb_conf = self.node.fresh_rgb_hit()
 
-        # Heat now, or heat that started the check still running.
-        if rgb_conf is not None and (heat is not None or checking):
+        # Heat now, or heat that started the check still running - or no
+        # heat needed, with thermal detection off.
+        if rgb_conf is not None and (heat is not None or checking
+                                     or not thermal_on):
             thermal_conf = heat_conf if heat is not None else 0.0
             if checking:
                 thermal_conf = max(thermal_conf, self._check_heat_conf)
             obj = self.node.rgb_hit_xy
             where = f" at ({obj[0]:.1f}, {obj[1]:.1f})" if obj else ""
+            why = ("thermal signature confirmed by RGB" if thermal_on
+                   else "RGB human (thermal detection off)")
             self.node.get_logger().warn(
-                f"Contact: thermal signature confirmed by RGB, "
+                f"Contact: {why}, "
                 f"human {rgb_conf:.0%}, track {self.node.rgb_hit_track}{where}")
             # Keep the frames that triggered the contact as evidence.
             self.vis_page.frozen = self.node.display_frame
-            self.ir_page.frozen = (self.node.thermal_frame if heat is not None
+            self.ir_page.frozen = (self.node.thermal_frame
+                                   if heat is not None or not checking
                                    else self._check_ir_frame)
             self._check_until = None
             # At the person, not the drone. obj is the detection projected
@@ -2575,6 +2840,21 @@ class MainWindow(QMainWindow):
             cx, cy = obj if obj else (x, y)
             self._raise_contact(cx, cy, rgb_conf=rgb_conf,
                                 thermal_conf=thermal_conf)
+            return
+
+        if not rgb_on:
+            # YOLO off: heat is the whole test. A dismissed one is not raised
+            # again: its dismissed track drops that blob in _detect_person.
+            if heat is not None and not self._near(x, y, self.rejected_spots):
+                obj = self.node.thermal_hit_xy
+                self.node.get_logger().warn(
+                    f"Contact: thermal signature ({count} px, peak "
+                    f"{peak_k:.1f} K), YOLO detection off")
+                self.vis_page.frozen = self.node.display_frame
+                self.ir_page.frozen = self.node.thermal_frame
+                cx, cy = obj if obj else (x, y)
+                self._raise_contact(cx, cy, rgb_conf=0.0,
+                                    thermal_conf=heat_conf, from_rgb=False)
             return
 
         animal = self.node.fresh_animal_only()
@@ -2667,7 +2947,9 @@ class MainWindow(QMainWindow):
         self.stack.currentWidget().update()
 
         self.page_label.setText(
-            ["MAP", "VISUAL", "THERMAL", "CONTACTS"][self.page])
+            ["MAP", "VISUAL", "THERMAL", "CONTACTS", "SETUP"][self.page])
+        if self.page == PAGE_SETTINGS:
+            self.settings_page.refresh()
 
         pending = sum(1 for c in self.contacts if c.status == "UNCONFIRMED")
         if pending:
@@ -2684,11 +2966,19 @@ class MainWindow(QMainWindow):
         else:
             self.hold_label.setText("SEARCH HOLD" if self.node.holding else "")
 
-        # Without the detector nothing can raise a contact, so say so.
+        # Without the detector nothing can raise a contact, so say so. A
+        # detector switched off on the SETUP page says OFF, on every page,
+        # so a changed rule is never a surprise.
         ai = self.node.detector_alive()
-        self.ai_label.setText("AI OK" if ai else "AI ---")
+        if not self.node.rgb_enabled:
+            self.ai_label.setText("AI OFF")
+            ai_tone = MUTED
+        else:
+            self.ai_label.setText("AI OK" if ai else "AI ---")
+            ai_tone = CONFIRM if ai else RED
         self.ai_label.setStyleSheet(
-            f"color:{CONFIRM if ai else RED}; border:none; padding-left:24px;")
+            f"color:{ai_tone}; border:none; padding-left:24px;")
+        self.ir_label.setText("" if self.node.thermal_enabled else "IR OFF")
 
         live = self.node.drone_xy is not None
         self.link_label.setText("LINK OK" if live else "LINK ---")

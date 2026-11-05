@@ -271,12 +271,17 @@ LIBGL_ALWAYS_SOFTWARE=1 HEADLESS=true NIGHT=true ./run_blue_mountains.sh
    (`ros_gz_interfaces/msg/Light`) to Gazebo `/world/large_demo/light_config`.
    Gazebo's UserCommands system (loaded by `config/ignition_server.config`)
    applies each message to the light of that name.
-5. `UI/ground_station.py`, `GroundStationNode`: when `night_mode` is true,
+5. `UI/ground_station.py`, `GroundStationNode`: `night_mode` picks the
+   starting `flashlight_mode`, THERMAL at night and OFF by day. In THERMAL,
    `set_hold()` calls `_send_light(hold)`, so the light is on exactly while the
    search is held (thermal check running, contact waiting, or after a confirm
-   until RESUME). A 1 s timer re-sends the current state, because a message
-   sent before the bridge connects is lost. With `night_mode` false neither
-   runs (`TestNightFloodlight` in `test/test_dismissed_objects.py`).
+   until RESUME). A 1 s timer (`_resend_light`) re-sends the current state,
+   because a message sent before the bridge connects is lost. A day run that
+   never touches the light publishes nothing to it (`TestNightFloodlight` in
+   `test/test_dismissed_objects.py`, `TestDefaultsUnchanged` in
+   `test/test_settings.py`).
+6. The operator can change the mode (OFF / ON / THERMAL) on the SETUP page,
+   see "Operator settings" below.
 
 Everything else is the normal contact workflow in
 `MainWindow._check_detections`: heat starts a check and holds the search, a
@@ -321,6 +326,24 @@ the person being missed:
 | Light brightness, cone, range | `_send_light` and the xacro `<light>` (change both) |
 | How long the light has to confirm | `rgb_check_s` ground station parameter (6 s) |
 
+### Operator settings (SETUP page)
+
+Page 5 of the ground station (`SETUP`, key `5`). The values change with the
+right column (F1–F5) and apply at once. Each also has a ground station
+parameter for where it starts.
+
+| Setting | Buttons | Parameter (default) | Effect |
+|---|---|---|---|
+| Flashlight | LIGHT cycles OFF → ON → THERMAL | `flashlight_mode` (empty: THERMAL at night, OFF by day) | THERMAL = on while the search holds |
+| Minimum body heat | HEAT+ / HEAT- (0.5 K) | `person_min_k` (305 K) | thermal pixels this warm count as body heat; kept inside `thermal_min_k`–`thermal_max_k` |
+| Thermal detection | IR DET | `thermal_detection` (true) | off: a YOLO human raises a contact without heat |
+| YOLO detection | AI DET | `rgb_detection` (true) | off: body heat raises a contact on its own, at the heat's ground position (`thermal_hit_xy`); animals too |
+
+At least one detector stays on. Switching one off mid-check ends the check.
+The status strip shows `AI OFF` / `IR OFF` while one is off. The logic is in
+the `set_*` methods of `GroundStationNode` and in `_check_detections`; tests
+in `test/test_settings.py`.
+
 ### Debugging
 
 - `[UserCommands.cc] Failed to find light with name [flashlight]` in the sim
@@ -353,10 +376,13 @@ Remove all of these together:
 2. `urdf_parrot/parrot.gazebo.xacro`: the `<gazebo reference="${prefix}base_link">`
    block holding `<light name="flashlight">`.
 3. `config/gazebo_bridge_parrot1.yaml`: the `flashlight` entry.
-4. `UI/ground_station.py`: the `night_mode` parameter, `light_pub` and timer in
-   `__init__`, the `_send_light` call in `set_hold`, `_send_light` itself, and
-   the `ros_gz_interfaces.msg.Light` import.
-5. `test/test_dismissed_objects.py`: `TestNightFloodlight`.
+4. `UI/ground_station.py`: the `night_mode` and `flashlight_mode` parameters,
+   `light_pub` and timer in `__init__`, the `_send_light` call in `set_hold`,
+   `light_on`, `_resend_light`, `set_flashlight_mode`, `_send_light` itself,
+   the LIGHT button on the SETUP page, and the `ros_gz_interfaces.msg.Light`
+   import.
+5. `test/test_dismissed_objects.py`: `TestNightFloodlight`, and
+   `test/test_settings.py`: `TestFlashlight`.
 
 Leave the related detection rules above unless they are what's wrong; they
 fix day-mode misses too. Rebuild with `colcon build --symlink-install`.
