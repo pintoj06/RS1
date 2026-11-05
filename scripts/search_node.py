@@ -875,6 +875,13 @@ class SearchNode(Node):
         self.possible = None
         self._shadow_cache = None
         self._shadow_cache_for = None
+        # Same for the per-cell memories: they are arrays shaped for the OLD
+        # grid. Left in place, a new area with fewer rows/cols made
+        # _build_inside_mask index past their end (IndexError, node died).
+        self.unverifiable = None
+        self.ever_reachable = None
+        self.ever_confirmed = None
+        self.unverified_at_vantage = None
 
         # The coverage grid is sized to the polygon, so it has to be rebuilt -
         # otherwise progress would be measured against the old shape.
