@@ -449,6 +449,8 @@ class GroundStationNode(Node):
         self.courier_path_time = 0.0
         self.courier_xy: Optional[Tuple[float, float]] = None
         self.courier_yaw = 0.0
+        # RETURNING, HOME or RETURN_FAILED once the package is dropped.
+        self.courier_state: Optional[str] = None
         # What the scout says it is doing. Without it the operator watches the
         # green path vanish and the drone fly out of the box with no way to
         # tell a finished search from a look-around trip from a crash.
@@ -521,6 +523,8 @@ class GroundStationNode(Node):
                                  self._on_courier_plan, 10)
         self.create_subscription(Odometry, f"/{self.courier_name}/odometry",
                                  self._on_courier_odometry, 10)
+        self.create_subscription(String, "/aeroaid/courier_state",
+                                 self._on_courier_state, path_qos)
         self.create_subscription(String, "search_status", self._on_status, path_qos)
         self.create_subscription(PointStamped, "search_vantage",
                                  self._on_vantage, path_qos)
@@ -990,6 +994,13 @@ class GroundStationNode(Node):
         self.courier_yaw = np.arctan2(2.0 * (q.w * q.z + q.x * q.y),
                                       1.0 - 2.0 * (q.y ** 2 + q.z ** 2))
 
+    def _on_courier_state(self, msg: String):
+        self.courier_state = msg.data
+
+    def courier_used(self) -> bool:
+        """It carries one package and only flies once, see courier_node.py."""
+        return self.courier_state in ("HOME", "RETURN_FAILED")
+
     def courier_route(self) -> List[Tuple[float, float]]:
         """What is left of the courier's route, from where it is now.
 
@@ -1197,6 +1208,10 @@ class GroundStationNode(Node):
         recorded. The courier reads this robot's TF to convert the point
         into its own frame (see courier_node.py).
         """
+        if self.courier_used():
+            self.get_logger().warn(
+                f"Contact confirmed at ({x:.1f}, {y:.1f}), but the courier has "
+                f"already used its package and will not fly.")
         msg = PointStamped()
         msg.header.frame_id = self.map_frame
         msg.header.stamp = self.get_clock().now().to_msg()
@@ -1600,6 +1615,13 @@ class MapPage(QWidget):
                 p.setFont(QFont("DejaVu Sans Mono", 9))
                 p.setPen(QColor(MUTED))
                 p.drawText(18, 44, self.node.search_detail[:68])
+            if self.node.courier_state:
+                p.setFont(QFont("DejaVu Sans Mono", 9, QFont.Bold))
+                p.setPen(QColor(COURIER))
+                note = self.node.courier_state.replace("_", " ")
+                if self.node.courier_used():
+                    note += " - PACKAGE USED"
+                p.drawText(18, 60, "COURIER " + note)
 
         if self.show_coverage and self.node.coverage_percent is not None:
             p.setFont(QFont("DejaVu Sans Mono", 10, QFont.Bold))
@@ -2026,6 +2048,10 @@ class MainWindow(QMainWindow):
         # A confirmed person keeps the drone holding over them until the
         # operator explicitly resumes the search.
         self.hold_for_confirmed = False
+        self._mission_over = False
+        # An area was drawn after the latest confirm: when the courier gets
+        # back the scout searches that, so heat checks must stay on.
+        self._area_since_confirm = False
 
         self.setWindowTitle("AeroAid  ground station")
         self.resize(1440, 900)
@@ -2040,7 +2066,7 @@ class MainWindow(QMainWindow):
         self.ir_page = VideoPage(node, "thermal", "No thermal feed")
         self.contacts_page = ContactsPage()
 
-        self.map_page.on_area_set = self.node.publish_search_area
+        self.map_page.on_area_set = self._set_area
 
         self.stack = QStackedWidget()
         for page in (self.map_page, self.vis_page, self.ir_page,
@@ -2443,6 +2469,7 @@ class MainWindow(QMainWindow):
         self.vis_page.frozen = None
         self.ir_page.frozen = None
         if decision == "CONFIRMED":
+            self._area_since_confirm = False
             self.node.publish_confirmed_point(c.x, c.y)
             self.hold_for_confirmed = True
         else:
@@ -2606,7 +2633,30 @@ class MainWindow(QMainWindow):
     def _toggle_blink(self):
         self._blink = not self._blink
 
+    def _end_mission_if_courier_done(self):
+        """The courier is done, and the scout flies home on the same message.
+        Let go of it, and stop checking for heat on the way: a contact still
+        waiting for a ruling does keep it there, since that is a person's
+        decision to make."""
+        if self._mission_over or self.node.courier_state not in ("HOME", "RETURN_FAILED"):
+            return
+        self._mission_over = True
+        self.hold_for_confirmed = False
+        self._check_until = None
+        if not self._area_since_confirm:
+            self._no_check_until = float("inf")
+        self._update_hold()
+
+    def _set_area(self, min_x: float, min_y: float, max_x: float, max_y: float):
+        """The operator drew an area. If the scout has already been sent home,
+        this is a new search, so heat checks come back on."""
+        self._area_since_confirm = True
+        if self._mission_over:
+            self._no_check_until = 0.0
+        self.node.publish_search_area(min_x, min_y, max_x, max_y)
+
     def refresh(self):
+        self._end_mission_if_courier_done()
         self._check_detections()
         self.map_page.contacts = self.contacts
         self.contacts_page.refresh(self.contacts)

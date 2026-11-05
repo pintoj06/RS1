@@ -15,6 +15,7 @@
 #   HEADLESS=true ./run_blue_mountains.sh     no Gazebo window, faster
 #   PERSON_SPOT=3 ./run_blue_mountains.sh     casualty at a fixed spot
 #   NIGHT=true ./run_blue_mountains.sh        dark world, thermal-led search
+#   RETURN_AFTER_DELIVERY=false ./run_blue_mountains.sh   courier stays at the contact
 
 set -u
 
@@ -50,6 +51,9 @@ HEADLESS=${HEADLESS:-false}
 # the search and switches on the scout's floodlight so the RGB detector can
 # confirm (night_mode in UI/ground_station.py).
 NIGHT=${NIGHT:-false}
+
+# After the drop the courier flies back to its pad, then the scout flies home.
+RETURN_AFTER_DELIVERY=${RETURN_AFTER_DELIVERY:-true}
 
 # Where the casualty (person1) stands. One of these is picked at random each
 # run, with a random yaw, so the search is not always solving the same
@@ -213,7 +217,8 @@ sleep 2
 
 echo "5/5  Courier"
 tab "courier" "ros2 launch $PKG 41068_courier_demo.launch.py robot:=$COURIER \
-    target_world_x:=$PERSON_X target_world_y:=$PERSON_Y"
+    target_world_x:=$PERSON_X target_world_y:=$PERSON_Y \
+    return_after_delivery:=$RETURN_AFTER_DELIVERY"
 
 cat <<EOF
 
