@@ -671,6 +671,17 @@ class SearchNode(Node):
         # catches the strongly inflated ring around an obstacle. (The old
         # default of 200 could never be reached, so nothing was ever blocked.)
         self.declare_parameter('obstacle_cost_threshold', 77)
+        # Cost at or above which a cell blocks the CAMERA's view along the
+        # ground. Deliberately higher than the planning threshold: 77 catches
+        # Nav2's inflated ring, which is a margin for the drone's width and
+        # has no physical height at all - the camera looks down over it.
+        #
+        # With 77 used here, flying along the side of the mountain put the
+        # drone INSIDE that ring, its own cell read as obstacle, and every
+        # sight line failed at once: the whole camera footprint was thrown
+        # away and the percentage stopped climbing over ground in plain view.
+        # 99 is inscribed-and-above, i.e. where the obstacle really is.
+        self.declare_parameter('sight_block_threshold', 99)
         # How far to stay back from an obstacle edge, on top of inflation.
         self.declare_parameter('obstacle_clearance', 1.0)
         # Pieces of a split leg shorter than this are not worth flying.
@@ -2919,17 +2930,29 @@ class SearchNode(Node):
                                      np.array([tx]), np.array([ty]),
                                      solid, info)[0]
 
-    def _lines_clear(self, x0, y0, x1, y1, solid, info):
+    def _lines_clear(self, x0, y0, x1, y1, solid, info, skip_start=False):
         """Clear straight line from each (x0, y0) to its own (x1, y1)?
 
         The pairwise form of _line_of_sight, so the whole map can be tested
         in one go rather than a point at a time. Unknown cells do not block:
         only mapped obstacle does.
+
+        skip_start ignores obstacle within the cell the viewer is standing
+        in, because a viewer cannot occlude itself. The drone's own cell
+        reads as obstacle more often than you would expect - sitting on the
+        launch pad, or flying inside the inflated ring beside the mountain -
+        and counting it failed EVERY line in the same call, so nothing at
+        all was recorded as seen.
+
+        It has to be a distance, not just the first sample: the samples are
+        spaced by the LONGEST line in the batch, so on a shorter one several
+        of the first can land inside the start cell.
         """
         res = info.resolution
         if x0.size == 0:
             return np.zeros(0, dtype=bool)
-        far = float(np.max(np.hypot(x1 - x0, y1 - y0)))
+        length = np.hypot(x1 - x0, y1 - y0)
+        far = float(np.max(length))
         n = int(max(8, min(160, far / res)))
         t = np.linspace(0.0, 1.0, n)[None, :]
         px = x0[:, None] + (x1 - x0)[:, None] * t
@@ -2940,7 +2963,11 @@ class SearchNode(Node):
                   & (rows >= 0) & (rows < info.height))
         np.clip(cols, 0, info.width - 1, out=cols)
         np.clip(rows, 0, info.height - 1, out=rows)
-        return ~(solid[rows, cols] & inside).any(axis=1)
+        hit = solid[rows, cols] & inside
+        if skip_start:
+            # 1.5 cells clears the diagonal of the one the viewer is in.
+            hit = hit & ((length[:, None] * t) > res * 1.5)
+        return ~hit.any(axis=1)
 
     def _nearest_known(self):
         """For every cell, the index of the nearest known-free cell.
@@ -3350,12 +3377,15 @@ class SearchNode(Node):
 
         if candidates and self.costmap is not None:
             grid, info = self._costmap_grid()
-            solid = grid >= self.get_parameter('obstacle_cost_threshold').value
+            # sight_block_threshold, not obstacle_cost_threshold: see the
+            # parameter's comment. What stops the drone flying somewhere is
+            # not what stops the camera seeing it.
+            solid = grid >= self.get_parameter('sight_block_threshold').value
             xs = np.array([c[2] for c in candidates])
             ys = np.array([c[3] for c in candidates])
             seen = self._lines_clear(np.full(xs.shape, robot_x),
                                      np.full(ys.shape, robot_y),
-                                     xs, ys, solid, info)
+                                     xs, ys, solid, info, skip_start=True)
         else:
             seen = np.ones(len(candidates), dtype=bool)
 

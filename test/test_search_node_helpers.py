@@ -2474,6 +2474,7 @@ class TestCoverageDoesNotSeeThroughWalls:
                 self.published = 0
                 self.get_parameter = FakeParams(
                     obstacle_cost_threshold=INSCRIBED,
+                    sight_block_threshold=INSCRIBED,
                     flight_altitude=10.0, fallback_camera_hfov=1.0472,
                     fallback_image_width=720, fallback_image_height=480)
 
@@ -2485,6 +2486,88 @@ class TestCoverageDoesNotSeeThroughWalls:
         col = int((x - node.cov_origin_x) / node.coverage_resolution)
         row = int((y - node.cov_origin_y) / node.coverage_resolution)
         return bool(node.coverage[row, col] > 0)
+
+    def params(self, node, **over):
+        """The real defaults: planning blocks at 77, sight only at 99."""
+        values = dict(obstacle_cost_threshold=77,
+                      sight_block_threshold=INSCRIBED,
+                      flight_altitude=10.0, fallback_camera_hfov=1.0472,
+                      fallback_image_width=720, fallback_image_height=480)
+        values.update(over)
+        node.get_parameter = FakeParams(**values)
+
+    def test_rock_under_the_drone_does_not_throw_away_the_footprint(self, node):
+        """One solid cell under the drone used to fail EVERY sight line in
+        the call, because each ray was sampled at its own start. Flying off
+        the launch pad - which reads as obstacle - nothing at all was
+        recorded as searched, including open ground in plain view."""
+        import numpy as np
+        grid = make_costmap(200, 200, resolution=0.15, origin=(-15.0, -15.0))
+        here = int((0.0 + 15.0) / 0.15)
+        set_cell(grid, here, here, LETHAL)          # the drone's own cell
+        node.costmap = grid
+        node.at = (0.0, 0.0)
+
+        cells, info = node._costmap_grid()
+        solid = cells >= INSCRIBED
+        xs = np.array([3.0, -3.0, 0.0])
+        ys = np.array([3.0, -3.0, 4.0])
+        zeros = np.zeros(3)
+        old = node._lines_clear(zeros, zeros, xs, ys, solid, info,
+                                skip_start=False)
+        assert not old.any(), \
+            'the setup no longer reproduces the bug, so the test proves nothing'
+        new = node._lines_clear(zeros, zeros, xs, ys, solid, info,
+                                skip_start=True)
+        assert new.all(), 'the drone is still occluding itself'
+
+        node.update_coverage()
+        assert self.covered_at(node, 3.0, 3.0), \
+            'nothing was recorded although the ground was in plain view'
+
+    def test_the_inflated_ring_does_not_blind_the_camera(self, node):
+        """Flying along the side of the mountain puts the drone inside Nav2's
+        inflated ring. That ring is a margin for the drone's width with no
+        physical height, and the camera looks straight down over it - so it
+        must not be judged by the planning threshold."""
+        import numpy as np
+        self.params(node)
+        grid = make_costmap(200, 200, resolution=0.15, origin=(-15.0, -15.0))
+        lo = int((-0.6 + 15.0) / 0.15)
+        hi = int((0.6 + 15.0) / 0.15)
+        fill_rect(grid, lo, hi, lo, hi, 80)     # inflation: over 77, under 99
+        node.costmap = grid
+        node.at = (0.0, 0.0)
+
+        cells, info = node._costmap_grid()
+        xs, ys, zeros = np.array([3.0]), np.array([3.0]), np.zeros(1)
+        planning = node._lines_clear(zeros, zeros, xs, ys, cells >= 77, info,
+                                     skip_start=True)
+        assert not planning.any(), \
+            'the setup no longer reproduces the bug, so the test proves nothing'
+        sight = node._lines_clear(zeros, zeros, xs, ys, cells >= INSCRIBED,
+                                  info, skip_start=True)
+        assert sight.all(), 'the inflation margin still blocks the camera'
+
+        node.update_coverage()
+        assert self.covered_at(node, 3.0, 3.0), \
+            'the inflated ring blinded the camera to open ground'
+
+    def test_real_rock_between_the_two_still_blocks(self, node):
+        """The point of the sight test in the first place: 18.5 m2 of the
+        inside of a mountain had been marked searched. Loosening the
+        threshold must not bring that back."""
+        self.params(node)
+        grid = make_costmap(200, 200, resolution=0.15, origin=(-15.0, -15.0))
+        lo = int((2.0 + 15.0) / 0.15)
+        hi = int((2.6 + 15.0) / 0.15)
+        fill_rect(grid, lo, hi, 0, 200, LETHAL)     # real rock at x 2.0..2.6
+        node.costmap = grid
+        node.at = (0.0, 0.0)
+        node.update_coverage()
+        assert self.covered_at(node, 1.0, 0.0), 'this side of the rock was lost'
+        assert not self.covered_at(node, 4.0, 0.0), \
+            'marked ground behind solid rock as searched'
 
     def test_open_ground_under_the_camera_is_covered(self, node):
         node.costmap = make_costmap(200, 200, resolution=0.15, origin=(-15.0, -15.0))
