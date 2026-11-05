@@ -47,7 +47,9 @@ from rclpy.node import Node
 from rclpy.qos import (QoSDurabilityPolicy, QoSHistoryPolicy, QoSProfile,
                        QoSReliabilityPolicy, qos_profile_sensor_data)
 
-from geometry_msgs.msg import Point32, PointStamped, PolygonStamped
+from action_msgs.srv import CancelGoal
+from geometry_msgs.msg import (Point32, PointStamped, PolygonStamped,
+                               Twist)
 from nav_msgs.msg import Odometry, OccupancyGrid, Path
 from sensor_msgs.msg import Image
 from std_msgs.msg import Bool, String
@@ -573,6 +575,41 @@ class GroundStationNode(Node):
         self.estopped = False
         self.estop_pub.publish(Bool(data=False))
 
+        # The button does not trust the drones' own nodes.
+        #
+        # It used to do one thing: publish /aeroaid/estop and leave each node
+        # to cancel its own Nav2 goal. That works only while those nodes are
+        # healthy, and the one time it was really needed they were not - the
+        # search node had been killed by a MemoryError and the scout flew on
+        # with nobody left to hear the button. A stop that needs the thing it
+        # is stopping to still be working is not a stop.
+        #
+        # So the ground station now also stops the drones itself, by two
+        # routes that between them cover both ways a drone can still be
+        # moving with its node gone:
+        #
+        #   cancel_goal - cancels whatever Nav2 is executing, whoever asked
+        #   for it. In the action protocol a CancelGoal request with a zero
+        #   goal id and a zero stamp means every goal, so a default-built
+        #   request stops a goal this process never sent.
+        #
+        #   cmd_vel held at zero - for the climb, which takeoff_node drives
+        #   as raw velocity with Nav2 not involved at all, and for a last
+        #   command left standing after Nav2 itself has gone. Held, not sent
+        #   once, because the drone keeps the last velocity it was given.
+        self.declare_parameter("estop_cancel_nav", True)
+        self.declare_parameter("estop_zero_velocity", True)
+        self.declare_parameter("estop_zero_period_s", 0.1)
+        estop_drones = [self.robot_name, self.courier_name]
+        self.estop_cancel = {
+            name: self.create_client(
+                CancelGoal, f"/{name}/navigate_to_pose/_action/cancel_goal")
+            for name in estop_drones}
+        self.estop_cmd = {
+            name: self.create_publisher(Twist, f"/{name}/cmd_vel", 10)
+            for name in estop_drones}
+        self.estop_zero_timer = None
+
         self.create_timer(0.1, self._poll_pose)
 
         self.get_logger().info(f"Ground station up for {self.robot_name}")
@@ -1080,8 +1117,52 @@ class GroundStationNode(Node):
         self.estop_pub.publish(Bool(data=stop))
         if stop:
             self.get_logger().warn("E-STOP: all drones stopping")
+            self.stop_the_drones()
         else:
             self.get_logger().info("E-Stop released: drones resuming")
+            self.let_the_drones_fly()
+
+    def stop_the_drones(self):
+        """Stop both drones without needing their nodes to cooperate.
+
+        Belt and braces on purpose. Cancelling the Nav2 goal is the clean
+        stop and leaves Nav2 able to fly again on RESUME; zeroing cmd_vel is
+        what actually stops a drone whose node has died mid-climb, when
+        there is no goal to cancel. Neither depends on search_node or
+        courier_node being alive to hear the topic.
+        """
+        for name, client in self.estop_cancel.items():
+            if not self.get_parameter("estop_cancel_nav").value:
+                break
+            if not client.service_is_ready():
+                # Not a failure of the E-Stop: either Nav2 is not up, so
+                # nothing is flying under it, or it is gone, which is exactly
+                # the case cmd_vel covers.
+                self.get_logger().warn(
+                    f"E-STOP: no cancel service for {name} - Nav2 is not "
+                    f"running. Holding its velocity at zero instead.")
+                continue
+            client.call_async(CancelGoal.Request())
+            self.get_logger().warn(f"E-STOP: cancelled Nav2 goals for {name}")
+
+        if self.get_parameter("estop_zero_velocity").value:
+            self.publish_zero_velocity()
+            if self.estop_zero_timer is None:
+                self.estop_zero_timer = self.create_timer(
+                    float(self.get_parameter("estop_zero_period_s").value),
+                    self.publish_zero_velocity)
+
+    def let_the_drones_fly(self):
+        """RESUME: stop holding the velocity down, or nothing can move."""
+        if self.estop_zero_timer is not None:
+            self.estop_zero_timer.cancel()
+            self.destroy_timer(self.estop_zero_timer)
+            self.estop_zero_timer = None
+
+    def publish_zero_velocity(self):
+        """Hover. Gravity is off, so zero velocity is a stop, not a drop."""
+        for pub in self.estop_cmd.values():
+            pub.publish(Twist())
 
     def launch(self):
         if self.launched:

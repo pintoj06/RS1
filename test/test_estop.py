@@ -7,7 +7,7 @@ import pytest
 from action_msgs.msg import GoalStatus
 from std_msgs.msg import Bool
 
-from conftest import FakeLogger, load_module
+from conftest import FakeLogger, FakeParams, load_module
 
 
 class FakeGoalHandle:
@@ -226,17 +226,152 @@ class TestTakeoff:
         assert takeoff.sent[-1].linear.z > 0
 
 
+class FakeCancelClient:
+    """Stands in for the Nav2 navigate_to_pose cancel_goal service client."""
+
+    def __init__(self, ready=True):
+        self.ready = ready
+        self.requests = []
+
+    def service_is_ready(self):
+        return self.ready
+
+    def call_async(self, request):
+        self.requests.append(request)
+        return SimpleNamespace()
+
+
+class FakeCmdPub:
+    def __init__(self):
+        self.sent = []
+
+    def publish(self, msg):
+        self.sent.append(msg)
+
+
+def make_station(ground_station, nav_ready=True, cancel=True, zero=True):
+    """A ground station carrying only the fields E-Stop touches."""
+    node = ground_station.GroundStationNode.__new__(
+        ground_station.GroundStationNode)
+    node.estopped = False
+    node.published = []
+    node.estop_pub = SimpleNamespace(
+        publish=lambda m: node.published.append(m.data))
+    node.estop_cancel = {"parrot1": FakeCancelClient(nav_ready),
+                         "parrot2": FakeCancelClient(nav_ready)}
+    node.estop_cmd = {"parrot1": FakeCmdPub(), "parrot2": FakeCmdPub()}
+    node.estop_zero_timer = None
+    node.made_timers = []
+    node.destroyed = []
+
+    def create_timer(period, callback):
+        handle = SimpleNamespace(period=period, callback=callback,
+                                 cancelled=False)
+        handle.cancel = lambda: setattr(handle, "cancelled", True)
+        node.made_timers.append(handle)
+        return handle
+
+    node.create_timer = create_timer
+    node.destroy_timer = node.destroyed.append
+    node.get_logger = FakeLogger
+    node.get_parameter = FakeParams(
+        estop_cancel_nav=cancel, estop_zero_velocity=zero,
+        estop_zero_period_s=0.1)
+    return node
+
+
 class TestGroundStation:
     def test_set_estop_publishes_only_on_change(self, ground_station):
-        published = []
-        station = SimpleNamespace(
-            estopped=False,
-            estop_pub=SimpleNamespace(publish=lambda m: published.append(m.data)),
-            get_logger=FakeLogger,
-        )
-        set_estop = ground_station.GroundStationNode.set_estop
-        set_estop(station, True)
-        set_estop(station, True)
-        set_estop(station, False)
-        assert published == [True, False]
+        station = make_station(ground_station)
+        station.set_estop(True)
+        station.set_estop(True)
+        station.set_estop(False)
+        assert station.published == [True, False]
         assert station.estopped is False
+
+
+class TestTheButtonDoesNotTrustTheDrones:
+    """E-Stop was pressed in flight and the scout flew on.
+
+    It worked by publishing /aeroaid/estop and leaving each node to cancel
+    its own Nav2 goal. The search node had been killed by a MemoryError, so
+    there was nothing left to hear the topic - a stop that needs the thing
+    it is stopping to still be working. The ground station now stops the
+    drones itself as well, by two routes, and these tests are about the
+    routes working with no drone node in the picture at all.
+    """
+
+    def test_pressing_it_acts_and_does_not_only_announce(self, ground_station):
+        station = make_station(ground_station)
+        station.set_estop(True)
+        assert station.estop_cancel["parrot1"].requests, \
+            'the button published the topic and did nothing else'
+        assert station.estop_cmd["parrot1"].sent
+
+    def test_nav2_goals_are_cancelled_for_every_drone(self, ground_station):
+        station = make_station(ground_station)
+        station.stop_the_drones()
+        for name in ("parrot1", "parrot2"):
+            assert len(station.estop_cancel[name].requests) == 1, name
+
+    def test_it_cancels_goals_this_process_never_sent(self, ground_station):
+        """The point of going through the service: the goal belongs to the
+        search node, which may be gone. A zero goal id and a zero stamp mean
+        'every goal' in the action protocol."""
+        station = make_station(ground_station)
+        station.stop_the_drones()
+        info = station.estop_cancel["parrot1"].requests[0].goal_info
+        assert not any(info.goal_id.uuid), 'not a cancel-all request'
+        assert info.stamp.sec == 0 and info.stamp.nanosec == 0
+
+    def test_the_velocity_is_zeroed_for_every_drone(self, ground_station):
+        station = make_station(ground_station)
+        station.stop_the_drones()
+        for name in ("parrot1", "parrot2"):
+            sent = station.estop_cmd[name].sent
+            assert sent, name
+            assert sent[-1].linear.x == 0.0
+            assert sent[-1].linear.z == 0.0
+            assert sent[-1].angular.z == 0.0
+
+    def test_the_velocity_is_held_down_not_sent_once(self, ground_station):
+        """The drone keeps the last velocity it was given, so one zero is
+        not a stop if anything publishes again afterwards."""
+        station = make_station(ground_station)
+        station.stop_the_drones()
+        assert len(station.made_timers) == 1, 'nothing keeps the velocity at zero'
+        assert station.made_timers[0].callback == station.publish_zero_velocity
+
+    def test_pressing_it_twice_does_not_stack_timers(self, ground_station):
+        station = make_station(ground_station)
+        station.stop_the_drones()
+        station.stop_the_drones()
+        assert len(station.made_timers) == 1
+
+    def test_a_dead_nav2_still_gets_the_velocity_zeroed(self, ground_station):
+        """The case that matters most: Nav2 gone, or never up, and a drone
+        still climbing on raw cmd_vel from takeoff_node."""
+        station = make_station(ground_station, nav_ready=False)
+        station.stop_the_drones()
+        assert not station.estop_cancel["parrot1"].requests
+        assert station.estop_cmd["parrot1"].sent, \
+            'no cancel service and no zero velocity: nothing stopped the drone'
+
+    def test_resume_stops_holding_the_velocity_down(self, ground_station):
+        """Otherwise RESUME leaves a 10 Hz stream of zeroes fighting Nav2
+        and nothing can fly again."""
+        station = make_station(ground_station)
+        station.set_estop(True)
+        held = station.made_timers[0]
+        station.set_estop(False)
+        assert held.cancelled
+        assert station.destroyed == [held]
+        assert station.estop_zero_timer is None
+
+    def test_it_can_stop_again_after_a_resume(self, ground_station):
+        station = make_station(ground_station)
+        station.set_estop(True)
+        station.set_estop(False)
+        station.set_estop(True)
+        assert len(station.made_timers) == 2
+        assert not station.made_timers[1].cancelled
