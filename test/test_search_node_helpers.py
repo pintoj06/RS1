@@ -624,9 +624,9 @@ def fake_frontier(search_node):
         _polygon_mask_costmap = SearchNode._polygon_mask_costmap
         _line_of_sight = SearchNode._line_of_sight
         _in_obstacle_shadow = SearchNode._in_obstacle_shadow
-        _shadowed_mask = SearchNode._shadowed_mask
+        _nearest_known = SearchNode._nearest_known
         _lines_clear = SearchNode._lines_clear
-        _shadowed_mask = SearchNode._shadowed_mask
+        _nearest_known = SearchNode._nearest_known
         _lines_clear = SearchNode._lines_clear
         _frontier_goal = SearchNode._frontier_goal
 
@@ -876,7 +876,7 @@ def planning_node(search_node):
                       '_confirmed_from', '_is_reachable', '_project',
                       '_polygon_mask_costmap', '_line_of_sight',
                       '_frontier_goal', '_in_obstacle_shadow',
-                      '_shadowed_mask', '_lines_clear',
+                      '_nearest_known', '_lines_clear',
                       '_unverified_cells', '_worth_looking',
                       '_write_off_unverified',
                       '_build_inside_mask', '_refresh_searchable',
@@ -2016,7 +2016,7 @@ class TestObstacleShadow:
         class N:
             for _n in ('_is_blocked', '_costmap_grid', '_flood', '_reachable_from',
                        '_confirmed_from', '_is_reachable', '_polygon_mask_costmap',
-                       '_line_of_sight', '_lines_clear', '_shadowed_mask',
+                       '_line_of_sight', '_lines_clear', '_nearest_known',
                        '_in_obstacle_shadow'):
                 locals()[_n] = getattr(SearchNode, _n)
             del _n
@@ -2069,15 +2069,28 @@ class TestObstacleShadow:
 
     def test_no_floods_means_no_claim(self, node):
         node.costmap = self.rock_with_a_hollow()
-        assert node._shadowed_mask() is None
+        assert node._nearest_known() is None
 
-    def test_the_mask_is_cached_per_costmap(self, node):
+    def test_the_nearest_known_lookup_is_cached(self, node):
+        """It is one distance transform over the map, so it must not be
+        redone for every target - but it must follow a new costmap."""
         node.costmap = self.rock_with_a_hollow()
         node.flood((20.5, 5.5))
-        first = node._shadowed_mask()
-        assert node._shadowed_mask() is first      # same object, not recomputed
+        first = node._nearest_known()
+        assert node._nearest_known() is first      # same object, not recomputed
         node.costmap = self.rock_with_a_hollow()   # a new message
-        assert node._shadowed_mask() is not first
+        node.flood((20.5, 5.5))
+        assert node._nearest_known() is not first
+
+    def test_it_does_not_build_an_array_per_unknown_cell(self, node):
+        """The whole-map version allocated (unknown cells x samples) - about
+        32 million elements, 830 MB, on a real costmap - and ran the node out
+        of memory mid-flight. The lookup must stay the size of the map."""
+        node.costmap = self.rock_with_a_hollow()
+        node.flood((20.5, 5.5))
+        idx = node._nearest_known()
+        assert idx[0].shape == node.confirmed.shape
+        assert idx[0].size + idx[1].size <= 2 * node.confirmed.size
 
 
 class TestShadowOnlyOrdersTargets:

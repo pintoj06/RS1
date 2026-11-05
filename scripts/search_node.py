@@ -2402,16 +2402,32 @@ class SearchNode(Node):
         return ~(solid[rows, cols] & inside).any(axis=1)
 
     def _in_obstacle_shadow(self, tx, ty, solid, info):
-        """Is this point hidden behind mapped obstacle? See _shadowed_mask."""
-        mask = self._shadowed_mask()
-        if mask is None:
+        """Is this point hidden behind mapped obstacle?
+
+        The straight line from the NEAREST known-free ground to it. Inside a
+        rock that line starts hard against the mapped face and crosses it at
+        once; for ground merely unvisited it runs through unknown only.
+
+        Used only to ORDER the targets of a look-around trip, never to
+        exclude them - seen from one side, the inside of a rock and open
+        ground beyond it are the same thing to the map, so this cannot tell
+        them apart. Measured: it caught 32% of a rock interior while
+        condemning 86% of the open ground past it.
+        """
+        idx = self._nearest_known()
+        if idx is None:
             return False
         res = info.resolution
         col = int((tx - info.origin.position.x) / res)
         row = int((ty - info.origin.position.y) / res)
         if not (0 <= col < info.width and 0 <= row < info.height):
             return False
-        return bool(mask[row, col])
+        nr = int(idx[0][row, col]); nc = int(idx[1][row, col])
+        x0 = info.origin.position.x + (nc + 0.5) * res
+        y0 = info.origin.position.y + (nr + 0.5) * res
+        return not self._lines_clear(np.array([x0]), np.array([y0]),
+                                     np.array([tx]), np.array([ty]),
+                                     solid, info)[0]
 
     def _lines_clear(self, x0, y0, x1, y1, solid, info):
         """Clear straight line from each (x0, y0) to its own (x1, y1)?
@@ -2436,45 +2452,30 @@ class SearchNode(Node):
         np.clip(rows, 0, info.height - 1, out=rows)
         return ~(solid[rows, cols] & inside).any(axis=1)
 
-    def _shadowed_mask(self):
-        """Unknown ground that sits behind mapped obstacle, for the whole map.
+    def _nearest_known(self):
+        """For every cell, the index of the nearest known-free cell.
 
-        For each unknown cell, the straight line from the NEAREST known-free
-        ground to it. Inside a rock that line starts hard against the mapped
-        face and crosses it at once; for ground that is merely far away and
-        never visited it runs through unknown only. That is the distinction
-        that matters, and depth into unknown does not make it - measured on a
-        live costmap, shadowed and unshadowed cells had almost the same median
-        depth (2.9 m against 2.6 m) while being 44% and 56% of the total.
+        One distance transform, cached per costmap. Two int arrays the size of
+        the map, which is a few megabytes - the point being that the shadow
+        test can then be answered one point at a time.
 
-        Cached per costmap message: it costs one distance transform and one
-        vectorised sight-line pass, and both the target choice and the
-        overlay want the answer.
+        It used to be computed for the WHOLE map at once: an array of
+        (unknown cells x samples along each sight line), which on a real
+        costmap is about 200000 x 160 = 32 million elements across six
+        arrays, roughly 830 MB. That ran the node out of memory and killed it
+        mid-flight. The answer is only ever wanted for the dozen targets a
+        look-around trip considers, so it is computed for those.
         """
-        if self.confirmed is None or self.possible is None or self.costmap is None:
+        if self.confirmed is None or not self.confirmed.any():
             return None
-        if self._shadow_cache_for is self.costmap:
+        key = id(self.costmap), id(self.confirmed)
+        if self._shadow_cache_for == key:
             return self._shadow_cache
-        unknown = self.possible & ~self.confirmed
-        grid, info = self._costmap_grid()
-        out = np.zeros_like(unknown)
-        if unknown.any() and self.confirmed.any():
-            solid = grid >= self.get_parameter('obstacle_cost_threshold').value
-            res = info.resolution
-            ox, oy = info.origin.position.x, info.origin.position.y
-            # nearest known-free cell for every cell, in one pass
-            _, (nr, nc) = ndimage.distance_transform_edt(
-                ~self.confirmed, return_indices=True)
-            ur, uc = np.nonzero(unknown)
-            x1 = ox + (uc + 0.5) * res
-            y1 = oy + (ur + 0.5) * res
-            x0 = ox + (nc[ur, uc] + 0.5) * res
-            y0 = oy + (nr[ur, uc] + 0.5) * res
-            clear = self._lines_clear(x0, y0, x1, y1, solid, info)
-            out[ur[~clear], uc[~clear]] = True
-        self._shadow_cache_for = self.costmap
-        self._shadow_cache = out
-        return out
+        _, idx = ndimage.distance_transform_edt(~self.confirmed,
+                                                return_indices=True)
+        self._shadow_cache_for = key
+        self._shadow_cache = idx
+        return idx
 
     def _frontier_goal(self):
         """Somewhere to fly to in order to SEE ground we cannot yet judge.
@@ -2593,9 +2594,10 @@ class SearchNode(Node):
         # wrote off ground the drone could have reached by going round.
         # Preferring the others still spends the early trips where they are
         # most likely to pay, which is what cut the hopping along the face.
-        shadowed = self._shadowed_mask()
-        if shadowed is not None:
-            lit = ~shadowed[wr[probes], wc[probes]]
+        lit = np.array([not self._in_obstacle_shadow(wx[i], wy[i],
+                                                     solid_now, info_now)
+                        for i in probes])
+        if lit.size:
             probes = np.concatenate([probes[lit], probes[~lit]])
 
         for i in probes:
