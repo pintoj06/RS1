@@ -1398,6 +1398,19 @@ class SearchNode(Node):
         self.returning = returning
         self.planned = False
 
+    def _heading_home(self):
+        """Is the waypoint being flown the trip back to base?
+
+        There are two ways that happens - _fly_home after the search is
+        finished, which sets self.returning, and _finish_plan tacking the
+        spawn point onto the end of an ordinary plan, which does not. Only
+        the first was being recognised, so most trips home reported
+        SEARCHING and the operator never saw the run end.
+        """
+        return bool(self.returning
+                    or (self.home_index is not None
+                        and self.index == self.home_index))
+
     def _fly_home(self):
         """Make going home an ordinary one-waypoint pass."""
         self._start_pass(returning=True)
@@ -1502,11 +1515,7 @@ class SearchNode(Node):
         # the pad itself at cost 77, exactly the blocked threshold. Every
         # trip home was therefore abandoned the moment it was checked, and
         # the run ended with the drone stopped wherever it happened to be.
-        going_home = (self.returning
-                      or (self.home_index is not None
-                          and self.index == self.home_index))
-
-        if not going_home and self._goal_now_impossible(gx, gy):
+        if not self._heading_home() and self._goal_now_impossible(gx, gy):
             self.get_logger().warn(
                 f'Waypoint {self.index + 1}/{len(self.points)} is no longer '
                 f'reachable - the lidar has since mapped an obstacle there. '
@@ -1672,8 +1681,8 @@ class SearchNode(Node):
         # Tell the operator which kind of trip this is. A go-and-look leg
         # takes the drone outside the search area with no sweep pattern to
         # draw, which is indistinguishable from a fault unless it is named.
-        if self.returning:
-            self._set_status(ST_RETURNING, 'flying back to base')
+        if self._heading_home():
+            self._set_status(ST_RETURNING, 'search done - flying back to base')
         elif self.vantage_index is not None and self.index == self.vantage_index:
             self._set_status(
                 ST_LOOKING,
@@ -1808,6 +1817,9 @@ class SearchNode(Node):
         self.index +=1
         self.busy = False
         if self.index >=len(self.points):
+            self.returning = self.returning or (
+                self.home_index is not None
+                and completed_index == self.home_index)
             here = self._lookup_robot_xy()
             home = (self.home_index is not None
                     and completed_index == self.home_index

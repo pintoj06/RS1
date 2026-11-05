@@ -893,7 +893,8 @@ def planning_node(search_node):
                       '_log_plan', '_review_map', '_publish_coverage',
                       '_publish_vantage',
                       '_maybe_return_home', '_after_last_waypoint',
-                      '_start_pass', '_fly_home', '_coverage_summary'):
+                      '_start_pass', '_fly_home', '_heading_home',
+                      'next_waypoint', '_coverage_summary'):
             locals()[_name] = getattr(SearchNode, _name)
         del _name
 
@@ -2214,6 +2215,7 @@ class TestProgressAlongTheRoute:
 
         class N:
             _check_stalled = SearchNode._check_stalled
+            _heading_home = SearchNode._heading_home
             _on_nav_plan = SearchNode._on_nav_plan
 
             def __init__(self):
@@ -2688,6 +2690,7 @@ class TestTheWayHomeIsNotAbandoned:
 
         class N:
             _check_stalled = SearchNode._check_stalled
+            _heading_home = SearchNode._heading_home
             next_waypoint = SearchNode.next_waypoint
 
             def __init__(self):
@@ -2757,3 +2760,66 @@ class TestTheWayHomeIsNotAbandoned:
         node.index = 0
         node.next_waypoint()
         assert any('returned to spawn' in m for m in node.said), node.said
+
+
+class TestItSaysWhenItIsGoingHome:
+    """The drone flew home with the status still reading SEARCHING, and the
+    run never announced itself as finished.
+
+    There are two ways it heads home - _fly_home after the search is done,
+    which sets self.returning, and _finish_plan tacking the spawn point onto
+    the end of an ordinary plan, which does not. send_goal only recognised
+    the first, and the second is the common one: every plan without a vantage
+    point ends with a home waypoint.
+    """
+
+    def box(self):
+        return [(0.0, 0.0), (20.0, 0.0), (20.0, 20.0), (0.0, 20.0)]
+
+    def flyable(self, node, search_node):
+        node.goal_best_dist = None
+        node.goal_best_crow = float('inf')
+        node.nav_plan_length = None
+        node.goal_progress_at = node.goal_sent_at = node.last_recheck = 0.0
+        node.goal_leg_length = 0.0
+        node.rejections = 0
+        node._now = lambda: 0.0
+        node.nav_client = SimpleNamespace(
+            send_goal_async=lambda g: SimpleNamespace(
+                add_done_callback=lambda cb: None))
+        node.goal_response = lambda f: None
+        node.send_goal = search_node.SearchNode.send_goal.__get__(node)
+
+    def test_the_home_leg_of_an_ordinary_plan_says_returning(
+            self, planning_node, search_node):
+        """The case that was wrong: home appended by _finish_plan, so
+        self.returning is still False."""
+        grid = make_costmap(60, 60, resolution=0.5, origin=(-5.0, -5.0))
+        node = planning_node(self.box(), grid)
+        node.plan_sweep()
+        assert node.home_index is not None, 'test needs a home waypoint'
+        assert not node.returning
+        self.flyable(node, search_node)
+        node.index = node.home_index
+        node.send_goal(node.points[node.home_index])
+        assert node.status_state == search_node.ST_RETURNING, node.status_state
+
+    def test_a_sweep_leg_still_says_searching(self, planning_node, search_node):
+        grid = make_costmap(60, 60, resolution=0.5, origin=(-5.0, -5.0))
+        node = planning_node(self.box(), grid)
+        node.plan_sweep()
+        self.flyable(node, search_node)
+        node.index = 0
+        node.send_goal(node.points[0])
+        assert node.status_state == search_node.ST_SEARCHING
+
+    def test_arriving_home_counts_as_returning(self, planning_node):
+        """So _after_last_waypoint reports COMPLETE rather than looking for
+        somewhere else to go."""
+        grid = make_costmap(60, 60, resolution=0.5, origin=(-5.0, -5.0))
+        node = planning_node(self.box(), grid)
+        node.plan_sweep()
+        node.at = (0.2, 0.1)
+        node.index = node.home_index
+        node.next_waypoint()
+        assert node.returning, 'arriving home was not recognised as the end'
