@@ -13,7 +13,7 @@
 # Overridable from the environment, e.g.
 #   SIM_WAIT=45 LARGE_COURIER=false ./run_blue_mountains.sh
 #   HEADLESS=true ./run_blue_mountains.sh     no Gazebo window, faster
-#   PERSON_SPOT=3 ./run_blue_mountains.sh     casualty at a fixed spot
+#   PERSON_SPOT=3 ./run_blue_mountains.sh     second casualty at a fixed spot
 #   NIGHT=true ./run_blue_mountains.sh        dark world, thermal-led search
 #   RETURN_AFTER_DELIVERY=false ./run_blue_mountains.sh   courier stays at the contact
 
@@ -55,14 +55,14 @@ NIGHT=${NIGHT:-false}
 # After the drop the courier flies back to its pad, then the scout flies home.
 RETURN_AFTER_DELIVERY=${RETURN_AFTER_DELIVERY:-true}
 
-# Where the casualty (person1) stands. One of these is picked at random each
-# run, with a random yaw, so the search is not always solving the same
-# problem. The first is person1's pose in worlds/large_demo.sdf. z is the
-# terrain height there. PERSON_SPOT=0..4 picks one instead of random.
+# Two casualties. person1 always stands where worlds/large_demo.sdf puts it,
+# (-6.36, -3.07) beside the kangaroo and wombat. person2, a copy of person1,
+# stands at one of these spots, picked at random each run with a random yaw,
+# so the search is not always solving the same problem. z is the terrain
+# height there. PERSON_SPOT=0..3 picks one instead of random.
 # (11.46, 34.25) was dropped: the ground there is 9.7 m up, above the
 # courier's 9 m flight height, so it could never get there to deliver.
 PERSON_SPOTS=(
-    "-6.36 -3.07 0.08"
     "-6.36 18.12 0.63"
     "-3.7 34.25 5.45"
     "42.37 20.97 0.23"
@@ -73,8 +73,8 @@ read -r PERSON_X PERSON_Y PERSON_Z <<< "${PERSON_SPOTS[$PERSON_SPOT]}"
 PERSON_YAW=$(awk -v seed="$RANDOM" \
     'BEGIN { srand(seed); printf "%.3f", rand() * 2 * 3.14159265 }')
 
-# The world Gazebo loads: a copy of large_demo.sdf with person1's pose
-# swapped in, so the person is already there when the world appears.
+# The world Gazebo loads: a copy of large_demo.sdf with person2 added, so
+# both people are already there when the world appears.
 WORLD_FILE=${TMPDIR:-/tmp}/aeroaid_${WORLD}.sdf
 
 # Every node that does a TF lookup needs these: this package pushes TF into
@@ -158,13 +158,26 @@ tab() {
     esac
 }
 
-echo "     casualty at spot $PERSON_SPOT:" \
+echo "     casualty person1 at its fixed spot beside the kangaroo and wombat"
+echo "     casualty person2 at spot $PERSON_SPOT:" \
      "($PERSON_X, $PERSON_Y, $PERSON_Z), yaw $PERSON_YAW rad"
-# The <pose> straight after <model name="person1"> is person1's own.
-sed "/<model name=\"person1\">/{n;s|<pose>.*</pose>|<pose>$PERSON_X $PERSON_Y $PERSON_Z 0 0 $PERSON_YAW</pose>|}" \
-    "$HERE/worlds/$WORLD.sdf" > "$WORLD_FILE"
-if ! grep -q "<pose>$PERSON_X $PERSON_Y $PERSON_Z 0 0 $PERSON_YAW</pose>" "$WORLD_FILE"; then
-    echo "Could not set person1's pose in $WORLD_FILE - has the world file changed?" >&2
+# Copy person1's <model> block (up to its first </model>), rename it person2,
+# give it the new pose (the <pose> straight after <model name=...>), and put
+# it right after person1. person1 itself is left untouched.
+awk -v pose="<pose>$PERSON_X $PERSON_Y $PERSON_Z 0 0 $PERSON_YAW</pose>" '
+    { print }
+    /<model name="person1">/ { copying = 1; first = 1; block = "" }
+    copying {
+        line = $0
+        if (first) { sub(/person1/, "person2", line); first = 0; pose_next = 1 }
+        else if (pose_next) { sub(/<pose>.*<\/pose>/, pose, line); pose_next = 0 }
+        block = block line "\n"
+        if ($0 ~ /<\/model>/) { copying = 0; printf "%s", block }
+    }
+' "$HERE/worlds/$WORLD.sdf" > "$WORLD_FILE"
+if ! grep -q '<model name="person2">' "$WORLD_FILE" ||
+   ! grep -q "<pose>$PERSON_X $PERSON_Y $PERSON_Z 0 0 $PERSON_YAW</pose>" "$WORLD_FILE"; then
+    echo "Could not add person2 to $WORLD_FILE - has the world file changed?" >&2
     exit 1
 fi
 
