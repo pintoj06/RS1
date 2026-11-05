@@ -466,6 +466,17 @@ class SearchNode(Node):
         # the odom frame, so it keeps what the lidar has already seen - without
         # that memory there would be nothing to plan against.
         self.costmap = None
+        # SLAM's occupancy map, used ONLY to judge what is walled in.
+        self.slam_map = None
+        self._slam_walls_cache = None
+        self._slam_walls_for = None
+        if self.get_parameter('use_slam_walls').value:
+            slam_qos = QoSProfile(
+                depth=1,
+                reliability=QoSReliabilityPolicy.RELIABLE,
+                durability=QoSDurabilityPolicy.TRANSIENT_LOCAL)
+            self.create_subscription(OccupancyGrid, 'map',
+                                     self._slam_map_callback, slam_qos)
         # One-shot guard, see _check_unknown_tracking.
         self._unknown_checked = False
         if self.get_parameter('avoid_obstacles').value:
@@ -672,6 +683,22 @@ class SearchNode(Node):
         # drone lapping between "something left to look at" and "no there
         # isn't" for several seconds at the end of a run, commanding nothing.
         self.declare_parameter('min_unverified_area', 2.0)      # m2
+        # Use SLAM's occupancy map, as well as the costmap, to decide whether
+        # ground is WALLED IN. Not for anything else: waypoints are still
+        # placed against the costmap, so the controller and the planner never
+        # disagree about where the rock is.
+        #
+        # Measured on one box drawn inside the mountain. Taking the boundary
+        # of the unknown region it sat in: the SLAM map had it 94% walled
+        # with 6 m of gap, the costmap 75% walled with 31 m. Inflating the
+        # costmap's walls to the drone's width and beyond never sealed it -
+        # you cannot bridge a missing 31 m by making walls fatter. The SLAM
+        # map sealed at every width from 0.3 m to 1.0 m.
+        self.declare_parameter('use_slam_walls', True)
+        # Treat a gap narrower than twice this as no way through: the drone
+        # is 0.25 m across and keeps 0.6 m of inflation, so it needs about
+        # 1.5 m to pass. Applied only to the walled-in test.
+        self.declare_parameter('slam_wall_inflate', 0.75)       # metres
         # How much unverified ground one trip has to resolve to count as
         # progress, as a fraction of the area the operator drew.
         self.declare_parameter('vantage_progress_fraction', 0.02)
@@ -2034,6 +2061,75 @@ class SearchNode(Node):
                                 b.pose.position.y - a.pose.position.y)
         self.nav_plan_length = total if msg.poses else None
 
+    def _slam_map_callback(self, msg):
+        """Keep SLAM's map. Only _slam_walls reads it."""
+        self.slam_map = msg
+
+    def _slam_walls(self):
+        """SLAM's walls, on the costmap's grid, as a bool array.
+
+        Why bother, when we already have a costmap: the costmap is three
+        times coarser and loses whole stretches of thin wall, so the mountain
+        never closes in it however much the walls are inflated. SLAM's map
+        traces the same outline nearly completely. Using it for the walled-in
+        test - and nothing else - gets a sealed verdict without putting
+        SLAM anywhere near the controller.
+
+        The two maps are in different frames, so this goes through TF. That
+        correction drifts by around half a metre, which does not matter here:
+        the question is whether a few hundred square metres are ringed by
+        metres of rock, not where a wall sits to the centimetre. It would
+        matter for placing a waypoint, which is why that still uses the
+        costmap.
+
+        Returns None when there is no SLAM map yet.
+        """
+        if not self.get_parameter('use_slam_walls').value:
+            return None
+        if self.slam_map is None or self.costmap is None:
+            return None
+        key = (id(self.slam_map), id(self.costmap))
+        if self._slam_walls_for == key:
+            return self._slam_walls_cache
+
+        sm, cm = self.slam_map, self.costmap
+        try:
+            tf = self.tf_buffer.lookup_transform(
+                self.map_frame, sm.header.frame_id,
+                rclpy.time.Time(), timeout=Duration(seconds=0.1))
+            dx = tf.transform.translation.x
+            dy = tf.transform.translation.y
+        except Exception:
+            return None                      # no transform yet; skip quietly
+
+        sres = sm.info.resolution
+        occupied = (np.asarray(sm.data, dtype=np.int16)
+                    .reshape(sm.info.height, sm.info.width) >= 65)
+        if occupied.any():
+            # A gap the drone cannot fit through is not a way through.
+            grow = float(self.get_parameter('slam_wall_inflate').value)
+            steps = max(1, int(round(grow / sres)))
+            occupied = ndimage.binary_dilation(occupied, iterations=steps)
+
+        # Resample onto the costmap grid. Costmap cell -> planning frame ->
+        # SLAM frame -> SLAM cell.
+        cres = cm.info.resolution
+        cx = (cm.info.origin.position.x
+              + (np.arange(cm.info.width) + 0.5) * cres) - dx
+        cy = (cm.info.origin.position.y
+              + (np.arange(cm.info.height) + 0.5) * cres) - dy
+        cols = np.floor((cx - sm.info.origin.position.x) / sres).astype(int)
+        rows = np.floor((cy - sm.info.origin.position.y) / sres).astype(int)
+        ok_c = (cols >= 0) & (cols < sm.info.width)
+        ok_r = (rows >= 0) & (rows < sm.info.height)
+        out = np.zeros((cm.info.height, cm.info.width), dtype=bool)
+        if ok_c.any() and ok_r.any():
+            out[np.ix_(ok_r, ok_c)] = occupied[np.ix_(rows[ok_r], cols[ok_c])]
+
+        self._slam_walls_for = key
+        self._slam_walls_cache = out
+        return out
+
     def _costmap_callback(self, msg):
         """Keep the latest costmap so the planner can ask what is blocked."""
         self.costmap = msg
@@ -2155,6 +2251,9 @@ class SearchNode(Node):
         grid, info = got
         thr = self.get_parameter('obstacle_cost_threshold').value
         free = (grid < thr) & (grid >= -1)        # -1 = unobserved, count as free
+        walls = self._slam_walls()
+        if walls is not None:
+            free &= ~walls                        # see _slam_walls
 
         res = info.resolution
         col = int((start_xy[0] - info.origin.position.x) / res)
@@ -2189,6 +2288,9 @@ class SearchNode(Node):
         grid, info = got
         thr = self.get_parameter('obstacle_cost_threshold').value
         seen_clear = (grid >= 0) & (grid < thr)   # observed AND clear
+        walls = self._slam_walls()
+        if walls is not None:
+            seen_clear &= ~walls                  # see _slam_walls
 
         res = info.resolution
         # Close the wedges between diverging lidar rays - see

@@ -8,6 +8,8 @@ costmap_raw.
 """
 
 import math
+
+import numpy as np
 from types import SimpleNamespace
 
 import pytest
@@ -29,6 +31,10 @@ def fake_search(search_node):
         _costmap_grid = SearchNode._costmap_grid
         _flood = SearchNode._flood
         _reachable_from = SearchNode._reachable_from
+
+        def _slam_walls(self):
+            return None
+
         _confirmed_from = SearchNode._confirmed_from
         _is_reachable = SearchNode._is_reachable
         _camera_fov = SearchNode._camera_fov
@@ -357,6 +363,10 @@ def fake_review(search_node):
         _costmap_grid = SearchNode._costmap_grid
         _flood = SearchNode._flood
         _reachable_from = SearchNode._reachable_from
+
+        def _slam_walls(self):
+            return None
+
         _confirmed_from = SearchNode._confirmed_from
         _is_reachable = SearchNode._is_reachable
         _project = SearchNode._project
@@ -605,6 +615,10 @@ def fake_frontier(search_node):
         _costmap_grid = SearchNode._costmap_grid
         _flood = SearchNode._flood
         _reachable_from = SearchNode._reachable_from
+
+        def _slam_walls(self):
+            return None
+
         _confirmed_from = SearchNode._confirmed_from
         _is_reachable = SearchNode._is_reachable
         _polygon_mask_costmap = SearchNode._polygon_mask_costmap
@@ -876,6 +890,10 @@ def planning_node(search_node):
                       '_start_pass', '_fly_home', '_coverage_summary'):
             locals()[_name] = getattr(SearchNode, _name)
         del _name
+
+        def _slam_walls(self):
+            return None
+
         # Still a staticmethod here, or self would be passed as its first
         # argument and every cell would test as outside the polygon.
         point_in_polygon = staticmethod(SearchNode.point_in_polygon)
@@ -2003,6 +2021,9 @@ class TestObstacleShadow:
                 locals()[_n] = getattr(SearchNode, _n)
             del _n
 
+            def _slam_walls(self):
+                return None
+
             def __init__(self):
                 self.costmap = None
                 self.confirmed = self.possible = None
@@ -2284,6 +2305,9 @@ class TestCoverageDoesNotSeeThroughWalls:
                 locals()[_n] = getattr(SearchNode, _n)
             del _n
 
+            def _slam_walls(self):
+                return None
+
             def __init__(self):
                 self.area_set = True
                 self.at = (0.0, 0.0)
@@ -2345,3 +2369,132 @@ class TestCoverageDoesNotSeeThroughWalls:
         """Before the first costmap there is nothing to occlude with."""
         node.update_coverage()
         assert self.covered_at(node, 1.0, 1.0)
+
+
+class TestSlamWallsSealWhatTheCostmapCannot:
+    """The costmap is three times coarser than SLAM's map and loses whole
+    stretches of thin wall, so a mountain never closes in it however much the
+    walls are inflated. Measured on one box: the SLAM map had the region 94%
+    walled with 6 m of gap, the costmap 75% walled with 31 m, and inflating
+    the costmap out to 1.0 m never sealed it.
+
+    SLAM's walls are therefore folded into the walled-in test - and ONLY
+    that. Waypoints are still placed against the costmap, so the planner and
+    the controller never disagree about where the rock is.
+    """
+
+    UNKNOWN = -1
+
+    @pytest.fixture
+    def node(self, search_node):
+        import numpy as np
+        SearchNode = search_node.SearchNode
+
+        class Tf:
+            def __init__(self, dx=0.0, dy=0.0): self.dx, self.dy = dx, dy
+            def lookup_transform(self, *a, **k):
+                return SimpleNamespace(transform=SimpleNamespace(
+                    translation=SimpleNamespace(x=self.dx, y=self.dy)))
+
+        class N:
+            for _n in ('_is_blocked', '_costmap_grid', '_flood', '_reachable_from',
+                       '_confirmed_from', '_is_reachable', '_slam_walls'):
+                locals()[_n] = getattr(SearchNode, _n)
+            del _n
+
+            def __init__(self):
+                self.costmap = None
+                self.slam_map = None
+                self._slam_walls_cache = None
+                self._slam_walls_for = None
+                self.map_frame = 'parrot1_odom'
+                self.tf_buffer = Tf()
+                self.get_parameter = FakeParams(
+                    obstacle_cost_threshold=INSCRIBED,
+                    observation_gap_fill=0.0,
+                    use_slam_walls=True,
+                    slam_wall_inflate=0.0)
+        return N()
+
+    def ring_with_a_gap(self, res=1.0, size=20, gap=2):
+        """A box of wall with a gap in one side, and unknown inside it."""
+        grid = make_costmap(size, size, resolution=res)
+        fill_rect(grid, 5, 15, 5, 6, LETHAL)          # bottom
+        fill_rect(grid, 5, 15, 14, 15, LETHAL)        # top
+        fill_rect(grid, 5, 6, 5, 15, LETHAL)          # left
+        fill_rect(grid, 14, 15, 5, 15, LETHAL)        # right
+        fill_rect(grid, 9, 9 + gap, 14, 15, 0)        # the gap in the top
+        fill_rect(grid, 7, 13, 7, 13, self.UNKNOWN)   # unknown interior
+        return grid
+
+    def test_the_gap_lets_the_flood_in_without_slam(self, node):
+        node.costmap = self.ring_with_a_gap()
+        reached = node._reachable_from((1.5, 1.5))
+        assert node._is_reachable(10.5, 10.5, reached), \
+            'test needs the costmap-only case to be OPEN'
+
+    def test_slam_walls_close_it(self, node):
+        node.costmap = self.ring_with_a_gap()
+        # SLAM has seen the bit of wall the costmap missed
+        slam = make_costmap(20, 20, resolution=1.0)
+        fill_rect(slam, 9, 11, 14, 15, 100)
+        slam.header.frame_id = 'parrot1_map'
+        node.slam_map = slam
+        reached = node._reachable_from((1.5, 1.5))
+        assert not node._is_reachable(10.5, 10.5, reached), \
+            'SLAM walls did not seal the region'
+
+    def test_waypoint_placement_is_untouched(self, node):
+        """_is_blocked must still answer from the costmap alone, or the
+        planner and the controller would disagree about where rock is."""
+        node.costmap = self.ring_with_a_gap()
+        slam = make_costmap(20, 20, resolution=1.0)
+        fill_rect(slam, 0, 20, 0, 20, 100)       # SLAM says everything is wall
+        slam.header.frame_id = 'parrot1_map'
+        node.slam_map = slam
+        assert not node._is_blocked(1.5, 1.5), \
+            '_is_blocked was contaminated by the SLAM map'
+
+    def test_turning_it_off_restores_the_old_behaviour(self, node):
+        node.costmap = self.ring_with_a_gap()
+        slam = make_costmap(20, 20, resolution=1.0)
+        fill_rect(slam, 9, 11, 14, 15, 100)
+        slam.header.frame_id = 'parrot1_map'
+        node.slam_map = slam
+        node.get_parameter.values['use_slam_walls'] = False
+        reached = node._reachable_from((1.5, 1.5))
+        assert node._is_reachable(10.5, 10.5, reached)
+
+    def test_no_slam_map_yet_changes_nothing(self, node):
+        node.costmap = self.ring_with_a_gap()
+        assert node._slam_walls() is None
+
+    def test_a_gap_too_narrow_to_fly_counts_as_wall(self, node):
+        """The drone is 0.25 m across and keeps 0.6 m of inflation, so a
+        sub-metre gap is not a doorway."""
+        node.costmap = self.ring_with_a_gap(gap=1)
+        slam = make_costmap(20, 20, resolution=1.0)
+        fill_rect(slam, 5, 15, 5, 6, 100); fill_rect(slam, 5, 15, 14, 15, 100)
+        fill_rect(slam, 5, 6, 5, 15, 100);  fill_rect(slam, 14, 15, 5, 15, 100)
+        fill_rect(slam, 9, 10, 14, 15, 0)        # a one-cell hole
+        slam.header.frame_id = 'parrot1_map'
+        node.slam_map = slam
+        node.get_parameter.values['slam_wall_inflate'] = 1.0
+        reached = node._reachable_from((1.5, 1.5))
+        assert not node._is_reachable(10.5, 10.5, reached), \
+            'a gap the drone cannot fit through was treated as a way in'
+
+    def test_the_frame_offset_is_applied(self, node):
+        """The two maps are in different frames; the walls have to be moved
+        by the TF correction or they land in the wrong place."""
+        node.costmap = self.ring_with_a_gap()
+        slam = make_costmap(20, 20, resolution=1.0)
+        fill_rect(slam, 9, 11, 14, 15, 100)
+        slam.header.frame_id = 'parrot1_map'
+        node.slam_map = slam
+        walls_at_zero = node._slam_walls().copy()
+        node._slam_walls_for = None              # force a recompute
+        node.tf_buffer.dx = 5.0
+        shifted = node._slam_walls()
+        assert not np.array_equal(walls_at_zero, shifted), \
+            'the TF offset was ignored'
