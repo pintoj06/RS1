@@ -306,9 +306,20 @@ class TestGroundStationLetsGo:
         assert window.holds == [True]
 
 
-def transform(x=0.0, y=0.0):
+def transform(x=0.0, y=0.0, yaw=0.0):
+    """A TF transform for the fakes.
+
+    The rotation is needed as well as the translation now: map -> odom is
+    SLAM's drift correction and it twists as well as shifts, so the search
+    node applies the whole transform to the drawn area. Left at zero here,
+    so every expected coordinate below is unchanged.
+    """
+    import math
     return SimpleNamespace(transform=SimpleNamespace(
-        translation=SimpleNamespace(x=x, y=y)))
+        translation=SimpleNamespace(x=x, y=y),
+        rotation=SimpleNamespace(x=0.0, y=0.0,
+                                 z=math.sin(yaw / 2.0),
+                                 w=math.cos(yaw / 2.0))))
 
 
 def area_msg(x0, y0, x1, y1):

@@ -8,13 +8,27 @@ from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Odometry, Path
 
 
+def _shift(tx, ty, yaw=0.0):
+    """A TF transform standing in for map <- odom."""
+    import math
+    from geometry_msgs.msg import Transform
+    t = Transform()
+    t.translation.x, t.translation.y = float(tx), float(ty)
+    t.rotation.z, t.rotation.w = math.sin(yaw / 2.0), math.cos(yaw / 2.0)
+    return t
+
+
+
 @pytest.fixture
 def station(ground_station):
     GS = ground_station.GroundStationNode
     node = SimpleNamespace(
         courier_path=[], courier_path_time=0.0, courier_xy=None,
         courier_plan_timeout_s=3.0,
-        _odom_to_map_shift=lambda: (1.0, -2.0),
+        # Returns a TF transform now, not a (dx, dy) pair: adding an
+        # offset silently dropped SLAM's yaw correction. Yaw left at zero
+        # here, so the expected numbers below are unchanged.
+        _odom_to_map_shift=lambda: _shift(1.0, -2.0),
     )
     node.route = lambda: GS.courier_route(node)
     node.on_plan = lambda msg: GS._on_courier_plan(node, msg)

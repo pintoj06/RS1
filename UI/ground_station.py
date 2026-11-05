@@ -30,6 +30,7 @@ Qt owns the event loop; rclpy is pumped from a QTimer (see main()). Never
 block inside a callback or the window freezes.
 """
 
+import math
 import os
 import sys
 import time
@@ -171,6 +172,95 @@ def match_one_to_one(points, anchors, gate: float) -> dict:
 
 
 EDGE_MARGIN = 0.05   # fraction of the frame; detector's edge_margin_frac
+
+
+
+def yaw_of(rotation):
+    """Yaw in radians from a geometry_msgs Quaternion. Drones fly level, so
+    yaw is the only part of a frame-to-frame rotation that matters here."""
+    return math.atan2(2.0 * (rotation.w * rotation.z + rotation.x * rotation.y),
+                      1.0 - 2.0 * (rotation.y ** 2 + rotation.z ** 2))
+
+
+def apply_transform_2d(transform, x, y):
+    """Move one point through a TF transform, in 2D.
+
+    ROTATE THEN TRANSLATE. The obvious shortcut - adding the translation and
+    ignoring the rotation - is wrong, and was wrong here for a long time.
+    map -> odom is SLAM's drift correction, and that correction includes a
+    twist as well as a shift: measured at -1.894 degrees in one run. Dropping
+    it costs r * sin(theta), which is nothing at the frame origin and about a
+    metre 30 m out, so it hid near the spawn point and grew with distance.
+    """
+    yaw = yaw_of(transform.rotation)
+    c, s = math.cos(yaw), math.sin(yaw)
+    return (transform.translation.x + c * x - s * y,
+            transform.translation.y + s * x + c * y)
+
+
+def place_overlay(image, res, origin_x, origin_y, transform):
+    """Put a grid overlay into the map frame as an axis-aligned image.
+
+    The coverage grid arrives in the scout's ODOM frame and is drawn on a map
+    in the MAP frame, and those differ by SLAM's correction - a shift AND a
+    twist. Shifting the bounds handles the first; the second needs the pixels
+    moved, because the painter draws an axis-aligned rectangle.
+
+    Done by resampling rather than by rotating the painter, so paintEvent
+    stays as it was and this is testable without a window. The map is written
+    out explicitly - for each OUTPUT pixel, work out which INPUT pixel it came
+    from - so there is no library's rotation convention to guess at.
+
+    image:  RGBA, row 0 = NORTH (already flipud'd by the caller)
+    res:    metres per cell
+    origin: the grid's lower-left corner, in the grid's own frame
+    Returns (image in the map frame, (x0, y0, x1, y1) bounds).
+    """
+    h, w = image.shape[:2]
+    if transform is None:
+        return image, (origin_x, origin_y,
+                       origin_x + w * res, origin_y + h * res)
+
+    yaw = yaw_of(transform.rotation)
+    c, s = math.cos(yaw), math.sin(yaw)
+    if abs(s) < 1e-9:                       # no twist: shift the bounds only
+        x0, y0 = apply_transform_2d(transform, origin_x, origin_y)
+        return image, (x0, y0, x0 + w * res, y0 + h * res)
+
+    # The grid's four corners, carried into the map frame; their extent is
+    # the axis-aligned box the rotated grid needs.
+    corners = [(origin_x, origin_y),
+               (origin_x + w * res, origin_y),
+               (origin_x, origin_y + h * res),
+               (origin_x + w * res, origin_y + h * res)]
+    moved = [apply_transform_2d(transform, cx, cy) for cx, cy in corners]
+    x0 = min(m[0] for m in moved); x1 = max(m[0] for m in moved)
+    y0 = min(m[1] for m in moved); y1 = max(m[1] for m in moved)
+
+    out_w = max(1, int(math.ceil((x1 - x0) / res)))
+    out_h = max(1, int(math.ceil((y1 - y0) / res)))
+
+    # Centre of every output pixel, in the map frame.
+    u = np.arange(out_w)[None, :]
+    v = np.arange(out_h)[:, None]
+    mx = x0 + (u + 0.5) * res
+    my = y1 - (v + 0.5) * res               # row 0 is north
+
+    # Back into the grid's frame: subtract the shift, then unrotate.
+    rx = mx - transform.translation.x
+    ry = my - transform.translation.y
+    gx = c * rx + s * ry
+    gy = -s * rx + c * ry
+
+    col = ((gx - origin_x) / res).astype(np.int32)
+    row = ((origin_y + h * res - gy) / res).astype(np.int32)   # north-up again
+    inside = (col >= 0) & (col < w) & (row >= 0) & (row < h)
+    np.clip(col, 0, w - 1, out=col)
+    np.clip(row, 0, h - 1, out=row)
+
+    out = image[row, col]
+    out[~inside] = 0                        # transparent beyond the grid
+    return out, (x0, y0, x1, y1)
 
 
 def box_region(mask: np.ndarray, bbox, width: int, height: int,
@@ -957,12 +1047,12 @@ class GroundStationNode(Node):
         rgba[grid == SEARCHED] = COVERED    # outside the area stays clear
         # Row 0 of an OccupancyGrid is the bottom of the world, row 0 of an
         # image is the top - same flip the SLAM map does.
-        self.coverage_image = np.flipud(rgba).copy()
-
         res = msg.info.resolution
-        ox = msg.info.origin.position.x + tf.transform.translation.x
-        oy = msg.info.origin.position.y + tf.transform.translation.y
-        self.coverage_bounds = (ox, oy, ox + w * res, oy + h * res)
+        north_up = np.flipud(rgba).copy()
+        self.coverage_image, self.coverage_bounds = place_overlay(
+            north_up, res,
+            msg.info.origin.position.x, msg.info.origin.position.y,
+            tf.transform)
 
         # Three figures, from the one grid. Everything with a value at all
         # is inside the area the operator drew; -1 is outside it and says
@@ -1026,17 +1116,21 @@ class GroundStationNode(Node):
         self.search_path_frame = msg.header.frame_id
 
     def _odom_to_map_shift(self) -> Tuple[float, float]:
-        """Offset from the scout's odom frame to this map's frame.
+        """The scout's odom frame to this map's frame, as a TF transform.
 
-        Zero before SLAM starts: until then the view is drawn in odom, as
-        _poll_pose explains.
+        None before SLAM starts, which callers treat as identity: until then
+        the view is drawn in odom, as _poll_pose explains.
+
+        Returns the whole transform rather than an offset on purpose. It used
+        to return (dx, dy) and callers added it, which silently dropped
+        SLAM's yaw correction - see apply_transform_2d.
         """
         try:
             tf = self.tf_buffer.lookup_transform(
                 self.map_frame, self.odom_frame, rclpy.time.Time())
         except Exception:
-            return 0.0, 0.0
-        return tf.transform.translation.x, tf.transform.translation.y
+            return None
+        return tf.transform
 
     def _on_courier_plan(self, msg: Path):
         """Store the courier's planned route in this map's frame.
@@ -1045,20 +1139,22 @@ class GroundStationNode(Node):
         frame (see courier_node.py), so the courier's plan is already in the
         scout's odom frame and needs only the same shift as search_path.
         """
-        dx, dy = self._odom_to_map_shift()
-        self.courier_path = [(p.pose.position.x + dx, p.pose.position.y + dy)
-                             for p in msg.poses]
+        move = self._odom_to_map_shift()
+        self.courier_path = [
+            apply_transform_2d(move, p.pose.position.x, p.pose.position.y)
+            if move else (p.pose.position.x, p.pose.position.y)
+            for p in msg.poses]
         self.courier_path_time = time.monotonic()
 
     def _on_courier_odometry(self, msg: Odometry):
         # Raw Gazebo odometry is world pose, i.e. the shared odom frame.
-        dx, dy = self._odom_to_map_shift()
-        self.courier_xy = (msg.pose.pose.position.x + dx,
-                           msg.pose.pose.position.y + dy)
-        # The shift is translation only, so the heading carries straight over.
-        q = msg.pose.pose.orientation
-        self.courier_yaw = np.arctan2(2.0 * (q.w * q.z + q.x * q.y),
-                                      1.0 - 2.0 * (q.y ** 2 + q.z ** 2))
+        move = self._odom_to_map_shift()
+        px, py = msg.pose.pose.position.x, msg.pose.pose.position.y
+        self.courier_xy = apply_transform_2d(move, px, py) if move else (px, py)
+        # The heading turns with the frames too. It used to carry straight
+        # over, which was right only while the shift was translation only.
+        heading = yaw_of(msg.pose.pose.orientation)
+        self.courier_yaw = heading + (yaw_of(move.rotation) if move else 0.0)
 
     def _on_courier_state(self, msg: String):
         self.courier_state = msg.data
@@ -1154,19 +1250,20 @@ class GroundStationNode(Node):
                 else:
                     self.vantage_xy = None
                 continue
-            dx = dy = 0.0
+            move = None
             if frame and frame != self.map_frame:
                 try:
                     tf = self.tf_buffer.lookup_transform(
                         self.map_frame, frame, rclpy.time.Time())
-                    dx = tf.transform.translation.x
-                    dy = tf.transform.translation.y
                 except Exception:
                     continue           # try again on the next poll
+                move = tf.transform
             if attr == 'search_path':
-                self.search_path = [(x + dx, y + dy) for x, y in raw]
+                self.search_path = [apply_transform_2d(move, x, y) if move
+                                    else (x, y) for x, y in raw]
             else:
-                self.vantage_xy = (raw[0] + dx, raw[1] + dy)
+                self.vantage_xy = (apply_transform_2d(move, *raw) if move
+                                   else (raw[0], raw[1]))
 
     def set_hold(self, hold: bool):
         if hold == self.holding:

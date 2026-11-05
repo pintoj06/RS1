@@ -217,9 +217,24 @@ local_costmap:
           # equivalent radius) out of a 40 m sensor, and the sweep could only
           # plan legs in whichever corner of the search area that fan reached.
           #
-          # With it true an inf reading clears out to range_max and marks
-          # nothing, which is exactly right for a downward drone over open
-          # ground.
+          # What it ACTUALLY does, which is not what this comment used to
+          # say: an inf reading is replaced by range_max - epsilon and then
+          # processed as a normal return. So it clears along the ray, which
+          # is what we want - and it also MARKS an obstacle at the far end,
+          # which we very much do not.
+          #
+          # That is why obstacle_max_range below is under the lidar's 40 m
+          # range_max while raytrace_max_range is left at it: the phantom
+          # point at 39.9999 m then falls outside the marking range and is
+          # used for clearing only.
+          #
+          # Measured before that was fixed: every ray into open ground left
+          # a false obstacle at 40 m, and since this costmap does not roll
+          # they accumulated into a band of wall about 8 m thick - an arc of
+          # radius ~41 m centred on the spawn point, matching
+          # sqrt(41^2 - y^2) to within a cell. A search area drawn out there
+          # got planned, then every goal was refused as unreachable and the
+          # drone gave up: "Could not reach that one. Skipping it."
           inf_is_valid: true
           max_obstacle_height: 30.0
           clearing: true
@@ -227,7 +242,11 @@ local_costmap:
           data_type: LaserScan
           raytrace_max_range: 40.0
           raytrace_min_range: 0.0
-          obstacle_max_range: 40.0
+          # Deliberately BELOW the lidar's range_max of 40 m - see
+          # inf_is_valid above. A real obstacle in the last metre of range
+          # goes unmarked until the drone is a metre closer, which costs
+          # nothing; marking the phantom cost us the whole east of the map.
+          obstacle_max_range: 39.0
           obstacle_min_range: 0.0
       static_layer:
         plugin: nav2_costmap_2d::StaticLayer
@@ -320,9 +339,24 @@ global_costmap:
           # equivalent radius) out of a 40 m sensor, and the sweep could only
           # plan legs in whichever corner of the search area that fan reached.
           #
-          # With it true an inf reading clears out to range_max and marks
-          # nothing, which is exactly right for a downward drone over open
-          # ground.
+          # What it ACTUALLY does, which is not what this comment used to
+          # say: an inf reading is replaced by range_max - epsilon and then
+          # processed as a normal return. So it clears along the ray, which
+          # is what we want - and it also MARKS an obstacle at the far end,
+          # which we very much do not.
+          #
+          # That is why obstacle_max_range below is under the lidar's 40 m
+          # range_max while raytrace_max_range is left at it: the phantom
+          # point at 39.9999 m then falls outside the marking range and is
+          # used for clearing only.
+          #
+          # Measured before that was fixed: every ray into open ground left
+          # a false obstacle at 40 m, and since this costmap does not roll
+          # they accumulated into a band of wall about 8 m thick - an arc of
+          # radius ~41 m centred on the spawn point, matching
+          # sqrt(41^2 - y^2) to within a cell. A search area drawn out there
+          # got planned, then every goal was refused as unreachable and the
+          # drone gave up: "Could not reach that one. Skipping it."
           inf_is_valid: true
           max_obstacle_height: 30.0
           clearing: true
@@ -330,7 +364,11 @@ global_costmap:
           data_type: LaserScan
           raytrace_max_range: 40.0
           raytrace_min_range: 0.0
-          obstacle_max_range: 40.0
+          # Deliberately BELOW the lidar's range_max of 40 m - see
+          # inf_is_valid above. A real obstacle in the last metre of range
+          # goes unmarked until the drone is a metre closer, which costs
+          # nothing; marking the phantom cost us the whole east of the map.
+          obstacle_max_range: 39.0
           obstacle_min_range: 0.0
       static_layer:
         plugin: nav2_costmap_2d::StaticLayer

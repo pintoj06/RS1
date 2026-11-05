@@ -86,6 +86,29 @@ def rotate_points(points, angle):
     return [(x * c - y * s, x * s + y * c) for x, y in points]
 
 
+
+def yaw_of(rotation):
+    """Yaw in radians from a geometry_msgs Quaternion. Drones fly level, so
+    yaw is the only part of a frame-to-frame rotation that matters here."""
+    return math.atan2(2.0 * (rotation.w * rotation.z + rotation.x * rotation.y),
+                      1.0 - 2.0 * (rotation.y ** 2 + rotation.z ** 2))
+
+
+def apply_transform_2d(transform, x, y):
+    """Move one point through a TF transform, in 2D.
+
+    ROTATE THEN TRANSLATE. The obvious shortcut - adding the translation and
+    ignoring the rotation - is wrong, and was wrong here for a long time.
+    map -> odom is SLAM's drift correction, and that correction includes a
+    twist as well as a shift: measured at -1.894 degrees in one run. Dropping
+    it costs r * sin(theta), which is nothing at the frame origin and about a
+    metre 30 m out, so it hid near the spawn point and grew with distance.
+    """
+    yaw = yaw_of(transform.rotation)
+    c, s = math.cos(yaw), math.sin(yaw)
+    return (transform.translation.x + c * x - s * y,
+            transform.translation.y + s * x + c * y)
+
 def best_sweep_angle(polygon):
     """Pick the sweep direction that needs the fewest rows.
 
@@ -911,9 +934,11 @@ class SearchNode(Node):
             return
         self.pending_area = None
 
-        dx = tf.transform.translation.x
-        dy = tf.transform.translation.y
-        self.polygon = [(x + dx, y + dy) for x, y in pts]
+        # The full transform, not just its translation: see
+        # apply_transform_2d. With the rotation dropped, the area actually
+        # searched came out twisted by SLAM's yaw correction relative to the
+        # box the operator drew - about a metre out at the far corners.
+        self.polygon = [apply_transform_2d(tf.transform, x, y) for x, y in pts]
         self.area_set = True
         # A new area is a new search, even after being sent home.
         self.recalled = False
