@@ -4,6 +4,7 @@
 "Fly a lawnmower search patter over a rectangle, using NAV2"
 
 import math
+import traceback
 
 import numpy as np
 # Connected-component labelling, used by the reachability checks below. Those
@@ -823,7 +824,37 @@ class SearchNode(Node):
         self.declare_parameter('wait_for_area', True)
 
     def on_area_request(self, msg):
-        """Operator drew a new search area in the ground station.
+        """Operator drew a new search area: apply it, but never die trying.
+
+        The node HAS died here. A smaller polygon than the last one indexed
+        an array left over from the old coverage grid out of bounds, the
+        IndexError came out of a subscription callback, rclpy stopped the
+        executor, and the process exited mid-mission - taking the drone's
+        only listener for the E-Stop topic with it.
+
+        That particular cause is fixed (see _forget_the_old_area), but a
+        drawn area is operator input arriving from another process, and no
+        single piece of it is worth the whole node. A bad one is now
+        rejected, loudly, with the drone left holding.
+
+        Not a bare except: the traceback is logged in full, so this hides
+        nothing - it only stops a bug in here from becoming a crash.
+        """
+        try:
+            self._apply_area_request(msg)
+        except Exception:
+            self.get_logger().error(
+                'That search area could not be used, so it has been '
+                'rejected. The drone is holding where it is. Draw the area '
+                'again; if it keeps failing, this traceback is the bug:\n'
+                + traceback.format_exc())
+            self.area_set = False
+            self.planned = False
+            self._set_status(
+                ST_IDLE, 'that search area could not be used - draw it again')
+
+    def _apply_area_request(self, msg):
+        """Take the drawn area into use.
 
         Rather than building the path here, this resets self.planned so
         plan_sweep() redoes it on the next tick - that way the new area still
@@ -863,28 +894,10 @@ class SearchNode(Node):
         self.polygon = [(x + dx, y + dy) for x, y in pts]
         self.area_set = True
 
-        # Forget the old reachability picture BEFORE the mask is rebuilt.
-        # _build_inside_mask filters by self.possible, and that was computed
-        # for the previous area, at a different position, against an older
-        # map. A new box falling outside it came out with no searchable cells
-        # at all, and the node then announced "SEARCH AREA NOT SEARCHABLE"
-        # and stopped - for an area a fresh flood reached in full, 960 cells
-        # of 960. With these cleared the mask is built on geometry alone and
-        # the real floods are computed by the next plan.
-        self.confirmed = None
-        self.possible = None
-        self._shadow_cache = None
-        self._shadow_cache_for = None
-        # Same for the per-cell memories: they are arrays shaped for the OLD
-        # grid. Left in place, a new area with fewer rows/cols made
-        # _build_inside_mask index past their end (IndexError, node died).
-        self.unverifiable = None
-        self.ever_reachable = None
-        self.ever_confirmed = None
-        self.unverified_at_vantage = None
-
         # The coverage grid is sized to the polygon, so it has to be rebuilt -
-        # otherwise progress would be measured against the old shape.
+        # otherwise progress would be measured against the old shape. The
+        # rebuild also forgets everything learned about the old area, which
+        # is why nothing here has to remember to.
         self._rebuild_coverage_grid()
 
         # Abandon the current leg. The operator has new information, so
@@ -892,19 +905,14 @@ class SearchNode(Node):
         if self.goal_handle is not None:
             self.goal_handle.cancel_goal_async()
         self._start_pass()
-        # Everything the node LEARNED about the old area goes too. Kept apart
-        # from _start_pass because a replan resets the sequence but must keep
-        # all of this - the coverage it has built up, the vantage points it
-        # has already used, the ground it has written off.
+        # Counters for the old area go too. Kept apart from _start_pass
+        # because a replan resets the sequence but must keep these - the
+        # coverage built up so far, the vantage points already used.
         self.replans = 0
         self.plan_reachable_cells = None
         self.map_replans = 0
         self.looked_from = []
         self.edge_checked = []
-        self.unverifiable = None
-        self.ever_reachable = None
-        self.ever_confirmed = None
-        self.unverified_at_vantage = None
         self.fruitless_vantages = 0
 
         self.get_logger().info(
@@ -937,6 +945,40 @@ class SearchNode(Node):
         # that just changed underneath it.
         self.last_coverage_log = 0.0
 
+    def _forget_the_old_area(self):
+        """Drop every per-cell memory, because they are shaped to the OLD grid.
+
+        One place, called by _rebuild_coverage_grid, so a field added here
+        later cannot be left behind by a caller that did not know about it.
+        That is how the node died: the list used to be split in two, and the
+        half that ran AFTER the rebuild left self.unverifiable - sized for
+        the previous area - to be indexed by the new grid's rows.
+
+        Two separate reasons to clear, which is why they belong together:
+
+        - shape. unverifiable, ever_reachable, ever_confirmed and
+          unverified_at_vantage are arrays on the coverage grid. A new area
+          with fewer rows is an IndexError waiting to happen, or a silent
+          broadcast error where they are used whole.
+
+        - meaning. confirmed and possible were flooded for the previous
+          area, from a different position, against an older map. A new box
+          falling outside them came out with no searchable cells at all and
+          the node announced "SEARCH AREA NOT SEARCHABLE" - for an area a
+          fresh flood reached in full, 960 cells of 960.
+
+        Only assignment, no reads, so this is safe to call from __init__
+        before the fields exist.
+        """
+        self.confirmed = None
+        self.possible = None
+        self._shadow_cache = None
+        self._shadow_cache_for = None
+        self.unverifiable = None
+        self.ever_reachable = None
+        self.ever_confirmed = None
+        self.unverified_at_vantage = None
+
     def _rebuild_coverage_grid(self):
         """Size and clear the coverage grid for the current polygon.
 
@@ -945,6 +987,9 @@ class SearchNode(Node):
         the percentage is measured against those only, or a non-rectangular
         area could never reach 100%.
         """
+        # Before the mask is built, never after: _build_inside_mask reads
+        # these and indexes them with the NEW grid's rows.
+        self._forget_the_old_area()
         pad = 5.0
         xs = [p[0] for p in self.polygon]
         ys = [p[1] for p in self.polygon]

@@ -2191,16 +2191,126 @@ class TestNewAreaIsJudgedAfresh:
         node.possible = np.zeros((80, 80), dtype=bool)
         node.confirmed = np.zeros((80, 80), dtype=bool)
 
-        # the operator draws somewhere new
+        # The operator draws somewhere new. Nothing is cleared by hand:
+        # _rebuild_coverage_grid owns that now, which is the whole point -
+        # a caller that forgot was how the node came to crash.
         node.polygon = [(20.0, 20.0), (30.0, 20.0), (30.0, 30.0), (20.0, 30.0)]
-        node.confirmed = None          # what on_area_request now does
-        node.possible = None
-        node._shadow_cache = node._shadow_cache_for = None
-        node._rebuild_coverage_grid = search_node.SearchNode._rebuild_coverage_grid.__get__(node)
+        for name in ('_forget_the_old_area', '_rebuild_coverage_grid'):
+            setattr(node, name, getattr(search_node.SearchNode, name).__get__(node))
         node._rebuild_coverage_grid()
 
+        assert node.possible is None, 'the rebuild kept the old flood'
         assert node.cells_to_search > 0, \
             'the new area was written off using the old reachability picture'
+
+
+class TestASmallerAreaDoesNotKillTheNode:
+    """The scout exited mid-session with
+
+        File "search_node.py", in _build_inside_mask
+          if self.unverifiable is not None and self.unverifiable[row, col]:
+        IndexError: index 35 is out of bounds for axis 0 with size 35
+
+    A finished search had written ground off as unverifiable. The operator
+    drew a SMALLER area, so the new coverage grid had fewer rows than the
+    array still held from the old one. Only smaller: a same-sized or bigger
+    area leaves the old array big enough to index, which is why it looked
+    random.
+    """
+
+    def rebuild(self, node, search_node):
+        for name in ('_forget_the_old_area', '_rebuild_coverage_grid'):
+            setattr(node, name, getattr(search_node.SearchNode, name).__get__(node))
+        node._rebuild_coverage_grid()
+
+    def node_with_a_written_off_area(self, planning_node, search_node):
+        import numpy as np
+        grid = make_costmap(120, 120, resolution=0.5, origin=(-5.0, -5.0))
+        node = planning_node([(0.0, 0.0), (40.0, 0.0), (40.0, 40.0), (0.0, 40.0)],
+                             grid)
+        self.rebuild(node, search_node)
+        # a finished search that gave up on some of the ground
+        node.unverifiable = np.zeros((node.cov_rows, node.cov_cols), dtype=bool)
+        node.unverifiable[0, 0] = True
+        node.ever_reachable = np.ones((node.cov_rows, node.cov_cols), dtype=bool)
+        node.ever_confirmed = np.ones((node.cov_rows, node.cov_cols), dtype=bool)
+        return node
+
+    def test_a_smaller_area_after_a_write_off_does_not_raise(
+            self, planning_node, search_node):
+        node = self.node_with_a_written_off_area(planning_node, search_node)
+        was = (node.cov_rows, node.cov_cols)
+        node.polygon = [(5.0, 5.0), (12.0, 5.0), (12.0, 12.0), (5.0, 12.0)]
+        self.rebuild(node, search_node)          # used to raise IndexError
+        assert node.cov_rows < was[0], 'the new grid was not actually smaller'
+        assert node.cells_to_search > 0
+
+    def test_the_old_write_off_is_forgotten_not_carried_over(
+            self, planning_node, search_node):
+        """Otherwise the new area starts with ground already given up on."""
+        node = self.node_with_a_written_off_area(planning_node, search_node)
+        node.polygon = [(5.0, 5.0), (12.0, 5.0), (12.0, 12.0), (5.0, 12.0)]
+        self.rebuild(node, search_node)
+        assert node.unverifiable is None
+        assert node.ever_reachable is None
+        assert node.ever_confirmed is None
+
+    def test_a_bigger_area_is_fine_too(self, planning_node, search_node):
+        """The case that never crashed, so it never got tested."""
+        node = self.node_with_a_written_off_area(planning_node, search_node)
+        node.polygon = [(0.0, 0.0), (60.0, 0.0), (60.0, 60.0), (0.0, 60.0)]
+        self.rebuild(node, search_node)
+        assert node.cells_to_search > 0
+
+    def test_a_bad_area_does_not_take_the_node_down(self, search_node):
+        """The IndexError came out of a SUBSCRIPTION callback, which stops
+        rclpy's executor and exits the process. A drawn area arrives from
+        another process and no part of it is worth the whole node - not
+        least because a dead search node is also one that cannot hear the
+        E-Stop topic."""
+        from types import SimpleNamespace
+        logged = []
+        node = SimpleNamespace(area_set=True, planned=True, status=None)
+        node.get_logger = lambda: SimpleNamespace(
+            error=logged.append, warn=logged.append, info=logged.append)
+        node._set_status = lambda state, detail='': setattr(
+            node, 'status', (state, detail))
+
+        def explode(_msg):
+            raise IndexError('index 35 is out of bounds for axis 0 with size 35')
+
+        node._apply_area_request = explode
+        search_node.SearchNode.on_area_request(node, object())   # must not raise
+
+        assert node.area_set is False, 'a rejected area was left looking usable'
+        assert node.planned is False
+        assert node.status[0] == search_node.ST_IDLE
+        assert any('out of bounds' in m for m in logged), \
+            'the traceback was swallowed - this must never be a bare except'
+        assert any('rejected' in m.lower() for m in logged), \
+            'the operator was not told the area was refused'
+
+    def test_a_good_area_is_left_alone(self, search_node):
+        from types import SimpleNamespace
+        seen = []
+        node = SimpleNamespace(area_set=False, planned=False)
+        node.get_logger = lambda: SimpleNamespace(error=seen.append)
+        node._apply_area_request = lambda msg: seen.append('applied')
+        search_node.SearchNode.on_area_request(node, object())
+        assert seen == ['applied'], 'the happy path was disturbed'
+
+    def test_every_grid_shaped_field_is_in_one_place(self, search_node):
+        """The bug was a reset list split in two, with half of it running
+        after the rebuild. If a new per-cell array is added later, it has to
+        go in _forget_the_old_area - this says so out loud."""
+        import inspect
+        src = inspect.getsource(search_node.SearchNode._forget_the_old_area)
+        for field in ('unverifiable', 'ever_reachable', 'ever_confirmed',
+                      'unverified_at_vantage', 'confirmed', 'possible'):
+            assert f'self.{field} = None' in src, field
+        rebuild = inspect.getsource(search_node.SearchNode._rebuild_coverage_grid)
+        assert '_forget_the_old_area()' in rebuild, \
+            'the rebuild no longer forgets the old area'
 
     def test_a_stale_picture_would_have_written_it_off(self, planning_node):
         """The counterpart: with the stale picture left in place, the mask is
