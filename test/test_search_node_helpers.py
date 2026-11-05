@@ -2227,6 +2227,8 @@ class TestProgressAlongTheRoute:
                 self.goal_progress_at = 0.0
                 self.goal_sent_at = 0.0
                 self.goal_leg_length = 50.0
+                self.returning = False
+                self.home_index = None
                 self.clock = 0.0
                 self.timed_out = False
                 self._replan_wanted = False
@@ -2667,3 +2669,91 @@ class TestSealedGroundIsGreyNotAmber:
             60, 60, resolution=0.5, origin=(-5.0, -5.0)))
         sealed = node._sealed_mask()
         assert sealed is not None and not sealed.any()
+
+
+class TestTheWayHomeIsNotAbandoned:
+    """The run ended with "Sweep complete and returned to spawn" while the
+    drone sat out by the mountain, not moving.
+
+    The spawn point is on the ute, and the ute is an obstacle. Measured on
+    the live costmap, the pad itself reads cost 77 - exactly the blocked
+    threshold - with 42 to 99 all around it. So _goal_now_impossible declared
+    the launch pad unreachable and the trip home was abandoned the moment it
+    was checked, every time, until the replan budget ran out.
+    """
+
+    @pytest.fixture
+    def node(self, search_node):
+        SearchNode = search_node.SearchNode
+
+        class N:
+            _check_stalled = SearchNode._check_stalled
+            next_waypoint = SearchNode.next_waypoint
+
+            def __init__(self):
+                self.holding = self.estopped = False
+                self.points = [(0.0, 0.0)]
+                self.index = 0
+                self.home_index = 0
+                self.returning = True
+                self.at = (30.0, 25.0)        # still out in the search area
+                self.goal_best_dist = None
+                self.goal_best_crow = float('inf')
+                self.nav_plan_length = None
+                self.goal_progress_at = 0.0
+                self.goal_sent_at = 0.0
+                self.goal_leg_length = 40.0
+                self.clock = 0.0
+                self.busy = False
+                self.timed_out = False
+                self._replan_wanted = False
+                self.goal_handle = None
+                self.abandoned = 0
+                self.said = []
+                self.impossible = True        # the pad reads as blocked
+                self.get_parameter = FakeParams(
+                    goal_stall_timeout=60.0, goal_progress_threshold=2.0,
+                    goal_time_factor=4.0, assumed_speed=0.3)
+
+            def paused(self): return self.holding or self.estopped
+            def _now(self): return self.clock
+            def _lookup_robot_xy(self): return self.at
+            def _goal_now_impossible(self, gx, gy): return self.impossible
+            def _should_replan(self): return False
+            def _after_abandoned_goal(self): self.abandoned += 1
+            def get_logger(self):
+                outer = self
+                class L:
+                    def __getattr__(self, lvl):
+                        return lambda msg: outer.said.append(msg)
+                return L()
+            @property
+            def sweep_complete_pub(self):
+                class P:
+                    def publish(self, _): pass
+                return P()
+        return N()
+
+    def test_the_trip_home_is_not_abandoned(self, node):
+        node._check_stalled()
+        assert node.abandoned == 0, \
+            'gave up on flying home because the launch pad reads as blocked'
+
+    def test_an_ordinary_waypoint_still_is(self, node):
+        node.returning = False
+        node.home_index = None
+        node.points = [(30.0, 30.0)]
+        node._check_stalled()
+        assert node.abandoned == 1, 'a genuinely unreachable waypoint was kept'
+
+    def test_it_does_not_claim_to_be_home_when_it_is_not(self, node):
+        node.index = 0
+        node.next_waypoint()
+        assert any('did not finish' in m for m in node.said), node.said
+        assert not any('returned to spawn' in m for m in node.said)
+
+    def test_it_does_say_so_when_it_really_is_home(self, node):
+        node.at = (0.4, 0.3)
+        node.index = 0
+        node.next_waypoint()
+        assert any('returned to spawn' in m for m in node.said), node.said

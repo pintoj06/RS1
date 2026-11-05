@@ -1496,7 +1496,17 @@ class SearchNode(Node):
         # in the costmap - so the node can simply ask whether the waypoint it
         # is flying to is still somewhere it can get to, instead of waiting a
         # minute to work it out from the fact that it is not getting there.
-        if self._goal_now_impossible(gx, gy):
+        # The way home is never abandoned for being blocked. The drone took
+        # off from the spawn point, so it is reachable by definition - but it
+        # sits on the ute, and the ute is an obstacle, so the costmap reads
+        # the pad itself at cost 77, exactly the blocked threshold. Every
+        # trip home was therefore abandoned the moment it was checked, and
+        # the run ended with the drone stopped wherever it happened to be.
+        going_home = (self.returning
+                      or (self.home_index is not None
+                          and self.index == self.home_index))
+
+        if not going_home and self._goal_now_impossible(gx, gy):
             self.get_logger().warn(
                 f'Waypoint {self.index + 1}/{len(self.points)} is no longer '
                 f'reachable - the lidar has since mapped an obstacle there. '
@@ -1798,8 +1808,19 @@ class SearchNode(Node):
         self.index +=1
         self.busy = False
         if self.index >=len(self.points):
-            if self.home_index is not None and completed_index == self.home_index:
+            here = self._lookup_robot_xy()
+            home = (self.home_index is not None
+                    and completed_index == self.home_index
+                    and here is not None
+                    and math.hypot(here[0], here[1]) <= 3.0)
+            if home:
                 self.get_logger().info('Sweep complete and returned to spawn.')
+            elif self.home_index is not None and completed_index == self.home_index:
+                # Said "returned to spawn" while sitting out by the mountain,
+                # because the leg home had been abandoned rather than flown.
+                self.get_logger().warn(
+                    'Sweep complete, but the trip back to base did not finish '
+                    '- the drone is still out in the search area.')
             else:
                 self.get_logger().info('Sweep complete. ')
             self.sweep_complete_pub.publish(Empty())
