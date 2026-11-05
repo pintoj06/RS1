@@ -319,6 +319,7 @@ class TestReleaseRadius:
                 self.busy = True
                 self.sent = True
                 self.released = False
+                self.going_home = False
                 self.estopped = False
                 self.drops = 0
                 self.cancelled = False
@@ -336,6 +337,9 @@ class TestReleaseRadius:
 
             def own_xy(self):
                 return self.at
+
+            def tick(self):
+                pass                 # the way back: see test_return_to_base.py
 
         fake = Fake()
         fake.result = lambda status: SimpleNamespace(

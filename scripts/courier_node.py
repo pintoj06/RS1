@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 
-"Wait for the operator to confirm a contact on the ground station, then fly to it, using NAV2"
+"Wait for the operator to confirm a contact on the ground station, fly to it using NAV2, drop the care package, then fly back to base"
 
 import math
 
@@ -21,7 +21,8 @@ from rclpy.qos import QoSDurabilityPolicy, QoSProfile, QoSReliabilityPolicy
 # ColorRGBA lets us colour the target marker.
 # Empty is a message with no content: publishing one releases the care package.
 # Bool carries the ground station's E-Stop state.
-from std_msgs.msg import Bool, ColorRGBA, Empty
+# String reports where the courier is in its return, see courier_state_pub.
+from std_msgs.msg import Bool, ColorRGBA, Empty, String
 # TFMessage is what /<robot>/tf carries; used to read the scout's TF tree.
 from tf2_msgs.msg import TFMessage
 # tf2_ros answers "where is the drone right now?" by reading the transform tree.
@@ -56,6 +57,9 @@ class CourierNode(Node):
         # stretch is the slow, fiddly one - often next to rock, where Nav2
         # can spend a long time creeping in or give up altogether.
         self.declare_parameter('release_radius', 1.5)   # metres
+        # Fly back to the pad after the drop, then send the scout home. False:
+        # hover over the contact instead, and the scout is not recalled.
+        self.declare_parameter('return_after_delivery', True)
 
         robot_name = self.get_parameter('robot_name').value
         scout_name = self.get_parameter('scout_name').value
@@ -84,6 +88,12 @@ class CourierNode(Node):
         self.sent = False   # set True once the delivery goal has been sent
         self.busy = False
         self.released = False   # the care package has been dropped
+        # Where to come back to: this drone's own position, read before it
+        # takes off (see tick), so it is the pad whichever way the odom frame
+        # is defined. None until TF first answers.
+        self.home = None
+        self.going_home = False   # the goal in flight, if any, is the way back
+        self.return_done = False  # back at base, or gave up trying
         # E-Stop from the ground station: cancel the flight and hover until
         # RESUME, then fly the same delivery again.
         self.estopped = False
@@ -114,6 +124,11 @@ class CourierNode(Node):
                                reliability=QoSReliabilityPolicy.RELIABLE,
                                durability=QoSDurabilityPolicy.TRANSIENT_LOCAL)
         self.create_subscription(Bool, '/aeroaid/estop', self.on_estop, estop_qos)
+        # RETURNING, HOME or RETURN_FAILED. The scout flies home on either of
+        # the last two, and the ground station stops holding it over the
+        # contact. Latched, so a node that starts late still hears it.
+        self.courier_state_pub = self.create_publisher(
+            String, '/aeroaid/courier_state', estop_qos)
 
         self.timer = self.create_timer(1.0, self.tick)  # runs once a second
 
@@ -281,8 +296,13 @@ class CourierNode(Node):
         return (x, y)
 
     def tick(self):
-        """Called every second; sends the delivery goal once, once a contact is confirmed."""
+        """Called every second; sends the delivery goal once a contact is confirmed, then the way back once the package is dropped."""
+        if self.home is None:
+            self.home = self.own_xy()
         if self.estopped:
+            return
+        if self.released:
+            self.fly_home()
             return
         if self.sent:  # already sent (or in flight/finished) - nothing more to do
             return
@@ -310,8 +330,30 @@ class CourierNode(Node):
             return
         self.send_goal(self.target)
 
+    def fly_home(self):
+        """After the drop: head back to the pad, unless already done or under way."""
+        if (not self.get_parameter('return_after_delivery').value
+                or self.return_done or self.busy):
+            return
+        if self.home is None:  # TF never answered, so there is nowhere known to go
+            self.get_logger().warn('No home position recorded; staying here.')
+            self.finish_return('RETURN_FAILED')
+            return
+        if not self.nav_client.server_is_ready():
+            return
+        self.going_home = True
+        self.publish_courier_state('RETURNING')
+        self.send_goal(self.home)
+
+    def publish_courier_state(self, state):
+        self.courier_state_pub.publish(String(data=state))
+
+    def finish_return(self, state):
+        self.return_done = True
+        self.publish_courier_state(state)
+
     def send_goal(self, point):
-        """Send the one delivery waypoint to Nav2."""
+        """Send one waypoint to Nav2: the contact, or the way back."""
         x, y = point
 
         yaw = 0.0
@@ -328,7 +370,8 @@ class CourierNode(Node):
 
         self.busy = True
         self.sent = True
-        self.get_logger().info(f'Flying to delivery point ({x:.1f}, {y:.1f})')
+        place = 'base' if self.going_home else 'delivery point'
+        self.get_logger().info(f'Flying to {place} ({x:.1f}, {y:.1f})')
 
         # Stage 1: send it. goal_response() gets called when Nav2 answers.
         send_future = self.nav_client.send_goal_async(goal)
@@ -387,20 +430,37 @@ class CourierNode(Node):
         """Stage 3: Nav2 has arrived, failed or given up"""
         self.goal_handle = None
         self.busy = False
+        status = future.result().status
+        if self.going_home:
+            if self.estopped or status == GoalStatus.STATUS_CANCELED:
+                return  # tick() flies it again once the E-Stop is released
+            if status == GoalStatus.STATUS_SUCCEEDED:
+                self.get_logger().info('Back at base. Hovering over the pad.')
+                self.finish_return('HOME')
+            else:
+                # Say so anyway: the scout must not wait for ever on this.
+                self.get_logger().warn('Could not get back to base.')
+                self.finish_return('RETURN_FAILED')
+            return
         if self.released:
             # Dropped on the way in (check_release) and the goal cancelled,
             # or arrived just after. Either way the delivery is done.
-            self.get_logger().info('Delivery complete. Hovering over the contact.')
+            self.get_logger().info('Delivery complete.')
+            self.tick()
             return
-        if self.estopped:
+        # Checking the status as well as the flag matters: RESUME can land
+        # before Nav2 reports the cancel, by which time estopped is already
+        # False, and reading that as a failure would end the delivery for good.
+        if self.estopped or status == GoalStatus.STATUS_CANCELED:
             # Cancelled by the E-Stop: not delivered, so fly it again on
             # RESUME instead of giving up. The package stays on board.
             self.sent = False
             return
-        if future.result().status == GoalStatus.STATUS_SUCCEEDED:
+        if status == GoalStatus.STATUS_SUCCEEDED:
             # Only if the 10 Hz check has not already: Nav2's goal tolerance
             # is tighter than release_radius, so this is a backstop.
             self.release('on arrival')
+            self.tick()
         else:
             self.get_logger().warn('Could not reach the delivery point.')
 

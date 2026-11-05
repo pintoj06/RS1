@@ -41,6 +41,7 @@ def search(search_node):
         def __init__(self):
             self.holding = False
             self.estopped = False
+            self.recalled = False
             self.goal_handle = None
             self.index = 2
             self.points = [(0, 0)] * 6
@@ -147,12 +148,17 @@ def courier(courier_node):
             self.sent = True
             self.target = (5.0, 5.0)
             self.released = False       # the node's own flag
+            self.going_home = False
+            self.home = (0.0, 0.0)
             self.drops = 0              # how many times the package went
             self.release_pub = SimpleNamespace(publish=lambda _: self._release())
             self.get_logger = FakeLogger
 
         def _release(self):
             self.drops += 1
+
+        def fly_home(self):
+            pass                        # see test_return_to_base.py
 
         def tick(self):
             CourierNode.tick(self)

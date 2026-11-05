@@ -411,6 +411,12 @@ class SearchNode(Node):
         # (a ruling, RESUME on the contacts page, an IR check timing out) can
         # release it - only the E-Stop's own RESUME does.
         self.estopped = False
+        # The courier has finished (see on_courier_state): the mission is over,
+        # so stop searching and fly home.
+        self.recalled = False
+        # An area was drawn after the latest confirm. The operator has moved
+        # on, so the courier finishing must start that search, not end it.
+        self.area_since_confirm = False
         self.goal_handle = None
         # Times in a row Nav2 has rejected the current waypoint (see goal_response).
         self.rejections = 0
@@ -434,6 +440,10 @@ class SearchNode(Node):
         self.create_subscription(Bool, 'search/hold', self.on_hold, hold_qos)
         # Absolute: one E-Stop stops every drone.
         self.create_subscription(Bool, '/aeroaid/estop', self.on_estop, hold_qos)
+        self.create_subscription(String, '/aeroaid/courier_state',
+                                 self.on_courier_state, hold_qos)
+        self.create_subscription(PointStamped, 'operator/confirmed_point',
+                                 self.on_confirmed_point, hold_qos)
 
         # ------------------------------------------------------------------
         # VISUALISATION - everything below is only for RViz. It does not
@@ -905,6 +915,9 @@ class SearchNode(Node):
         dy = tf.transform.translation.y
         self.polygon = [(x + dx, y + dy) for x, y in pts]
         self.area_set = True
+        # A new area is a new search, even after being sent home.
+        self.recalled = False
+        self.area_since_confirm = True
 
         # The coverage grid is sized to the polygon, so it has to be rebuilt -
         # otherwise progress would be measured against the old shape. The
@@ -914,9 +927,17 @@ class SearchNode(Node):
 
         # Abandon the current leg. The operator has new information, so
         # finishing a waypoint from the old area is wasted flying.
-        if self.goal_handle is not None:
+        cancelling = self.goal_handle is not None
+        if cancelling:
             self.goal_handle.cancel_goal_async()
         self._start_pass()
+        if cancelling:
+            # Stay busy until that result lands. A new goal sent before it
+            # would preempt the old one, and its result would then be taken
+            # for the new goal's: a skipped waypoint, or a lost handle that
+            # E-Stop could no longer cancel. goal_finished clears this.
+            self.busy = True
+            self._goal_superseded = True
         # Counters for the old area go too. Kept apart from _start_pass
         # because a replan resets the sequence but must keep these - the
         # coverage built up so far, the vantage points already used.
@@ -1537,7 +1558,8 @@ class SearchNode(Node):
         """Called every second; sends the next waypoint to Nav2 once it's ready and we're not already flying to one."""
         if self.pending_area is not None:  # drawn before takeoff, see on_area_request
             self.on_area_request(self.pending_area)
-        if not self.area_set:  # nothing to search until the operator draws it
+        # nothing to search until the operator draws it
+        if not self.area_set and not self.recalled:
             self._set_status(ST_IDLE, 'draw a search area to start')
             return
         if self.paused():
@@ -1546,6 +1568,17 @@ class SearchNode(Node):
             else:
                 self._set_status(ST_HOLD,
                                  'paused on a contact - confirm or dismiss it')
+            return
+        # Checked again every tick rather than once, because anything that
+        # restarts the pass on the way home would otherwise resume the search.
+        if self.recalled and not self.returning:
+            if self.busy:
+                # Wait for this goal to finish cancelling, or its result would
+                # be taken for the way home's.
+                if self.goal_handle is not None:
+                    self.goal_handle.cancel_goal_async()
+                return
+            self._fly_home('delivery complete')
             return
         if self.busy: #goal is already in flight
             self._check_stalled()
@@ -1624,7 +1657,7 @@ class SearchNode(Node):
                     or (self.home_index is not None
                         and self.index == self.home_index))
 
-    def _fly_home(self):
+    def _fly_home(self, why='search finished'):
         """Make going home an ordinary one-waypoint pass."""
         self._start_pass(returning=True)
         self.points = [(0.0, 0.0)]
@@ -1632,9 +1665,9 @@ class SearchNode(Node):
         self.planned = True
         self._publish_path()
         self._set_status(ST_RETURNING,
-                         f'search finished - {self._coverage_summary()}')
+                         f'{why} - {self._coverage_summary()}')
         self.get_logger().info(
-            f'Search finished ({self._coverage_summary()}). Flying back to base.')
+            f'Flying back to base: {why} ({self._coverage_summary()}).')
 
     def _after_last_waypoint(self):
         """The plan is flown out. Decide, in one place, what happens next.
@@ -2024,6 +2057,23 @@ class SearchNode(Node):
         else:
             self.get_logger().info('E-Stop released.')
             self.tick()        # stays put if a contact hold is still on
+
+    def on_courier_state(self, msg):
+        """The courier goes home first, so this drone keeps watch over the
+        casualty until it is back. A courier that could not get back counts
+        too: it must not leave this drone waiting for ever."""
+        if msg.data in ('HOME', 'RETURN_FAILED') and not self.recalled:
+            if self.area_since_confirm:
+                self.get_logger().info(
+                    f'Courier reports {msg.data}. A new area has been drawn '
+                    f'since, so carrying on with that.')
+                return
+            self.get_logger().info(
+                f'Courier reports {msg.data}: stopping the search and flying home.')
+            self.recalled = True
+
+    def on_confirmed_point(self, msg):
+        self.area_since_confirm = False
 
     def on_hold(self, msg):
         if msg.data == self.holding:
@@ -3269,7 +3319,8 @@ class SearchNode(Node):
         what it will see at survey height. That plan no longer has to be
         right, because this corrects it as soon as there is a real map.
         """
-        if not self.area_set or not self.planned or self.replanning:
+        if (not self.area_set or not self.planned or self.replanning
+                or self.recalled):
             return
         # A replan already asked for, waiting on a goal to cancel. Without
         # this the review fires again on the next period, reports the very

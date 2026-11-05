@@ -14,6 +14,7 @@ def generate_launch_description():
     target_world_x = LaunchConfiguration('target_world_x')
     target_world_y = LaunchConfiguration('target_world_y')
     use_contact_position = LaunchConfiguration('use_contact_position')
+    return_after_delivery = LaunchConfiguration('return_after_delivery')
 
     ld.add_action(DeclareLaunchArgument(
         'robot',
@@ -34,6 +35,11 @@ def generate_launch_description():
         'use_contact_position', default_value='True',
         description='Fly to the contact position confirmed by the scout. '
                     'False flies to the fixed target_world_x/y instead.',
+    ))
+    ld.add_action(DeclareLaunchArgument(
+        'return_after_delivery', default_value='True',
+        description='Fly back to base after the drop, then recall the scout. '
+                    'False hovers over the contact and leaves the scout searching.',
     ))
     # Fixed delivery point in world coordinates, used only when
     # use_contact_position is False: above person1 in worlds/large_demo.sdf.
@@ -61,6 +67,7 @@ def generate_launch_description():
             'robot_name': robot,
             'confirmed_point_topic': confirmed_point_topic,
             'use_contact_position': ParameterValue(use_contact_position, value_type=bool),
+            'return_after_delivery': ParameterValue(return_after_delivery, value_type=bool),
             'target_world_x': ParameterValue(target_world_x, value_type=float),
             'target_world_y': ParameterValue(target_world_y, value_type=float),
         }],

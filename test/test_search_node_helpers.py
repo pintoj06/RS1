@@ -359,6 +359,7 @@ def fake_review(search_node):
     SearchNode = search_node.SearchNode
 
     class FakeReview:
+        recalled = False
         _is_blocked = SearchNode._is_blocked
         _costmap_grid = SearchNode._costmap_grid
         _flood = SearchNode._flood
@@ -1365,6 +1366,7 @@ class TestPendingReplanAlwaysRuns:
 
         class Fake:
             tick = SearchNode.tick
+            recalled = False
 
             def __init__(self):
                 self.pending_area = None

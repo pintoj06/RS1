@@ -50,6 +50,7 @@ def scout(search_node):
     SearchNode = search_node.SearchNode
 
     class Scout:
+        recalled = False
         for _name in ('_on_edge_detections', '_edge_check_allowed',
                       '_edge_target', '_start_edge_check', 'next_waypoint',
                       'goal_finished', 'tick', 'paused', '_camera_fov',
