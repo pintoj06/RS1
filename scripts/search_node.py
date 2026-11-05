@@ -2099,6 +2099,8 @@ class SearchNode(Node):
             return False
         if self.returning or self.replanning or self._replan_wanted or self.timed_out:
             return False
+        if self.home_index is not None and self.index == self.home_index:
+            return False     # the leg home is not a sweep leg to step off
         if self.edge_look_index is not None or self._dwell_until is not None:
             return False             # one check at a time
         if self.index >= len(self.points):
@@ -2172,9 +2174,13 @@ class SearchNode(Node):
             self.edge_look_index = None
             self.edge_back_index = None
         if self.index >=len(self.points):
-            self.returning = self.returning or (
-                self.home_index is not None
-                and completed_index == self.home_index)
+            # Deliberately NOT setting self.returning here. Landing on the
+            # home waypoint says where the drone is, not that the search is
+            # finished - and _after_last_waypoint's first branch reads that
+            # flag as "the run is over", so latching it skipped the check
+            # for somewhere left worth looking and abandoned exactly the
+            # ground _finish_plan had kept in the search for a later pass.
+            # The genuine finish is already caught by its near-base branch.
             here = self._lookup_robot_xy()
             home = (self.home_index is not None
                     and completed_index == self.home_index

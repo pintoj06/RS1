@@ -3028,16 +3028,65 @@ class TestItSaysWhenItIsGoingHome:
         node.send_goal(node.points[0])
         assert node.status_state == search_node.ST_SEARCHING
 
-    def test_arriving_home_counts_as_returning(self, planning_node):
-        """So _after_last_waypoint reports COMPLETE rather than looking for
-        somewhere else to go."""
+    def landed_at_home(self, planning_node):
         grid = make_costmap(60, 60, resolution=0.5, origin=(-5.0, -5.0))
         node = planning_node(self.box(), grid)
         node.plan_sweep()
+        node.coverage[:, :] = 100
         node.at = (0.2, 0.1)
         node.index = node.home_index
-        node.next_waypoint()
-        assert node.returning, 'arriving home was not recognised as the end'
+        node.next_waypoint()              # the leg home lands
+        return node
+
+    def test_arriving_home_with_nothing_left_reports_complete(
+            self, planning_node, search_node):
+        """Through _after_last_waypoint's near-base branch. It does NOT work
+        by latching self.returning when the home waypoint lands - that also
+        skipped the check below, which is the point of the next test."""
+        node = self.landed_at_home(planning_node)
+        node._after_last_waypoint()
+        assert search_node.ST_COMPLETE in [st for st, _ in node.statuses]
+        assert node.returning
+
+    def test_arriving_home_still_goes_back_for_unresolved_ground(
+            self, planning_node, search_node):
+        """_finish_plan deliberately keeps ground it could not judge in the
+        search, 'for when there is' somewhere to look from. Treating the
+        landing at home as the end of the run declared COMPLETE and
+        abandoned exactly that ground.
+        """
+        node = self.landed_at_home(planning_node)
+        assert not node.returning, \
+            'landing at home was latched as the run being over'
+        node._worth_looking = lambda: True
+        node._frontier_goal = lambda: (5.0, 5.0)
+        node._after_last_waypoint()
+        assert node.replanning, \
+            'declared the search complete with ground still unresolved'
+        assert search_node.ST_COMPLETE not in [st for st, _ in node.statuses]
+
+    def test_the_leg_home_is_not_a_sweep_leg_to_step_off(
+            self, planning_node, search_node):
+        """Harry's edge-check guard used self.returning, which the latch set.
+        Without the latch it has to test the home leg directly, or the drone
+        would detour off the trip home to check a sighting."""
+        grid = make_costmap(60, 60, resolution=0.5, origin=(-5.0, -5.0))
+        node = planning_node(self.box(), grid)
+        node.plan_sweep()
+        node.index = node.home_index
+        node.planned = True
+        node.area_set = True
+        node.edge_look_index = node.edge_back_index = None
+        node._dwell_until = None
+        node.busy = False
+        node.goal_handle = None
+        node.get_parameter.values['investigate_edges'] = True
+        node.paused = lambda: False
+        node._replan_wanted = False
+        node.timed_out = False
+        node.replanning = False
+        allowed = search_node.SearchNode._edge_check_allowed(node)
+        assert allowed is False, 'would step off the trip home'
 class TestWaitsForAMapBeforePlanning:
     """Measured in flight: the operator drew the area before LAUNCH, and the
     node planned about a second after the first costmap, with the drone
