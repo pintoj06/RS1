@@ -386,6 +386,13 @@ class GroundStationNode(Node):
         self.coverage_gap_reason = ""                    # and why
         # Planned sweep route, in the map frame once transformed.
         self.search_path: List[Tuple[float, float]] = []
+        # Kept in the frame they arrived in and converted when drawn - see
+        # _on_path. Both are sent once per plan, so a transform that is not
+        # ready at that moment must not lose them.
+        self.search_path_raw: List[Tuple[float, float]] = []
+        self.search_path_frame = ""
+        self.vantage_raw: Optional[Tuple[float, float]] = None
+        self.vantage_frame = ""
         # What the scout says it is doing. Without it the operator watches the
         # green path vanish and the drone fly out of the box with no way to
         # tell a finished search from a look-around trip from a crash.
@@ -776,35 +783,28 @@ class GroundStationNode(Node):
         self.search_detail = detail.strip()
 
     def _on_vantage(self, msg) -> None:
-        """Store where the scout is going to look, shifted into this frame."""
-        try:
-            tf = self.tf_buffer.lookup_transform(
-                self.map_frame, msg.header.frame_id,
-                rclpy.time.Time(), timeout=Duration(seconds=0.05))
-        except Exception:
-            return
-        self.vantage_xy = (msg.point.x + tf.transform.translation.x,
-                           msg.point.y + tf.transform.translation.y)
+        """Store where the scout is going to look, in its own frame.
+
+        Converted when drawn, for the same reason as the sweep: it is sent
+        once per plan, so a transform that is not ready yet must not lose it.
+        """
+        self.vantage_raw = (msg.point.x, msg.point.y)
+        self.vantage_frame = msg.header.frame_id
 
     def _on_path(self, msg: Path):
-        """Store the scout's planned sweep, shifted into this map's frame.
+        """Store the scout's planned sweep, in the frame it arrived in.
 
-        Same odom-to-map offset the coverage overlay needs; without it the
-        route would be drawn about a metre from where the drone actually flies.
+        Kept raw and converted when it is drawn, not here. The sweep is
+        published ONCE per plan, so a transform that is not ready at that
+        instant used to lose the route for good - which is what happened on
+        a restart, where the ground station comes up a few seconds before the
+        scout and SLAM. Converting at draw time also keeps the route in step
+        with the search box as SLAM's correction drifts, instead of freezing
+        whatever offset happened to apply when the message landed.
         """
-        if not msg.poses:
-            self.search_path = []
-            return
-        try:
-            tf = self.tf_buffer.lookup_transform(
-                self.map_frame, msg.header.frame_id,
-                rclpy.time.Time(), timeout=Duration(seconds=0.05))
-        except Exception:
-            return
-        dx = tf.transform.translation.x
-        dy = tf.transform.translation.y
-        self.search_path = [(p.pose.position.x + dx, p.pose.position.y + dy)
-                            for p in msg.poses]
+        self.search_path_raw = [(q.pose.position.x, q.pose.position.y)
+                                for q in msg.poses]
+        self.search_path_frame = msg.header.frame_id
 
     def _poll_pose(self):
         """Ask TF where the drone is, in the map's own frame.
@@ -837,6 +837,7 @@ class GroundStationNode(Node):
             x = tf.transform.translation.x
             y = tf.transform.translation.y
         self.drone_xy = (x, y)
+        self._refresh_overlays()
 
         q = tf.transform.rotation
         self.drone_yaw = np.arctan2(2.0 * (q.w * q.z + q.x * q.y),
@@ -845,6 +846,35 @@ class GroundStationNode(Node):
         if not self.trail or (abs(self.trail[-1][0] - x) > 0.05 or
                               abs(self.trail[-1][1] - y) > 0.05):
             self.trail.append((x, y))
+
+    def _refresh_overlays(self) -> None:
+        """Put the sweep and the vantage point into this map's frame.
+
+        Done every time the pose is polled rather than once on arrival, so a
+        transform that was not ready when the message landed is picked up as
+        soon as it is, and so the route follows SLAM's correction instead of
+        being frozen at whatever it was.
+        """
+        for raw, frame, attr in ((self.search_path_raw, self.search_path_frame,
+                                  'search_path'),
+                                 (self.vantage_raw, self.vantage_frame,
+                                  'vantage_xy')):
+            if not raw:
+                continue
+            dx = dy = 0.0
+            if frame and frame != self.map_frame:
+                try:
+                    tf = self.tf_buffer.lookup_transform(
+                        self.map_frame, frame, rclpy.time.Time(),
+                        timeout=Duration(seconds=0.05))
+                    dx = tf.transform.translation.x
+                    dy = tf.transform.translation.y
+                except Exception:
+                    continue           # try again on the next poll
+            if attr == 'search_path':
+                self.search_path = [(x + dx, y + dy) for x, y in raw]
+            else:
+                self.vantage_xy = (raw[0] + dx, raw[1] + dy)
 
     def set_hold(self, hold: bool):
         if hold == self.holding:

@@ -108,3 +108,55 @@ class TestContactRadius:
         assert near(window, 3.0, 3.0, spots)          # 4.2 m away
         assert not near(window, 4.0, 4.0, spots)      # 5.7 m away
         assert not near(window, 1.0, 1.0, [])
+
+
+class TestOverlaysSurviveALateTransform:
+    """The sweep vanished from the map after a restart.
+
+    search_path and search_vantage are published ONCE per plan. The ground
+    station converted them into its own frame on arrival and returned early
+    if the transform was not ready - which it is not for the first seconds,
+    when the ground station starts before the scout and SLAM. The route was
+    then lost for good, because nothing republishes it until the next replan.
+
+    They are now kept in the frame they arrived in and converted when drawn.
+    """
+
+    def path_msg(self, *points):
+        from nav_msgs.msg import Path
+        from geometry_msgs.msg import PoseStamped
+        msg = Path()
+        msg.header.frame_id = 'parrot1_odom'
+        for x, y in points:
+            p = PoseStamped()
+            p.pose.position.x, p.pose.position.y = x, y
+            msg.poses.append(p)
+        return msg
+
+    def test_a_sweep_arriving_before_tf_is_kept(self, ground_station):
+        node = ground_station.GroundStationNode.__new__(
+            ground_station.GroundStationNode)
+        node.search_path_raw, node.search_path_frame = [], ""
+        node._on_path(self.path_msg((1.0, 2.0), (3.0, 4.0)))
+        assert node.search_path_raw == [(1.0, 2.0), (3.0, 4.0)], \
+            'the sweep was dropped instead of kept for later conversion'
+        assert node.search_path_frame == 'parrot1_odom'
+
+    def test_a_vantage_arriving_before_tf_is_kept(self, ground_station):
+        from geometry_msgs.msg import PointStamped
+        node = ground_station.GroundStationNode.__new__(
+            ground_station.GroundStationNode)
+        node.vantage_raw, node.vantage_frame = None, ""
+        msg = PointStamped()
+        msg.header.frame_id = 'parrot1_odom'
+        msg.point.x, msg.point.y = 5.0, 6.0
+        node._on_vantage(msg)
+        assert node.vantage_raw == (5.0, 6.0)
+        assert node.vantage_frame == 'parrot1_odom'
+
+    def test_an_empty_sweep_clears_it(self, ground_station):
+        node = ground_station.GroundStationNode.__new__(
+            ground_station.GroundStationNode)
+        node.search_path_raw, node.search_path_frame = [(1.0, 1.0)], 'x'
+        node._on_path(self.path_msg())
+        assert node.search_path_raw == []
