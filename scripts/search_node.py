@@ -2730,13 +2730,45 @@ class SearchNode(Node):
         max_col = min(self.cov_cols - 1, max_col)
         max_row = min(self.cov_rows - 1, max_row)
 
-        # Mark every cell whose centre falls inside the circle.
+        # Mark every cell whose centre falls inside the circle - EXCEPT the
+        # ones the camera cannot have seen.
+        #
+        # It used to mark the lot. Flying past a rock, the footprint circle
+        # laps over it and the ground inside got recorded as searched: 18.5 m2
+        # of the inside of a mountain marked as covered, in one measured case.
+        # That inflates the percentage and, worse, makes _already_searched
+        # skip that ground on a replan - so the drone would decline to search
+        # ground it had never actually seen.
+        #
+        # Two things disqualify a cell: it is mapped obstacle (the camera
+        # surveys ground, not rock), or mapped obstacle stands between the
+        # drone and it. The second is what rules out the inside of a rock the
+        # drone is flying alongside.
+        candidates = []
         for row in range(min_row, max_row + 1):
             for col in range(min_col, max_col + 1):
                 cell_x = self.cov_origin_x + (col + 0.5) * self.coverage_resolution
                 cell_y = self.cov_origin_y + (row + 0.5) * self.coverage_resolution
-                if math.hypot(cell_x - robot_x, cell_y - robot_y) <= radius:
-                    self.coverage[row, col] = 100
+                if math.hypot(cell_x - robot_x, cell_y - robot_y) > radius:
+                    continue
+                if self._is_blocked(cell_x, cell_y):
+                    continue
+                candidates.append((row, col, cell_x, cell_y))
+
+        if candidates and self.costmap is not None:
+            grid, info = self._costmap_grid()
+            solid = grid >= self.get_parameter('obstacle_cost_threshold').value
+            xs = np.array([c[2] for c in candidates])
+            ys = np.array([c[3] for c in candidates])
+            seen = self._lines_clear(np.full(xs.shape, robot_x),
+                                     np.full(ys.shape, robot_y),
+                                     xs, ys, solid, info)
+        else:
+            seen = np.ones(len(candidates), dtype=bool)
+
+        for (row, col, _, _), ok in zip(candidates, seen):
+            if ok:
+                self.coverage[row, col] = 100
 
         self._publish_coverage()
 

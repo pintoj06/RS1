@@ -2259,3 +2259,89 @@ class TestProgressAlongTheRoute:
             msg.poses.append(p)
         node._on_nav_plan(msg)
         assert node.nav_plan_length == pytest.approx(7.0)   # 3 + 4, not 5
+
+
+class TestCoverageDoesNotSeeThroughWalls:
+    """Measured in flight: a box drawn inside the mountain came back with
+    74 cells - 18.5 m2 of solid rock - marked SEARCHED.
+
+    update_coverage marked every cell within the camera footprint with no
+    obstacle test and no sight line, so flying past a rock recorded the ground
+    inside it as covered. That inflates the percentage, and makes
+    _already_searched skip that ground on a replan - so the drone declines to
+    search ground it never saw.
+    """
+
+    @pytest.fixture
+    def node(self, search_node):
+        import numpy as np
+        SearchNode = search_node.SearchNode
+
+        class N:
+            for _n in ('update_coverage', '_is_blocked', '_costmap_grid',
+                       '_lines_clear', '_footprint_radius', '_camera_fov',
+                       '_camera_altitude'):
+                locals()[_n] = getattr(SearchNode, _n)
+            del _n
+
+            def __init__(self):
+                self.area_set = True
+                self.at = (0.0, 0.0)
+                self.coverage_resolution = 0.5
+                self.cov_origin_x = self.cov_origin_y = -10.0
+                self.cov_cols = self.cov_rows = 40
+                self.coverage = np.zeros((40, 40), dtype=np.int8)
+                self.costmap = None
+                self.cam_fx = self.cam_fy = 427.5
+                self.cam_width, self.cam_height = 720, 480
+                self.published = 0
+                self.get_parameter = FakeParams(
+                    obstacle_cost_threshold=INSCRIBED,
+                    flight_altitude=10.0, fallback_camera_hfov=1.0472,
+                    fallback_image_width=720, fallback_image_height=480)
+
+            def _lookup_robot_xy(self): return self.at
+            def _publish_coverage(self): self.published += 1
+        return N()
+
+    def covered_at(self, node, x, y):
+        col = int((x - node.cov_origin_x) / node.coverage_resolution)
+        row = int((y - node.cov_origin_y) / node.coverage_resolution)
+        return bool(node.coverage[row, col] > 0)
+
+    def test_open_ground_under_the_camera_is_covered(self, node):
+        node.costmap = make_costmap(200, 200, resolution=0.15, origin=(-15.0, -15.0))
+        node.update_coverage()
+        assert self.covered_at(node, 1.0, 1.0), 'nothing was marked at all'
+
+    def test_a_wall_is_not_marked_as_searched(self, node):
+        grid = make_costmap(200, 200, resolution=0.15, origin=(-15.0, -15.0))
+        lo = int((2.0 + 15.0) / 0.15); hi = int((3.0 + 15.0) / 0.15)
+        fill_rect(grid, lo, hi, 0, 200, LETHAL)     # a wall at x 2..3
+        node.costmap = grid
+        node.update_coverage()
+        assert not self.covered_at(node, 2.5, 0.0), 'marked rock as searched'
+
+    def test_ground_behind_a_wall_is_not_marked(self, node):
+        """The 18.5 m2 case: the footprint laps over a rock the drone is
+        flying alongside, and the ground inside it must not count."""
+        grid = make_costmap(200, 200, resolution=0.15, origin=(-15.0, -15.0))
+        lo = int((2.0 + 15.0) / 0.15); hi = int((3.0 + 15.0) / 0.15)
+        fill_rect(grid, lo, hi, 0, 200, LETHAL)
+        node.costmap = grid
+        node.update_coverage()
+        assert not self.covered_at(node, 4.5, 0.0), \
+            'the camera was credited with seeing through a wall'
+
+    def test_ground_this_side_of_the_wall_still_counts(self, node):
+        grid = make_costmap(200, 200, resolution=0.15, origin=(-15.0, -15.0))
+        lo = int((2.0 + 15.0) / 0.15); hi = int((3.0 + 15.0) / 0.15)
+        fill_rect(grid, lo, hi, 0, 200, LETHAL)
+        node.costmap = grid
+        node.update_coverage()
+        assert self.covered_at(node, 1.0, 0.0), 'over-corrected: lost real coverage'
+
+    def test_no_costmap_means_mark_everything(self, node):
+        """Before the first costmap there is nothing to occlude with."""
+        node.update_coverage()
+        assert self.covered_at(node, 1.0, 1.0)
