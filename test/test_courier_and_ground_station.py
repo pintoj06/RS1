@@ -222,6 +222,82 @@ class TestOverlaysSurviveALateTransform:
         node.search_path_raw, node.search_path_frame = [(1.0, 1.0)], 'x'
         node._on_path(self.path_msg())
         assert node.search_path_raw == []
+class FakeTFBuffer:
+    """Records how lookup_transform was called, so a test can insist it is
+    not asked to block."""
+
+    def __init__(self, dx=0.0, dy=0.0):
+        self.calls = []
+        self.dx, self.dy = dx, dy
+
+    def lookup_transform(self, *args, **kwargs):
+        self.calls.append((args, kwargs))
+        from geometry_msgs.msg import TransformStamped
+        tf = TransformStamped()
+        tf.transform.translation.x = self.dx
+        tf.transform.translation.y = self.dy
+        return tf
+
+
+class TestAnEmptySweepClearsTheMap:
+    """The scout publishes an EMPTY search_path whenever a plan has no
+    lawnmower in it - the trip home from _fly_home, or a vantage-only plan.
+
+    _refresh_overlays skipped empty raw lists, so it cleared nothing: the
+    previous sweep stayed drawn in dashed green for the rest of the mission,
+    a route with nothing flying it. The raw list was cleared, which is what
+    the old test checked, so this passed unnoticed.
+    """
+
+    def node(self, ground_station):
+        n = ground_station.GroundStationNode.__new__(
+            ground_station.GroundStationNode)
+        n.map_frame = 'parrot1_map'
+        n.search_path_raw, n.search_path_frame = [], ''
+        n.search_path = [(1.0, 1.0), (2.0, 2.0)]      # already on the map
+        n.vantage_raw, n.vantage_frame = None, ''
+        n.vantage_xy = (9.0, 9.0)
+        return n
+
+    def test_an_empty_sweep_clears_the_drawn_route(self, ground_station):
+        n = self.node(ground_station)
+        n._refresh_overlays()
+        assert n.search_path == [], 'the finished sweep stayed on the map'
+
+    def test_no_vantage_clears_the_drawn_one(self, ground_station):
+        n = self.node(ground_station)
+        n._refresh_overlays()
+        assert n.vantage_xy is None
+
+    def test_a_real_sweep_is_still_converted(self, ground_station):
+        n = self.node(ground_station)
+        n.search_path_raw, n.search_path_frame = [(1.0, 2.0)], 'parrot1_odom'
+        n.tf_buffer = FakeTFBuffer(10.0, 20.0)
+        n._refresh_overlays()
+        assert n.search_path == [(11.0, 22.0)]
+
+    def test_the_lookup_is_never_asked_to_block(self, ground_station):
+        """tf2 busy-waits for a timeout, and this runs in a ROS callback
+        pumped from the Qt event loop - so a 50 ms timeout stalled the
+        window by that much on every poll, during the very startup window
+        the per-poll retry was added for."""
+        n = self.node(ground_station)
+        n.search_path_raw, n.search_path_frame = [(1.0, 2.0)], 'parrot1_odom'
+        n.tf_buffer = FakeTFBuffer()
+        n._refresh_overlays()
+        assert n.tf_buffer.calls, 'no lookup was attempted'
+        _args, kwargs = n.tf_buffer.calls[0]
+        assert 'timeout' not in kwargs, 'the GUI thread was asked to wait'
+
+    def test_a_sweep_in_the_map_frame_needs_no_lookup(self, ground_station):
+        n = self.node(ground_station)
+        n.search_path_raw, n.search_path_frame = [(3.0, 4.0)], 'parrot1_map'
+        n.tf_buffer = FakeTFBuffer(10.0, 20.0)
+        n._refresh_overlays()
+        assert n.search_path == [(3.0, 4.0)]
+        assert not n.tf_buffer.calls
+
+
 class TestReleaseRadius:
     """The package drops once the courier is within release_radius of the
     contact, not only when Nav2 calls the goal reached at 0.25 m."""

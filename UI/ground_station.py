@@ -40,7 +40,6 @@ from typing import Callable, List, Optional, Tuple
 import numpy as np
 
 import rclpy
-from rclpy.duration import Duration
 from rclpy.executors import (ShutdownException, SingleThreadedExecutor,
                              TimeoutException)
 from rclpy.node import Node
@@ -1055,19 +1054,34 @@ class GroundStationNode(Node):
         transform that was not ready when the message landed is picked up as
         soon as it is, and so the route follows SLAM's correction instead of
         being frozen at whatever it was.
+
+        No timeout on the lookup. tf2 busy-waits for one, and this runs in a
+        ROS callback pumped from the Qt event loop, so asking for 50 ms
+        stalled the window by up to that much on every poll - in exactly the
+        case the retry exists for, the first seconds when the map frame does
+        not exist yet. Without it a miss costs one 100 ms frame instead, and
+        the next poll tries again.
         """
         for raw, frame, attr in ((self.search_path_raw, self.search_path_frame,
                                   'search_path'),
                                  (self.vantage_raw, self.vantage_frame,
                                   'vantage_xy')):
             if not raw:
+                # An EMPTY sweep is a message, not a missing one. The scout
+                # publishes one whenever a plan has no lawnmower in it - the
+                # trip home from _fly_home, or a vantage-only plan - and
+                # skipping it left the PREVIOUS sweep drawn in dashed green
+                # for the rest of the mission, a route nothing was flying.
+                if attr == 'search_path':
+                    self.search_path = []
+                else:
+                    self.vantage_xy = None
                 continue
             dx = dy = 0.0
             if frame and frame != self.map_frame:
                 try:
                     tf = self.tf_buffer.lookup_transform(
-                        self.map_frame, frame, rclpy.time.Time(),
-                        timeout=Duration(seconds=0.05))
+                        self.map_frame, frame, rclpy.time.Time())
                     dx = tf.transform.translation.x
                     dy = tf.transform.translation.y
                 except Exception:
