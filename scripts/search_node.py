@@ -732,6 +732,19 @@ class SearchNode(Node):
         self.polygon = [(x + dx, y + dy) for x, y in pts]
         self.area_set = True
 
+        # Forget the old reachability picture BEFORE the mask is rebuilt.
+        # _build_inside_mask filters by self.possible, and that was computed
+        # for the previous area, at a different position, against an older
+        # map. A new box falling outside it came out with no searchable cells
+        # at all, and the node then announced "SEARCH AREA NOT SEARCHABLE"
+        # and stopped - for an area a fresh flood reached in full, 960 cells
+        # of 960. With these cleared the mask is built on geometry alone and
+        # the real floods are computed by the next plan.
+        self.confirmed = None
+        self.possible = None
+        self._shadow_cache = None
+        self._shadow_cache_for = None
+
         # The coverage grid is sized to the polygon, so it has to be rebuilt -
         # otherwise progress would be measured against the old shape.
         self._rebuild_coverage_grid()

@@ -2104,3 +2104,51 @@ class TestShadowOnlyOrdersTargets:
         assert goal is not None
         # the open end is at low x; the chosen vantage should be over that side
         assert goal[0] < 15.0, f'aimed at the blocked side first: {goal}'
+
+
+class TestNewAreaIsJudgedAfresh:
+    """"SEARCH AREA NOT SEARCHABLE" for an area that was perfectly reachable.
+
+    _build_inside_mask filters by self.possible, and on_area_request rebuilt
+    the coverage grid BEFORE anything recomputed it - so a new box was judged
+    against the reachability picture of the previous one, taken at a different
+    position against an older map. A box outside that picture came out with
+    zero searchable cells, the node announced the area unreachable and set
+    planned = True, and never looked again. Measured on the live costmap at
+    the time: the box was 100% unknown, 0% blocked, and a fresh flood reached
+    all 960 of its cells.
+    """
+
+    def test_a_new_area_is_not_judged_by_the_old_one(self, planning_node,
+                                                     search_node):
+        import numpy as np
+        grid = make_costmap(80, 80, resolution=0.5, origin=(-5.0, -5.0))
+        node = planning_node([(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)],
+                             grid)
+        # a stale picture that covers nothing at all, as a previous area
+        # at a previous position could easily leave behind
+        node.possible = np.zeros((80, 80), dtype=bool)
+        node.confirmed = np.zeros((80, 80), dtype=bool)
+
+        # the operator draws somewhere new
+        node.polygon = [(20.0, 20.0), (30.0, 20.0), (30.0, 30.0), (20.0, 30.0)]
+        node.confirmed = None          # what on_area_request now does
+        node.possible = None
+        node._shadow_cache = node._shadow_cache_for = None
+        node._rebuild_coverage_grid = search_node.SearchNode._rebuild_coverage_grid.__get__(node)
+        node._rebuild_coverage_grid()
+
+        assert node.cells_to_search > 0, \
+            'the new area was written off using the old reachability picture'
+
+    def test_a_stale_picture_would_have_written_it_off(self, planning_node):
+        """The counterpart: with the stale picture left in place, the mask is
+        empty - which is the bug, pinned down so it cannot come back."""
+        import numpy as np
+        grid = make_costmap(80, 80, resolution=0.5, origin=(-5.0, -5.0))
+        node = planning_node([(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)],
+                             grid)
+        node.possible = np.zeros((80, 80), dtype=bool)
+        node.polygon = [(20.0, 20.0), (30.0, 20.0), (30.0, 30.0), (20.0, 30.0)]
+        node.inside_mask = node._build_inside_mask()
+        assert int(node.inside_mask.sum()) == 0
