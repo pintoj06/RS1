@@ -1931,6 +1931,44 @@ class SearchNode(Node):
                     inside = not inside
         return inside
 
+    def _sealed_mask(self):
+        """Cells with no way out through non-wall space: walled in.
+
+        Asked of the map alone, from no particular position, which is what
+        lets it override everything else. A region ringed by wall is ringed
+        from anywhere; ground merely out of sight from where the drone is
+        standing is not, and must not be written off - that distinction is
+        the whole reason the reachable set accumulates instead of being taken
+        fresh each time.
+
+        Without this the accumulation worked against itself. The inside of a
+        mountain is reachable early on, while its outline is still open, so
+        it goes into "ever reachable" - and once the outline closes that
+        memory keeps it there. Measured on a finished run: 110 m2 of mountain
+        interior still drawn as unverified rather than walled in.
+
+        Returns a costmap-shaped bool grid, or None without a costmap.
+        """
+        got = self._costmap_grid()
+        if got is None:
+            return None
+        grid, info = got
+        wall = grid >= self.get_parameter('obstacle_cost_threshold').value
+        slam = self._slam_walls()
+        if slam is not None:
+            wall = wall | slam
+        free = ~wall
+        if not free.any():
+            return None
+        labels, count = ndimage.label(free)
+        if not count:
+            return None
+        # Anything connected to the edge of the map has a way out.
+        edge = np.concatenate([labels[0, :], labels[-1, :],
+                               labels[:, 0], labels[:, -1]])
+        outside = np.unique(edge[edge > 0])
+        return free & ~np.isin(labels, outside)
+
     def _reach_picture(self):
         """(ever reachable, ever confirmed) on the coverage grid.
 
@@ -1985,6 +2023,10 @@ class SearchNode(Node):
         # Reachability accumulates; it does not come and go with the drone.
         self._remember_reachable()
         reach = self._reach_picture()[0] if avoiding else None
+        # Being walled in is a fact about the map, not about where the drone
+        # is, so it is allowed to override what has ever been reachable.
+        sealed = self._project(self._sealed_mask(), default=False) if avoiding \
+            else None
         mask = np.zeros((self.cov_rows, self.cov_cols), dtype=bool)
         # Kept alongside the searchable mask so the overlay can say WHY a cell
         # is not being searched instead of just leaving it blank. Accounting
@@ -2007,8 +2049,11 @@ class SearchNode(Node):
                 if avoiding and self._is_blocked(cell_x, cell_y):
                     blocked_mask[row, col] = True
                     continue
+                if sealed is not None and sealed[row, col]:
+                    blocked_mask[row, col] = True      # ringed by wall
+                    continue
                 if reach is not None and not reach[row, col]:
-                    blocked_mask[row, col] = True      # walled off, no way in
+                    blocked_mask[row, col] = True      # no way in found yet
                     continue
                 if self.unverifiable is not None and self.unverifiable[row, col]:
                     continue

@@ -883,6 +883,7 @@ def planning_node(search_node):
                       '_unverified_cells', '_worth_looking',
                       '_write_off_unverified',
                       '_build_inside_mask', '_remember_reachable',
+                      '_sealed_mask',
                       '_reach_picture',
                       '_refresh_searchable',
                       '_predicted_coverage', '_already_searched',
@@ -2591,3 +2592,78 @@ class TestAccountingDoesNotWobble:
         node.ever_reachable = np.ones((3, 3), dtype=bool)   # wrong shape
         node._remember_reachable()
         assert node.ever_reachable.shape == (node.cov_rows, node.cov_cols)
+
+
+class TestSealedGroundIsGreyNotAmber:
+    """Reported on a finished run: the mountain sat in the middle of the
+    search area, the whole outline was mapped, and its interior stayed ORANGE
+    - "not checked" - when it should read GREY, "walled off, no way in".
+
+    Measured at the time: 110 m2 orange against 24 m2 grey.
+
+    The cause was the monotone accounting fighting itself. The interior is
+    reachable early on, while the outline is still open, so it goes into
+    "ever reachable" - and once the outline closes that memory keeps it
+    there. Being walled in is a fact about the map rather than about where
+    the drone is standing, so it now overrides.
+    """
+
+    def box(self):
+        return [(0.0, 0.0), (20.0, 0.0), (20.0, 20.0), (0.0, 20.0)]
+
+    def ringed(self, open_gap):
+        """A box of wall in the middle of the area, optionally with a gap."""
+        grid = make_costmap(60, 60, resolution=0.5, origin=(-5.0, -5.0))
+        lo, hi = int((6.0 + 5.0) / 0.5), int((14.0 + 5.0) / 0.5)
+        fill_rect(grid, lo, hi, lo, lo + 1, LETHAL)
+        fill_rect(grid, lo, hi, hi - 1, hi, LETHAL)
+        fill_rect(grid, lo, lo + 1, lo, hi, LETHAL)
+        fill_rect(grid, hi - 1, hi, lo, hi, LETHAL)
+        if open_gap:
+            mid = (lo + hi) // 2
+            fill_rect(grid, mid, mid + 3, hi - 1, hi, 0)
+        return grid
+
+    def test_a_closed_ring_reads_as_walled_in(self, planning_node):
+        import numpy as np
+        node = planning_node(self.box(), self.ringed(open_gap=False))
+        node.possible = np.ones((60, 60), dtype=bool)   # "it was reachable once"
+        node._remember_reachable()
+        node.inside_mask = node._build_inside_mask()
+        # the middle of the ring
+        col = int((10.0 - node.cov_origin_x) / node.coverage_resolution)
+        row = int((10.0 - node.cov_origin_y) / node.coverage_resolution)
+        assert node.blocked_mask[row, col], \
+            'ground ringed by wall was not marked walled in'
+        assert not node.inside_mask[row, col]
+
+    def test_an_open_ring_is_not_written_off(self, planning_node):
+        """With a way in it must stay searchable - the drone can get there."""
+        import numpy as np
+        node = planning_node(self.box(), self.ringed(open_gap=True))
+        node.possible = np.ones((60, 60), dtype=bool)
+        node._remember_reachable()
+        node.inside_mask = node._build_inside_mask()
+        col = int((10.0 - node.cov_origin_x) / node.coverage_resolution)
+        row = int((10.0 - node.cov_origin_y) / node.coverage_resolution)
+        assert not node.blocked_mask[row, col], \
+            'ground with a way in was written off as walled'
+
+    def test_sealing_beats_the_accumulated_memory(self, planning_node):
+        """The exact regression: reachable early, sealed later."""
+        import numpy as np
+        node = planning_node(self.box(), self.ringed(open_gap=True))
+        node.possible = np.ones((60, 60), dtype=bool)
+        node._remember_reachable()                  # remembers the interior
+        node.costmap = self.ringed(open_gap=False)  # the outline closes
+        node.inside_mask = node._build_inside_mask()
+        col = int((10.0 - node.cov_origin_x) / node.coverage_resolution)
+        row = int((10.0 - node.cov_origin_y) / node.coverage_resolution)
+        assert node.blocked_mask[row, col], \
+            'the memory of early reachability outvoted a closed outline'
+
+    def test_open_ground_is_never_called_sealed(self, planning_node):
+        node = planning_node(self.box(), make_costmap(
+            60, 60, resolution=0.5, origin=(-5.0, -5.0)))
+        sealed = node._sealed_mask()
+        assert sealed is not None and not sealed.any()
