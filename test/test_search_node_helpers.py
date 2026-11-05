@@ -2354,6 +2354,7 @@ class TestProgressAlongTheRoute:
                 self.goal_best_dist = None
                 self.goal_best_crow = float('inf')
                 self.nav_plan_length = None
+                self.goal_route_max = None
                 self.goal_progress_at = 0.0
                 self.goal_sent_at = 0.0
                 self.goal_leg_length = 50.0
@@ -2377,6 +2378,71 @@ class TestProgressAlongTheRoute:
             def _should_replan(self): return False
             def _after_abandoned_goal(self): self.abandoned += 1
         return N()
+
+    def plan(self, length):
+        from nav_msgs.msg import Path
+        from geometry_msgs.msg import PoseStamped
+        msg = Path()
+        for x in (0.0, float(length)):
+            ps = PoseStamped()
+            ps.pose.position.x = x
+            msg.poses.append(ps)
+        return msg
+
+    def settle(self, node):
+        """Get past both progress tests, so the next call reaches the
+        backstop: one call banks the route distance, one banks the straight
+        line, and the one after that has nothing left to improve on."""
+        node._check_stalled()
+        node._check_stalled()
+        node._check_stalled()
+
+    def test_the_longest_route_is_remembered_not_what_is_left(self, node):
+        node._on_nav_plan(self.plan(200.0))
+        node._on_nav_plan(self.plan(140.0))
+        node._on_nav_plan(self.plan(5.0))
+        assert node.nav_plan_length == 5.0, 'the live figure should follow'
+        assert node.goal_route_max == 200.0, 'the high-water mark decayed'
+
+    def test_a_long_detour_is_not_cut_off_once_the_route_has_shrunk(self, node):
+        """Nav2's plan is what is LEFT to fly. Having come most of the way
+        round the mountain it is nearly zero, and a budget built from the
+        live figure fell back to the straight-line one - cutting the leg off
+        a few metres short of the corner, the exact failure the route-based
+        budget was added to prevent."""
+        node.get_parameter.values['goal_stall_timeout'] = 1e6   # isolate it
+        node._on_nav_plan(self.plan(200.0))     # the whole way round
+        node._check_stalled()
+        node._on_nav_plan(self.plan(5.0))       # nearly there now
+        self.settle(node)
+
+        straight = node.goal_leg_length / 0.3 * 4.0
+        node.clock = straight + 100.0
+        assert node.clock > straight, \
+            'the test must run past the straight-line budget or it proves nothing'
+        node._check_stalled()
+        assert node.abandoned == 0, \
+            'cut the detour off because the route LEFT had shrunk'
+
+    def test_the_backstop_still_fires_past_the_whole_route(self, node):
+        """It is a backstop against oscillating for ever; it must still work."""
+        node.get_parameter.values['goal_stall_timeout'] = 1e6
+        node._on_nav_plan(self.plan(200.0))
+        node._check_stalled()
+        node._on_nav_plan(self.plan(5.0))
+        self.settle(node)
+        node.clock = 200.0 / 0.3 * 4.0 + 100.0
+        node._check_stalled()
+        assert node.abandoned == 1, 'the overrun backstop stopped working'
+
+    def test_a_new_goal_forgets_the_last_legs_route(self, node):
+        """Otherwise one long way round the mountain would buy every later
+        waypoint the same enormous budget."""
+        node._on_nav_plan(self.plan(200.0))
+        assert node.goal_route_max == 200.0
+        node.goal_route_max = None              # what send_goal does
+        node._on_nav_plan(self.plan(12.0))
+        assert node.goal_route_max == 12.0
 
     def test_a_detour_is_not_mistaken_for_a_stall(self, node):
         """Flying round an obstacle: the straight-line distance never
@@ -2975,6 +3041,7 @@ class TestTheWayHomeIsNotAbandoned:
                 self.goal_best_dist = None
                 self.goal_best_crow = float('inf')
                 self.nav_plan_length = None
+                self.goal_route_max = None
                 self.goal_progress_at = 0.0
                 self.goal_sent_at = 0.0
                 self.goal_leg_length = 40.0

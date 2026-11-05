@@ -401,6 +401,7 @@ class SearchNode(Node):
         self.goal_sent_at = None    # when the current goal went out
         self.last_recheck = 0.0     # when the goal was last re-validated
         self.goal_leg_length = None  # how far it was when sent
+        self.goal_route_max = None   # longest route Nav2 had for it
         # Hold = stop sweeping and hover where we are. The ground station sets
         # it while the RGB camera checks a thermal signature and while a
         # contact waits for the operator's ruling, and clears it after.
@@ -1781,7 +1782,12 @@ class SearchNode(Node):
             # Budget against the route Nav2 is actually flying. A leg round an
             # obstacle is far longer than the straight line, and budgeting on
             # the straight line cut it off part way round.
-            leg = max(self.goal_leg_length, self.nav_plan_length or 0.0)
+            #
+            # The LONGEST route this leg has had, not what is left of it: the
+            # live figure shrinks as the drone arrives, so near the end of a
+            # long detour the budget fell back to the straight-line one and
+            # cut the leg off anyway. See _on_nav_plan.
+            leg = max(self.goal_leg_length, self.goal_route_max or 0.0)
             budget = (leg / speed
                       * float(self.get_parameter('goal_time_factor').value))
             overrun = self._now() - self.goal_sent_at > budget
@@ -1920,6 +1926,7 @@ class SearchNode(Node):
         self.goal_best_dist = None
         self.goal_best_crow = float('inf')
         self.nav_plan_length = None
+        self.goal_route_max = None
         self.goal_progress_at = self._now()
         self.goal_sent_at = self._now()
         self.last_recheck = self._now()
@@ -2609,12 +2616,22 @@ class SearchNode(Node):
         self.status_pub.publish(msg)
 
     def _on_nav_plan(self, msg):
-        """Keep the length of the route Nav2 means to fly."""
+        """Keep the route Nav2 means to fly, and the longest it has been.
+
+        The live figure is what is LEFT to fly, so it shrinks towards nothing
+        as the drone arrives. _check_stalled's time budget needs the whole
+        route instead: built from the live figure it decayed back to the
+        straight-line length part way round an obstacle, and cut the leg off
+        a few metres short of the corner it was rounding - which is the exact
+        failure the route-based budget was added to prevent.
+        """
         total = 0.0
         for a, b in zip(msg.poses[:-1], msg.poses[1:]):
             total += math.hypot(b.pose.position.x - a.pose.position.x,
                                 b.pose.position.y - a.pose.position.y)
         self.nav_plan_length = total if msg.poses else None
+        if msg.poses:
+            self.goal_route_max = max(self.goal_route_max or 0.0, total)
 
     def _slam_map_callback(self, msg):
         """Keep SLAM's map. Only _slam_walls reads it."""
