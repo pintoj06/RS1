@@ -883,7 +883,7 @@ def planning_node(search_node):
                       '_unverified_cells', '_worth_looking',
                       '_write_off_unverified',
                       '_build_inside_mask', '_remember_reachable',
-                      '_sealed_mask',
+                      '_sealed_mask', '_my_component',
                       '_reach_picture',
                       '_refresh_searchable',
                       '_predicted_coverage', '_already_searched',
@@ -2877,6 +2877,67 @@ class TestSealedGroundIsGreyNotAmber:
         assert node.blocked_mask[row, col], \
             'the memory of early reachability outvoted a closed outline'
 
+    def here(self, node, x, y):
+        res = node.costmap.info.resolution
+        col = int((x - node.costmap.info.origin.position.x) / res)
+        row = int((y - node.costmap.info.origin.position.y) / res)
+        return row, col
+
+    def test_the_space_the_drone_is_in_is_never_sealed(self, planning_node):
+        """A sealed verdict OVERRIDES the accumulated reachable set, by
+        design and with no way back. 'wall' is the planning threshold, so it
+        includes Nav2's inflated ring, and the SLAM walls are dilated on top
+        of that - between them they can pinch shut a corridor the drone is
+        actually flying down, and then the whole search area is written off
+        permanently. The drone is in that space and flying, so it has a way
+        out whatever the map says.
+        """
+        node = planning_node(self.box(), self.ringed(open_gap=False))
+        node.at = (10.0, 10.0)                  # inside the ring
+        sealed = node._sealed_mask()
+        assert sealed is not None
+        row, col = self.here(node, 10.0, 10.0)
+        assert not sealed[row, col], \
+            'sealed in the very space the drone was flying in'
+
+    def test_a_pocket_the_drone_is_not_in_is_still_sealed(self, planning_node):
+        """The feature itself must survive the exemption."""
+        node = planning_node(self.box(), self.ringed(open_gap=False))
+        node.at = (-3.0, -3.0)                  # outside the ring
+        sealed = node._sealed_mask()
+        row, col = self.here(node, 10.0, 10.0)
+        assert sealed is not None and sealed[row, col], \
+            'a walled-in pocket stopped being recognised'
+
+    def test_it_declines_to_seal_with_no_position_to_work_from(
+            self, planning_node):
+        """Deferring the verdict for two seconds beats writing off the lot."""
+        node = planning_node(self.box(), self.ringed(open_gap=False))
+        node._lookup_robot_xy = lambda: None
+        assert node._sealed_mask() is None
+
+    def test_the_nearest_open_cell_stands_in_for_the_drones_own(
+            self, planning_node):
+        """Flying close to the rock puts the drone inside the inflated ring,
+        where its own cell reads as wall."""
+        import numpy as np
+        node = planning_node(self.box(), make_costmap(
+            60, 60, resolution=0.5, origin=(-5.0, -5.0)))
+        labels = np.zeros((60, 60), dtype=int)
+        labels[31:, :] = 7                      # open ground just to the north
+        row, _col = self.here(node, 10.0, 10.0)
+        assert labels[row, 0] == 0, 'the drone must start in a wall cell'
+        node.at = (10.0, 10.0)
+        assert node._my_component(labels, node.costmap.info) == 7
+
+    def test_it_gives_up_when_nothing_open_is_within_reach(self, planning_node):
+        import numpy as np
+        node = planning_node(self.box(), make_costmap(
+            60, 60, resolution=0.5, origin=(-5.0, -5.0)))
+        node.at = (10.0, 10.0)
+        assert node._my_component(np.zeros((60, 60), dtype=int),
+                                 node.costmap.info) == 0
+
     def test_open_ground_is_never_called_sealed(self, planning_node):
         node = planning_node(self.box(), make_costmap(
             60, 60, resolution=0.5, origin=(-5.0, -5.0)))
@@ -3146,3 +3207,53 @@ class TestWaitsForAMapBeforePlanning:
         assert node._too_little_mapped()
         node.confirmed[:15, :14] = True             # 210 cells = 52.5 m2
         assert not node._too_little_mapped()
+
+
+class TestTheCachesAreNotKeyedOnAddresses:
+    """id() is unique only while the object it names is alive. A replacement
+    costmap or flood can land on the address a freed one had, and a cache
+    keyed on that id then goes on serving a result built from a map that no
+    longer exists - indefinitely, because the key keeps matching.
+
+    Holding the objects makes identity safe: nothing the cache keys on can
+    be freed while it is the key, so no address can be reused underneath it.
+    """
+
+    def box(self):
+        return [(0.0, 0.0), (20.0, 0.0), (20.0, 20.0), (0.0, 20.0)]
+
+    def test_the_shadow_cache_holds_what_it_keyed_on(self, planning_node):
+        import numpy as np
+        node = planning_node(self.box(), make_costmap(
+            60, 60, resolution=0.5, origin=(-5.0, -5.0)))
+        node.confirmed = np.ones((60, 60), dtype=bool)
+        first = node._nearest_known()
+        assert first is not None
+        assert node._shadow_cache_for[0] is node.costmap
+        assert node._shadow_cache_for[1] is node.confirmed
+
+    def test_the_same_inputs_are_served_from_the_cache(self, planning_node):
+        import numpy as np
+        node = planning_node(self.box(), make_costmap(
+            60, 60, resolution=0.5, origin=(-5.0, -5.0)))
+        node.confirmed = np.ones((60, 60), dtype=bool)
+        first = node._nearest_known()
+        assert node._nearest_known() is first, 'recomputed for no reason'
+
+    def test_a_different_flood_is_recomputed(self, planning_node):
+        import numpy as np
+        node = planning_node(self.box(), make_costmap(
+            60, 60, resolution=0.5, origin=(-5.0, -5.0)))
+        node.confirmed = np.ones((60, 60), dtype=bool)
+        first = node._nearest_known()
+        node.confirmed = np.ones((60, 60), dtype=bool)   # equal, not the same
+        assert node._nearest_known() is not first, \
+            'a new flood was answered from the old cache'
+
+    def test_neither_cache_keys_on_an_address_again(self, search_node):
+        import inspect
+        for name in ('_slam_walls', '_nearest_known'):
+            src = inspect.getsource(getattr(search_node.SearchNode, name))
+            body = src.split('"""')[-1]        # ignore the docstring
+            code = '\n'.join(line.split('#')[0] for line in body.splitlines())
+            assert 'id(' not in code, f'{name} is keyed on an address again'

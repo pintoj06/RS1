@@ -2361,7 +2361,55 @@ class SearchNode(Node):
         edge = np.concatenate([labels[0, :], labels[-1, :],
                                labels[:, 0], labels[:, -1]])
         outside = np.unique(edge[edge > 0])
+
+        # And so does the side the DRONE is on. It is demonstrably not
+        # walled in, because the drone is standing in it and flying.
+        #
+        # This matters because a sealed verdict OVERRIDES the accumulated
+        # reachable set, by design and with no way back. 'wall' here is the
+        # planning threshold, so it includes Nav2's inflated ring, and the
+        # SLAM walls are dilated on top of that. Between them they can pinch
+        # a corridor the drone is actually flying down - and then the whole
+        # search area is ringed by wall, written off, and stays written off.
+        mine = self._my_component(labels, info)
+        if mine is None:
+            # Could not place the drone in open space at all. Rather than
+            # risk writing off everything, decline to seal this time round;
+            # _review_map asks again in a couple of seconds.
+            return None
+        if mine:
+            outside = np.append(outside, mine)
         return free & ~np.isin(labels, outside)
+
+    def _my_component(self, labels, info):
+        """Which labelled free region the drone is in: 0 if it cannot be
+        placed, None if there is no position to work from at all.
+
+        Its own cell is usually enough, but not always: flying close to the
+        rock puts the drone inside the inflated ring, where its cell reads
+        as wall. Then the nearest open cell within a short reach stands in
+        for it, which is where the drone plainly just came from.
+        """
+        here = self._lookup_robot_xy()
+        if here is None:
+            return None
+        res = info.resolution
+        col = int((here[0] - info.origin.position.x) / res)
+        row = int((here[1] - info.origin.position.y) / res)
+        rows, cols = labels.shape
+        if 0 <= row < rows and 0 <= col < cols and labels[row, col] > 0:
+            return int(labels[row, col])
+        reach = max(1, int(math.ceil(1.5 / res)))
+        r0, r1 = max(0, row - reach), min(rows, row + reach + 1)
+        c0, c1 = max(0, col - reach), min(cols, col + reach + 1)
+        if r1 <= r0 or c1 <= c0:
+            return 0
+        window = labels[r0:r1, c0:c1]
+        ys, xs = np.nonzero(window > 0)
+        if not ys.size:
+            return 0
+        near = np.argmin((ys + r0 - row) ** 2 + (xs + c0 - col) ** 2)
+        return int(window[ys[near], xs[near]])
 
     def _reach_picture(self):
         """(ever reachable, ever confirmed) on the coverage grid.
@@ -2595,11 +2643,16 @@ class SearchNode(Node):
             return None
         if self.slam_map is None or self.costmap is None:
             return None
-        key = (id(self.slam_map), id(self.costmap))
-        if self._slam_walls_for == key:
-            return self._slam_walls_cache
-
+        # Keyed on the message OBJECTS, not their id(). An id is only
+        # unique while the object lives: a replacement costmap can land on
+        # the address the last one was freed from, and the cache then goes
+        # on returning walls built from a map that no longer exists. Holding
+        # the references is what makes identity safe - the objects cannot be
+        # freed while the cache keys on them, so no address is reused.
         sm, cm = self.slam_map, self.costmap
+        cached = self._slam_walls_for
+        if cached is not None and cached[0] is sm and cached[1] is cm:
+            return self._slam_walls_cache
         try:
             tf = self.tf_buffer.lookup_transform(
                 self.map_frame, sm.header.frame_id,
@@ -2633,7 +2686,7 @@ class SearchNode(Node):
         if ok_c.any() and ok_r.any():
             out[np.ix_(ok_r, ok_c)] = occupied[np.ix_(rows[ok_r], cols[ok_c])]
 
-        self._slam_walls_for = key
+        self._slam_walls_for = (sm, cm)
         self._slam_walls_cache = out
         return out
 
@@ -2991,12 +3044,15 @@ class SearchNode(Node):
         """
         if self.confirmed is None or not self.confirmed.any():
             return None
-        key = id(self.costmap), id(self.confirmed)
-        if self._shadow_cache_for == key:
+        # The objects themselves, for the reason given in _slam_walls: an
+        # id() is reused once the object it named is freed.
+        cm, conf = self.costmap, self.confirmed
+        cached = self._shadow_cache_for
+        if cached is not None and cached[0] is cm and cached[1] is conf:
             return self._shadow_cache
         _, idx = ndimage.distance_transform_edt(~self.confirmed,
                                                 return_indices=True)
-        self._shadow_cache_for = key
+        self._shadow_cache_for = (cm, conf)
         self._shadow_cache = idx
         return idx
 
