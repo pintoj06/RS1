@@ -76,3 +76,11 @@
   ros_type_name: "sensor_msgs/msg/Image"
   gz_type_name: "ignition.msgs.Image"
   direction: GZ_TO_ROS
+# Night-mode floodlight (parrot.gazebo.xacro), switched by the ground station.
+# shortcut: the world name is fixed to large_demo, the only world night mode
+# runs in; another world needs its own /world/<name>/light_config here.
+- ros_topic_name: "flashlight"
+  gz_topic_name: "/world/large_demo/light_config"
+  ros_type_name: "ros_gz_interfaces/msg/Light"
+  gz_type_name: "ignition.msgs.Light"
+  direction: ROS_TO_GZ

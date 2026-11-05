@@ -41,6 +41,8 @@ import numpy as np
 
 import rclpy
 from rclpy.duration import Duration
+from rclpy.executors import (ShutdownException, SingleThreadedExecutor,
+                             TimeoutException)
 from rclpy.node import Node
 from rclpy.qos import (QoSDurabilityPolicy, QoSHistoryPolicy, QoSProfile,
                        QoSReliabilityPolicy, qos_profile_sensor_data)
@@ -49,6 +51,7 @@ from geometry_msgs.msg import Point32, PointStamped, PolygonStamped
 from nav_msgs.msg import Odometry, OccupancyGrid, Path
 from sensor_msgs.msg import Image
 from std_msgs.msg import Bool, String
+from ros_gz_interfaces.msg import Light
 from vision_msgs.msg import Detection2DArray
 import tf2_ros
 
@@ -56,8 +59,9 @@ from cv_bridge import CvBridge
 import cv2
 import yaml
 
-from PyQt5.QtCore import QPointF, QRectF, Qt, QTimer
-from PyQt5.QtGui import (QColor, QFont, QImage, QKeySequence, QPainter, QPen,
+from PyQt5.QtCore import QPoint, QPointF, QRect, QRectF, QSize, Qt, QTimer
+from PyQt5.QtGui import (QColor, QFont, QImage, QKeySequence, QPainter,
+                         QPainterPath, QPen,
                          QPixmap)
 from PyQt5.QtWidgets import (QApplication, QFrame, QGridLayout, QHBoxLayout,
                              QLabel, QListWidget, QListWidgetItem,
@@ -104,6 +108,10 @@ PLANNED     = "#00FF88"            # planned sweep route — bright green.
                                    # Kept clear of ALERT's yellow-green so
                                    # an unruled contact still reads as the
                                    # one thing wanting a decision.
+COURIER     = "#FFD23F"            # courier and its route to the contact —
+                                   # warm yellow, kept off ALERT's
+                                   # yellow-green so it never reads as a
+                                   # contact wanting a decision.
 
 PAGE_MAP, PAGE_VIS, PAGE_IR, PAGE_CONTACTS = range(4)
 
@@ -153,6 +161,36 @@ def match_one_to_one(points, anchors, gate: float) -> dict:
             matched[i] = j
             used.add(j)
     return matched
+
+
+EDGE_MARGIN = 0.05   # fraction of the frame; detector's edge_margin_frac
+
+
+def box_region(mask: np.ndarray, bbox, width: int, height: int,
+               pad: float = 0.25) -> Tuple[slice, slice]:
+    """Rows and columns of the thermal mask under a YOLO box (RGB pixels,
+    image width x height), padded by `pad` of the box size."""
+    sx, sy = mask.shape[1] / width, mask.shape[0] / height
+    cx, cy = bbox.center.position.x, bbox.center.position.y
+    hw, hh = bbox.size_x * (0.5 + pad), bbox.size_y * (0.5 + pad)
+    return (slice(int(max(cy - hh, 0) * sy), int((cy + hh) * sy) + 1),
+            slice(int(max(cx - hw, 0) * sx), int((cx + hw) * sx) + 1))
+
+
+def box_on_heat(mask: Optional[np.ndarray], bbox, width: int, height: int,
+                min_px: int = 20, pad: float = 0.25) -> bool:
+    """True if a YOLO box (RGB pixels, image width x height) covers body heat
+    in the thermal mask, so a contact's heat and human are the same object.
+    The box is padded by `pad` of its size for the small time offset between
+    the two cameras' frames.
+
+    shortcut: assumes the thermal and RGB cameras share mount and FOV
+    (parrot.gazebo.xacro), so pixels line up after scaling; if they ever
+    differ, compare ground positions instead.
+    """
+    if mask is None:
+        return False
+    return np.count_nonzero(mask[box_region(mask, bbox, width, height, pad)]) >= min_px
 
 
 @dataclass
@@ -294,7 +332,7 @@ class GroundStationNode(Node):
         self.declare_parameter("track_gate", 2.0)
         self.declare_parameter("track_timeout_s", 10.0)
         self.declare_parameter("rgb_hfov", 1.4)
-        self.declare_parameter("thermal_hfov", 1.0472)
+        self.declare_parameter("thermal_hfov", 1.4)
         self.declare_parameter("flight_altitude", 10.0)
         self.tracker = GroundTracker(
             float(self.get_parameter("track_gate").value),
@@ -327,9 +365,12 @@ class GroundStationNode(Node):
         # class (kangaroo, wombat) in it. Never raises a contact; only lets
         # an animal's heat signature skip or end the RGB check early.
         self.animal_hit: Optional[Tuple[str, float]] = None
+        self.animal_boxes: list = []     # bboxes from the frame of animal_hit
         self._detections_time = 0.0
         # (peak kelvin, hot pixel count) for the latest frame, None if nothing.
         self.thermal_hit: Optional[Tuple[float, int]] = None
+        # Body-heat pixels of the latest thermal frame (dismissed heat removed).
+        self.thermal_mask: Optional[np.ndarray] = None
 
         self.bridge = CvBridge()
         self.rgb_frame: Optional[np.ndarray] = None
@@ -393,6 +434,20 @@ class GroundStationNode(Node):
         self.search_path_frame = ""
         self.vantage_raw: Optional[Tuple[float, float]] = None
         self.vantage_frame = ""
+        # The courier's route to a confirmed contact, as Nav2 planned it, and
+        # where the courier is now - both in this map's frame. Nav2 replans
+        # about once a second while it is flying and stops when it is not
+        # (arrived, dropped, E-Stopped), so a route older than
+        # courier_plan_timeout_s is no longer being flown and is not drawn.
+        self.declare_parameter("courier_name", "parrot2")
+        self.declare_parameter("courier_plan_timeout_s", 3.0)
+        self.courier_name = str(self.get_parameter("courier_name").value)
+        self.courier_plan_timeout_s = float(
+            self.get_parameter("courier_plan_timeout_s").value)
+        self.courier_path: List[Tuple[float, float]] = []
+        self.courier_path_time = 0.0
+        self.courier_xy: Optional[Tuple[float, float]] = None
+        self.courier_yaw = 0.0
         # What the scout says it is doing. Without it the operator watches the
         # green path vanish and the drone fly out of the box with no way to
         # tell a finished search from a look-around trip from a crash.
@@ -409,7 +464,15 @@ class GroundStationNode(Node):
 
         self.base_frame = f"{self.robot_name}_base_link"
         self.tf_buffer = tf2_ros.Buffer()
-        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
+        # On its own thread. /tf is by far the busiest topic here, and pumped
+        # through the Qt timer with everything else it queued up and arrived
+        # seconds late - so the drone marker trailed the real drone, and a
+        # contact raised at the marker landed where the drone used to be.
+        # The buffer is thread-safe, and nothing else runs on that thread.
+        # It also means lookups never need a timeout: the latest transform is
+        # already in the buffer or it is not, so the GUI never waits on one.
+        self.tf_listener = tf2_ros.TransformListener(
+            self.tf_buffer, self, spin_thread=True)
 
         # SLAM publishes the map transient-local. A default subscription
         # receives nothing at all, with no error  this QoS is required.
@@ -451,6 +514,12 @@ class GroundStationNode(Node):
                               reliability=QoSReliabilityPolicy.RELIABLE,
                               durability=QoSDurabilityPolicy.TRANSIENT_LOCAL)
         self.create_subscription(Path, "search_path", self._on_path, path_qos)
+        # The courier's Nav2 planner output and its position. Absolute, since
+        # this node runs in the scout's namespace.
+        self.create_subscription(Path, f"/{self.courier_name}/plan",
+                                 self._on_courier_plan, 10)
+        self.create_subscription(Odometry, f"/{self.courier_name}/odometry",
+                                 self._on_courier_odometry, 10)
         self.create_subscription(String, "search_status", self._on_status, path_qos)
         self.create_subscription(PointStamped, "search_vantage",
                                  self._on_vantage, path_qos)
@@ -465,6 +534,18 @@ class GroundStationNode(Node):
         self.hold_pub = self.create_publisher(Bool, "search/hold", hold_qos)
         self.holding = False
         self.hold_pub.publish(Bool(data=False))
+
+        # Night mode (NIGHT=true in run_blue_mountains.sh): the world is dark,
+        # so the scout's floodlight follows the search hold. Heat holds the
+        # search, the light comes on, and the RGB detector can then see what
+        # the thermal camera found; it goes off when the search resumes.
+        self.declare_parameter("night_mode", False)
+        self.night_mode = bool(self.get_parameter("night_mode").value)
+        self.light_pub = self.create_publisher(Light, "flashlight", 10)
+        if self.night_mode:
+            # Re-sent each second: nothing latches on the Gazebo side, so a
+            # message sent before the bridge connects would be lost.
+            self.create_timer(1.0, lambda: self._send_light(self.holding))
 
         # Tells the courier drone where to fly. Transient local so a courier
         # started after the confirm still gets the last confirmed position.
@@ -590,6 +671,8 @@ class GroundStationNode(Node):
         for d, xy, track in zip(msg.detections, points, tracks):
             if track is not None and track.dismissed:
                 continue      # the operator already ruled this one out
+            if not box_on_heat(self.thermal_mask, d.bbox, width, height):
+                continue      # heat elsewhere in frame (e.g. a wombat) doesn't back this box
             for r in d.results:
                 if best is None or r.hypothesis.score > best[0]:
                     best = (r.hypothesis.score, xy,
@@ -611,15 +694,32 @@ class GroundStationNode(Node):
                     for d in msg.detections for r in d.results), default=None)
         if best is not None:
             self.animal_hit = (best[1], time.monotonic())
+            self.animal_boxes = [d.bbox for d in msg.detections]
 
     def fresh_animal_only(self) -> Optional[str]:
         """Class name of an animal seen in the last rgb_fresh_s with no human
         seen in that time, else None. A human always wins: an animal next to
-        a person must never stop the person being checked."""
+        a person must never stop the person being checked.
+
+        Also None while there is body heat outside the animals' boxes: that
+        heat is something else (a person the detector hasn't seen yet, e.g.
+        beside the wombat), so the check must carry on."""
         if self.animal_hit is None or self.fresh_rgb_hit() is not None:
             return None
         name, seen = self.animal_hit
-        return name if time.monotonic() - seen < self.rgb_fresh_s else None
+        if time.monotonic() - seen >= self.rgb_fresh_s:
+            return None
+        if self.thermal_mask is not None:
+            if self.rgb_frame is not None:
+                height, width = self.rgb_frame.shape[:2]
+            else:
+                width, height = 720, 480      # parrot.gazebo.xacro rgbd_camera
+            rest = self.thermal_mask.copy()
+            for b in self.animal_boxes:
+                rest[box_region(rest, b, width, height)] = False
+            if np.count_nonzero(rest) >= self.person_min_pixels // 4:
+                return None
+        return name
 
     def detector_alive(self) -> bool:
         return time.monotonic() - self._detections_time < self.detector_stale_s
@@ -657,20 +757,33 @@ class GroundStationNode(Node):
         Each dismissed track claims the one hot blob nearest it (within the
         track gate) and that blob is left out, so the heat of a person the
         operator already ruled out doesn't hold the search again, while
-        anyone else's heat still counts."""
+        anyone else's heat still counts.
+
+        A blob touching the frame edge is left out too: it is a body only
+        partly in view, and holding there leaves the person at the edge of
+        the RGB frame, where the detector rightly won't count them. The
+        search flies on until the whole body is in view."""
         hot = kelvin >= self.person_min_k
-        dismissed = self.tracker.dismissed()
-        if dismissed and stamp is not None and hot.any():
-            n, labels, _, centroids = cv2.connectedComponentsWithStats(
+        if hot.any():
+            n, labels, stats, centroids = cv2.connectedComponentsWithStats(
                 hot.astype(np.uint8))
             h, w = hot.shape
-            blobs = [self.ground_point(centroids[i][0], centroids[i][1],
-                                       w, h, self.thermal_hfov, stamp)
-                     for i in range(1, n)]
-            claimed = match_one_to_one(
-                blobs, [(t.x, t.y) for t in dismissed], self.tracker.gate)
-            for i in claimed:
-                hot[labels == i + 1] = False
+            # Same margin as the detector's edge_margin_frac default.
+            mx, my = EDGE_MARGIN * w, EDGE_MARGIN * h
+            drop = {i for i in range(1, n)
+                    if stats[i][0] < mx or stats[i][1] < my
+                    or stats[i][0] + stats[i][2] > w - mx
+                    or stats[i][1] + stats[i][3] > h - my}
+            dismissed = self.tracker.dismissed()
+            if dismissed and stamp is not None:
+                blobs = [self.ground_point(centroids[i][0], centroids[i][1],
+                                           w, h, self.thermal_hfov, stamp)
+                         for i in range(1, n)]
+                drop |= {i + 1 for i in match_one_to_one(
+                    blobs, [(t.x, t.y) for t in dismissed], self.tracker.gate)}
+            for i in drop:
+                hot[labels == i] = False
+        self.thermal_mask = hot
         count = int(np.count_nonzero(hot))
         if count < self.person_min_pixels:
             return None
@@ -722,7 +835,7 @@ class GroundStationNode(Node):
         try:
             tf = self.tf_buffer.lookup_transform(
                 self.map_frame, msg.header.frame_id,
-                rclpy.time.Time(), timeout=Duration(seconds=0.05))
+                rclpy.time.Time())
         except Exception:
             return
 
@@ -806,6 +919,59 @@ class GroundStationNode(Node):
                                 for q in msg.poses]
         self.search_path_frame = msg.header.frame_id
 
+    def _odom_to_map_shift(self) -> Tuple[float, float]:
+        """Offset from the scout's odom frame to this map's frame.
+
+        Zero before SLAM starts: until then the view is drawn in odom, as
+        _poll_pose explains.
+        """
+        try:
+            tf = self.tf_buffer.lookup_transform(
+                self.map_frame, self.odom_frame, rclpy.time.Time())
+        except Exception:
+            return 0.0, 0.0
+        return tf.transform.translation.x, tf.transform.translation.y
+
+    def _on_courier_plan(self, msg: Path):
+        """Store the courier's planned route in this map's frame.
+
+        The courier's odom frame and the scout's are both the Gazebo world
+        frame (see courier_node.py), so the courier's plan is already in the
+        scout's odom frame and needs only the same shift as search_path.
+        """
+        dx, dy = self._odom_to_map_shift()
+        self.courier_path = [(p.pose.position.x + dx, p.pose.position.y + dy)
+                             for p in msg.poses]
+        self.courier_path_time = time.monotonic()
+
+    def _on_courier_odometry(self, msg: Odometry):
+        # Raw Gazebo odometry is world pose, i.e. the shared odom frame.
+        dx, dy = self._odom_to_map_shift()
+        self.courier_xy = (msg.pose.pose.position.x + dx,
+                           msg.pose.pose.position.y + dy)
+        # The shift is translation only, so the heading carries straight over.
+        q = msg.pose.pose.orientation
+        self.courier_yaw = np.arctan2(2.0 * (q.w * q.z + q.x * q.y),
+                                      1.0 - 2.0 * (q.y ** 2 + q.z ** 2))
+
+    def courier_route(self) -> List[Tuple[float, float]]:
+        """What is left of the courier's route, from where it is now.
+
+        Empty when no route is being flown. The plan is up to a second old
+        and starts where the courier was then, so it is cut at the point
+        nearest the courier and joined to its live position.
+        """
+        if (len(self.courier_path) < 2 or time.monotonic()
+                - self.courier_path_time > self.courier_plan_timeout_s):
+            return []
+        if self.courier_xy is None:
+            return list(self.courier_path)
+        cx, cy = self.courier_xy
+        nearest = min(range(len(self.courier_path)),
+                      key=lambda i: (self.courier_path[i][0] - cx) ** 2
+                      + (self.courier_path[i][1] - cy) ** 2)
+        return [self.courier_xy] + self.courier_path[nearest + 1:]
+
     def _poll_pose(self):
         """Ask TF where the drone is, in the map's own frame.
 
@@ -816,8 +982,7 @@ class GroundStationNode(Node):
         """
         try:
             tf = self.tf_buffer.lookup_transform(
-                self.map_frame, self.base_frame, rclpy.time.Time(),
-                timeout=Duration(seconds=0.05))
+                self.map_frame, self.base_frame, rclpy.time.Time())
             x = tf.transform.translation.x
             y = tf.transform.translation.y
         except Exception:
@@ -830,8 +995,7 @@ class GroundStationNode(Node):
             # looked up in odom is already relative to it.
             try:
                 tf = self.tf_buffer.lookup_transform(
-                    self.odom_frame, self.base_frame, rclpy.time.Time(),
-                    timeout=Duration(seconds=0.05))
+                    self.odom_frame, self.base_frame, rclpy.time.Time())
             except Exception:
                 return  # normal at startup, before transforms flow
             x = tf.transform.translation.x
@@ -882,6 +1046,32 @@ class GroundStationNode(Node):
         self.holding = hold
         self.hold_pub.publish(Bool(data=hold))
         self.get_logger().info("Search HOLD" if hold else "Search resumed")
+        if self.night_mode:
+            self._send_light(hold)
+
+    def _send_light(self, on: bool):
+        """Switch the scout's floodlight. Gazebo replaces the whole light
+        with this message, so every field must match the <light> in
+        parrot.gazebo.xacro; only the brightness changes."""
+        msg = Light()
+        msg.name = "flashlight"
+        msg.type = Light.SPOT
+        msg.pose.position.z = -0.15
+        msg.direction.z = -1.0
+        level = 1.0 if on else 0.0
+        msg.diffuse.r = msg.diffuse.g = msg.diffuse.b = level
+        msg.diffuse.a = 1.0
+        msg.specular.r = msg.specular.g = msg.specular.b = 0.3 * level
+        msg.specular.a = 1.0
+        msg.range = 40.0
+        msg.attenuation_constant = 0.2
+        msg.attenuation_linear = 0.01
+        msg.attenuation_quadratic = 0.0
+        msg.spot_inner_angle = 1.3
+        msg.spot_outer_angle = 1.6
+        msg.spot_falloff = 1.0
+        msg.intensity = 3.0 * level
+        self.light_pub.publish(msg)
 
     def set_estop(self, stop: bool):
         if stop == self.estopped:
@@ -1258,6 +1448,22 @@ class MapPage(QWidget):
             for a, b in zip(pts, pts[1:]):
                 p.drawLine(a, b)
 
+        # The courier's route to the contact, the part still ahead of it.
+        # Dash-dot so it is not read as the scout's dashed sweep, and over
+        # the trail so it is not lost under it. The contact marker drawn next
+        # sits at its far end.
+        route = self.node.courier_route() if self.show_path else []
+        if route:
+            pts = [self._world_to_widget(x, y) for x, y in route]
+            p.save()
+            p.setPen(QPen(QColor(COURIER), 2, Qt.DashDotLine))
+            for a, b in zip(pts, pts[1:]):
+                p.drawLine(a, b)
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(COURIER))
+            p.drawEllipse(pts[-1], 4, 4)
+            p.restore()
+
         if self.show_contacts:
             for c in self.contacts:
                 if c.status == "DISMISSED":
@@ -1270,15 +1476,14 @@ class MapPage(QWidget):
                 p.setPen(QPen(colour, 1))
                 p.drawText(QPointF(pos.x() + 15, pos.y() + 4), f"{c.id:02d}")
 
+        # Both drones as the same arrow, told apart by colour: the courier
+        # first, so the scout's arrow is on top where they overlap on the ute.
+        if self.node.courier_xy is not None:
+            self._draw_drone(p, self.node.courier_xy, self.node.courier_yaw,
+                             COURIER, BASE)
         if self.node.drone_xy:
-            pos = self._world_to_widget(*self.node.drone_xy)
-            p.save()
-            p.translate(pos)
-            p.rotate(-np.degrees(self.node.drone_yaw))
-            p.setBrush(QColor(DRONE))
-            p.setPen(QPen(QColor(TEXT), 1))
-            p.drawPolygon(QPointF(12, 0), QPointF(-7, 7), QPointF(-7, -7))
-            p.restore()
+            self._draw_drone(p, self.node.drone_xy, self.node.drone_yaw,
+                             DRONE, TEXT)
 
         # How much of the searchable ground has been swept. The one number
         # that answers "is this area done?", so it stays on screen rather than
@@ -1287,7 +1492,8 @@ class MapPage(QWidget):
         # line on the screen: it is what tells "finished" apart from "gone to
         # get a view" apart from "something has broken".
         STATE_COLOUR = {
-            "SEARCHING": CONFIRM, "LOOKING": ALERT, "RETURNING": TEXT,
+            "SEARCHING": CONFIRM, "LOOKING": ALERT, "INVESTIGATING": ALERT,
+            "RETURNING": TEXT,
             "COMPLETE": CONFIRM, "HOLD": ALERT, "ESTOP": ALERT,
             "UNSEARCHABLE": ALERT, "PLANNING": MUTED, "IDLE": MUTED,
         }
@@ -1329,6 +1535,18 @@ class MapPage(QWidget):
 
         if self.PIP_MODES[self.pip_mode][1]:
             self._draw_pips(p)
+
+    def _draw_drone(self, p: QPainter, xy: Tuple[float, float], yaw: float,
+                    fill: str, outline: str):
+        """An arrow at xy pointing along yaw. save/restore so its brush does
+        not leak into whatever is drawn after it."""
+        p.save()
+        p.translate(self._world_to_widget(*xy))
+        p.rotate(-np.degrees(yaw))
+        p.setBrush(QColor(fill))
+        p.setPen(QPen(QColor(outline), 1))
+        p.drawPolygon(QPointF(12, 0), QPointF(-7, 7), QPointF(-7, -7))
+        p.restore()
 
     def _draw_area(self, p: QPainter):
         """Dashed amber while dragging, solid green once committed and sent.
@@ -1377,6 +1595,10 @@ class MapPage(QWidget):
                 pw, ph, Qt.KeepAspectRatio, Qt.SmoothTransformation)
             p.drawPixmap(x, y, pix)
             p.setPen(QPen(QColor(LINE), 1))
+            # A border only: drawRect fills with the current brush, and a
+            # brush left set by anything drawn earlier would paint over the
+            # picture.
+            p.setBrush(Qt.NoBrush)
             p.drawRect(x, y, pix.width(), pix.height())
             p.setPen(QColor(MUTED))
             p.setFont(QFont("DejaVu Sans Mono", 8))
@@ -1471,6 +1693,219 @@ class ContactsPage(QWidget):
 
 
 # ---------------------------------------------------------------------------
+# Tutorial
+# ---------------------------------------------------------------------------
+@dataclass
+class TutorialStep:
+    title: str
+    body: str
+    # Returns the widgets to highlight; empty means a centred box with no
+    # highlight (welcome and summary steps).
+    targets: Callable[[], List[QWidget]] = lambda: []
+    # Page to show while this step is up, so page-specific labels (the right
+    # column) say what the text describes.
+    page: Optional[int] = None
+
+
+def place_callout(target: Optional[QRect], box: QSize, bounds: QRect,
+                  gap: int = 16) -> QPoint:
+    """Top-left for a callout box of size `box` next to `target`, inside
+    `bounds`. Tries right, left, below, then above the target and takes the
+    first side with room; centres it if there is no target or no room."""
+    if target is None:
+        return QPoint(bounds.center().x() - box.width() // 2,
+                      bounds.center().y() - box.height() // 2)
+    cy = target.center().y() - box.height() // 2
+    cx = target.center().x() - box.width() // 2
+    candidates = [
+        QPoint(target.right() + gap, cy),
+        QPoint(target.left() - gap - box.width(), cy),
+        QPoint(cx, target.bottom() + gap),
+        QPoint(cx, target.top() - gap - box.height()),
+    ]
+    for p in candidates:
+        r = QRect(p, box)
+        # Sideways only needs horizontal room (the clamp below fixes y);
+        # above/below only needs vertical room.
+        if bounds.left() <= r.left() and r.right() <= bounds.right() and \
+                bounds.top() <= r.top() + box.height() // 2 and \
+                r.bottom() - box.height() // 2 <= bounds.bottom():
+            break
+    else:
+        p = QPoint(bounds.center().x() - box.width() // 2,
+                   bounds.center().y() - box.height() // 2)
+    x = min(max(p.x(), bounds.left()), bounds.right() - box.width())
+    y = min(max(p.y(), bounds.top()), bounds.bottom() - box.height())
+    return QPoint(x, y)
+
+
+class TutorialOverlay(QWidget):
+    """Guided tour: dims the window, outlines one control at a time and pops
+    a small box beside it saying what it does.
+
+    Covers the whole window, so clicks can't reach the bezels underneath
+    while the operator is reading. Highlight is CONFIRM cyan, never ALERT:
+    the yellow-green stays reserved for an unruled contact.
+    """
+
+    def __init__(self, parent: QWidget, steps: List[TutorialStep],
+                 on_page: Callable[[int], None], on_close: Callable[[], None]):
+        super().__init__(parent)
+        self.steps = steps
+        self.index = 0
+        self._on_page = on_page
+        self._on_close = on_close
+        self.setFocusPolicy(Qt.StrongFocus)
+
+        self.box = QFrame(self)
+        self.box.setFixedWidth(360)
+        self.box.setStyleSheet(
+            f"QFrame {{ background:{PANEL}; border:2px solid {CONFIRM}; "
+            f"border-radius:4px; }}"
+            f"QLabel {{ border:none; background:transparent; }}")
+        lay = QVBoxLayout(self.box)
+        lay.setContentsMargins(16, 14, 16, 12)
+        lay.setSpacing(8)
+
+        self.step_label = QLabel()
+        self.step_label.setFont(QFont("DejaVu Sans Mono", 8))
+        self.step_label.setStyleSheet(f"color:{MUTED};")
+        lay.addWidget(self.step_label)
+
+        self.title_label = QLabel()
+        f = QFont("DejaVu Sans Mono", 12)
+        f.setBold(True)
+        self.title_label.setFont(f)
+        self.title_label.setStyleSheet(f"color:{CONFIRM};")
+        self.title_label.setWordWrap(True)
+        lay.addWidget(self.title_label)
+
+        self.body_label = QLabel()
+        self.body_label.setFont(QFont("DejaVu Sans", 10))
+        self.body_label.setStyleSheet(f"color:{TEXT};")
+        self.body_label.setWordWrap(True)
+        self.body_label.setTextFormat(Qt.RichText)
+        lay.addWidget(self.body_label)
+
+        buttons = QHBoxLayout()
+        buttons.setSpacing(8)
+        self.close_btn = self._button("CLOSE", MUTED, self.finish)
+        self.back_btn = self._button("◀ BACK", TEXT, self.back)
+        self.next_btn = self._button("NEXT ▶", CONFIRM, self.next)
+        buttons.addWidget(self.close_btn)
+        buttons.addStretch(1)
+        buttons.addWidget(self.back_btn)
+        buttons.addWidget(self.next_btn)
+        lay.addLayout(buttons)
+
+        self.hint = QLabel("← → to move, Esc to close. Space still E-Stops.")
+        self.hint.setFont(QFont("DejaVu Sans Mono", 8))
+        self.hint.setStyleSheet(f"color:{MUTED};")
+        lay.addWidget(self.hint)
+
+        self._hole: Optional[QRect] = None
+
+    def _button(self, text: str, tone: str, handler) -> QPushButton:
+        b = QPushButton(text)
+        b.setCursor(Qt.PointingHandCursor)
+        b.setFocusPolicy(Qt.NoFocus)
+        b.setFont(QFont("DejaVu Sans Mono", 9, QFont.Bold))
+        b.setMinimumHeight(32)
+        b.setStyleSheet(f"""
+            QPushButton {{ background:{BEZEL}; color:{tone};
+                           border:1px solid {LINE}; border-radius:2px;
+                           padding:2px 12px; }}
+            QPushButton:hover {{ border-color:{tone}; }}
+        """)
+        b.clicked.connect(handler)
+        return b
+
+    # -- navigation --------------------------------------------------------
+    def start(self):
+        self.index = 0
+        self.setGeometry(self.parentWidget().rect())
+        self.show()
+        self.raise_()
+        self.setFocus()
+        self._show_step()
+
+    def next(self):
+        if self.index >= len(self.steps) - 1:
+            self.finish()
+        else:
+            self.index += 1
+            self._show_step()
+
+    def back(self):
+        if self.index > 0:
+            self.index -= 1
+            self._show_step()
+
+    def finish(self):
+        self.hide()
+        self._on_close()
+
+    def keyPressEvent(self, event):
+        key = event.key()
+        if key in (Qt.Key_Right, Qt.Key_Return, Qt.Key_Enter):
+            self.next()
+        elif key == Qt.Key_Left:
+            self.back()
+        elif key == Qt.Key_Escape:
+            self.finish()
+        else:
+            super().keyPressEvent(event)
+
+    # -- drawing -----------------------------------------------------------
+    def _target_rect(self, widgets: List[QWidget]) -> Optional[QRect]:
+        rect = None
+        for w in widgets:
+            if w is None or not w.isVisible():
+                continue
+            r = QRect(w.mapTo(self.parentWidget(), QPoint(0, 0)), w.size())
+            rect = r if rect is None else rect.united(r)
+        return rect.adjusted(-6, -6, 6, 6) if rect is not None else None
+
+    def _show_step(self):
+        step = self.steps[self.index]
+        if step.page is not None:
+            self._on_page(step.page)
+        last = self.index == len(self.steps) - 1
+        self.step_label.setText(f"TUTORIAL  {self.index + 1} / {len(self.steps)}")
+        self.title_label.setText(step.title)
+        self.body_label.setText(step.body)
+        self.back_btn.setEnabled(self.index > 0)
+        self.next_btn.setText("DONE ✓" if last else "NEXT ▶")
+        self.reposition()
+
+    def reposition(self):
+        """Lay out for the current step. Also called on window resize."""
+        if not self.isVisible():
+            return
+        self.setGeometry(self.parentWidget().rect())
+        self._hole = self._target_rect(self.steps[self.index].targets())
+        self.box.adjustSize()
+        bounds = self.rect().adjusted(12, 12, -12, -12)
+        self.box.move(place_callout(self._hole, self.box.size(), bounds))
+        self.update()
+
+    def paintEvent(self, _event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        shade = QPainterPath()
+        shade.addRect(QRectF(self.rect()))
+        if self._hole is not None:
+            hole = QPainterPath()
+            hole.addRoundedRect(QRectF(self._hole), 6, 6)
+            shade = shade.subtracted(hole)
+        p.fillPath(shade, QColor(0, 0, 0, 165))
+        if self._hole is not None:
+            p.setPen(QPen(QColor(CONFIRM), 3))
+            p.setBrush(Qt.NoBrush)
+            p.drawRoundedRect(QRectF(self._hole), 6, 6)
+
+
+# ---------------------------------------------------------------------------
 # Main window
 # ---------------------------------------------------------------------------
 class MainWindow(QMainWindow):
@@ -1521,6 +1956,12 @@ class MainWindow(QMainWindow):
         self._build_layout()
         self._build_shortcuts()
         self.select_page(PAGE_MAP)
+
+        self._page_before_tutorial = PAGE_MAP
+        self.tutorial = TutorialOverlay(self, self._tutorial_steps(),
+                                        on_page=self._tutorial_page,
+                                        on_close=self._close_tutorial)
+        self.tutorial.hide()
 
         # 20 Hz is plenty for a human. Sensor data arrives faster; there is no
         # reason for the interface to chase it.
@@ -1589,6 +2030,7 @@ class MainWindow(QMainWindow):
 
     def _status_strip(self) -> QWidget:
         bar = QFrame()
+        bar.setObjectName("status_strip")     # the tutorial highlights it
         bar.setStyleSheet(f"background:{PANEL}; border:1px solid {LINE};")
         row = QHBoxLayout(bar)
         row.setContentsMargins(14, 8, 14, 8)
@@ -1629,22 +2071,189 @@ class MainWindow(QMainWindow):
         self.link_label.setFont(QFont("DejaVu Sans Mono", 10))
         self.link_label.setStyleSheet(f"color:{MUTED}; border:none; padding-left:24px;")
         row.addWidget(self.link_label)
+
+        # Up here rather than in a bezel slot: it is on every page and
+        # doesn't take a function slot away from the display.
+        row.addSpacing(24)
+        self.help_button = QPushButton("? HELP")
+        self.help_button.setCursor(Qt.PointingHandCursor)
+        self.help_button.setFocusPolicy(Qt.NoFocus)   # see BezelButton
+        self.help_button.setFont(QFont("DejaVu Sans Mono", 9, QFont.Bold))
+        self.help_button.setStyleSheet(f"""
+            QPushButton {{ background:{BEZEL}; color:{CONFIRM};
+                           border:1px solid {CONFIRM}; border-radius:2px;
+                           padding:3px 12px; }}
+            QPushButton:hover {{ background:{CONFIRM}; color:{BEZEL}; }}
+        """)
+        self.help_button.clicked.connect(self.open_tutorial)
+        row.addWidget(self.help_button)
         return bar
 
     def _build_shortcuts(self):
-        for i, key in enumerate(["1", "2", "3", "4"]):
-            QShortcut(QKeySequence(key), self, lambda n=i: self.select_page(n))
+        # Every shortcut but the E-Stop goes in this list, so the tutorial can
+        # switch them off while it is open: a stray R while reading must not
+        # launch the drones. Space stays live everywhere.
+        self._shortcuts: List[QShortcut] = []
+
+        def key(seq, handler):
+            self._shortcuts.append(QShortcut(QKeySequence(seq), self, handler))
+
+        for i, k in enumerate(["1", "2", "3", "4"]):
+            key(k, lambda n=i: self.select_page(n))
         for i in range(RIGHT_SLOTS):
-            QShortcut(QKeySequence(f"F{i+1}"), self,
-                      lambda n=i: self._press_right(n))
-        QShortcut(QKeySequence("Q"), self, lambda: self._rule("CONFIRMED"))
-        QShortcut(QKeySequence("W"), self, lambda: self._rule("DISMISSED"))
-        QShortcut(QKeySequence("R"), self, self.node.launch)
+            key(f"F{i+1}", lambda n=i: self._press_right(n))
+        key("Q", lambda: self._rule("CONFIRMED"))
+        key("W", lambda: self._rule("DISMISSED"))
+        key("R", self.node.launch)
         QShortcut(QKeySequence("Space"), self, lambda: self.node.set_estop(True))
         # Fake contact for testing the interface; keyboard only.
-        QShortcut(QKeySequence("E"), self, self._simulate_contact)
+        key("E", self._simulate_contact)
         # Escape stands down an armed area draw without setting one.
-        QShortcut(QKeySequence("Escape"), self, self._cancel_draw)
+        key("Escape", self._cancel_draw)
+        key("H", self.open_tutorial)
+
+    # -- tutorial ----------------------------------------------------------
+    def _tutorial_steps(self) -> List[TutorialStep]:
+        L, R, B = self.left_buttons, self.right_buttons, self.bottom_buttons
+        k = '<span style="color:%s"><b>%%s</b></span>' % CONFIRM   # key name
+        return [
+            TutorialStep(
+                "Welcome to AeroAid",
+                "This station runs a two-drone search and rescue mission. "
+                "The <b>scout</b> flies a lawnmower search over an area you "
+                "draw, looking for people with a thermal camera and an AI "
+                "(YOLO) camera. You rule on each possible person it finds. "
+                "When you confirm one, the <b>courier</b> flies a care "
+                "package to them.<br><br>This tour shows what every button "
+                "does. Use NEXT and BACK, or the arrow keys."),
+            TutorialStep(
+                "Status strip",
+                "Always visible, whatever page is up.<br>"
+                "• <b>CONTACT n</b> blinks when a possible person needs "
+                "your decision. It is the only thing that blinks.<br>"
+                "• <b>SEARCH HOLD / IR CHECK / E-STOP</b>: why the scout "
+                "is stopped, if it is.<br>"
+                "• <b>AI OK</b>: the person detector is running.<br>"
+                "• <b>LINK OK</b>: data is arriving from the scout.",
+                lambda: [self.findChild(QFrame, "status_strip")]),
+            TutorialStep(
+                "Main display",
+                "Shows the page picked on the left. On the map: the white "
+                "arrow is the scout and its trail, the green line is the "
+                "planned search route, cyan shading is ground already "
+                "searched, and markers are contacts.",
+                lambda: [self.stack], PAGE_MAP),
+            TutorialStep(
+                f"MAP  ({k % '1'})",
+                "The overview: map, scout position, search area and "
+                "contacts. The left column picks the page and never changes, "
+                "so you can hit it without looking.",
+                lambda: [L[0]], PAGE_MAP),
+            TutorialStep(
+                f"VIS  ({k % '2'})",
+                "The scout's camera with the AI's boxes drawn on:<br>"
+                "• <span style='color:#00FF00'><b>green</b></span>: a "
+                "person, fully in view. Only these can raise a contact.<br>"
+                "• <span style='color:#FFFF00'><b>yellow (entering)</b></span>: "
+                "a person still at the edge of the frame.<br>"
+                "• <span style='color:#FFBF00'><b>amber (ignored)</b></span>: "
+                "a kangaroo or wombat. Shown, but never a contact.",
+                lambda: [L[1]]),
+            TutorialStep(
+                f"IR  ({k % '3'})",
+                "The thermal camera. Bright means warm. Body heat makes the "
+                "scout stop and look with the AI camera; a contact needs "
+                "<b>both</b> heat and the AI seeing a person.",
+                lambda: [L[2]]),
+            TutorialStep(
+                f"CNTCT  ({k % '4'})",
+                "Every contact and its ruling. The number is how many there "
+                "are; the label lights up when one is waiting for you. "
+                "This page also has <b>RESUME</b>, which restarts the search "
+                "after you confirm someone.",
+                lambda: [L[3]]),
+            TutorialStep(
+                f"Map tools  ({k % 'F1'}–{k % 'F7'})",
+                "The right column changes with the page; these are the map's.<br>"
+                "• <b>TRAIL</b>: show or hide the scout's flight path.<br>"
+                "• <b>CNTCT</b>: show or hide contact markers.<br>"
+                "• <b>PIP</b>: a small camera picture over the map.<br>"
+                "• <b>ZOOM+ / ZOOM-</b>: zoom the map.<br>"
+                "• <b>AERIAL</b>: the aerial photo under the map.<br>"
+                "A boxed label means that option is on.<br>"
+                "The white arrow is the scout, the yellow arrow the "
+                "<b>courier</b>. While the courier flies to a confirmed "
+                "person, its route ahead is the yellow dash-dot line.",
+                lambda: [b for b in R if b.text()], PAGE_MAP),
+            TutorialStep(
+                f"SET AREA  ({k % 'F6'})",
+                "Step one of every mission. Press it, then drag a box on the "
+                "map over the ground to search. You can do this before "
+                "launch. Press again (<b>CLR AREA</b>) to clear it, or "
+                f"{k % 'Esc'} to cancel while drawing.",
+                lambda: [R[5]], PAGE_MAP),
+            TutorialStep(
+                f"LAUNCH  ({k % 'R'})",
+                "Lifts both drones off the ute. The scout climbs and flies "
+                "the search area. It changes to <b>AIRBORNE</b> and can't be "
+                "undone: the drones don't land back on the ute.",
+                lambda: [B[2]]),
+            TutorialStep(
+                f"CONFIRM  ({k % 'Q'})",
+                "When CONTACT blinks, the scout holds still and the camera "
+                "pages freeze on what it saw. If it is a person, CONFIRM: "
+                "the courier flies the care package to them. The scout keeps "
+                "holding until you press RESUME on the CNTCT page.",
+                lambda: [B[0]]),
+            TutorialStep(
+                f"DISMISS  ({k % 'W'})",
+                "Not a person? DISMISS. The scout carries on, and that same "
+                "object won't be raised again, even when the scout passes "
+                "over it on a later row.",
+                lambda: [B[1]]),
+            TutorialStep(
+                f"E-STOP  ({k % 'Space'})",
+                "Stops <b>every</b> drone where it is, at any time. Space "
+                "works on every page, even with this tour open. Only a "
+                "click on <b>RESUME</b> (the same button) restarts them, so "
+                "a stray key can never set them moving.",
+                lambda: [self.estop_button]),
+            TutorialStep(
+                "Running a mission",
+                "<b>1.</b> SET AREA and drag a box over the search ground.<br>"
+                "<b>2.</b> LAUNCH.<br>"
+                "<b>3.</b> Watch the map. When CONTACT blinks, check VIS "
+                "and IR.<br>"
+                "<b>4.</b> CONFIRM a person, or DISMISS anything else.<br>"
+                "<b>5.</b> After a confirm, open CNTCT and press RESUME to "
+                "search on.<br><br>"
+                f"Press ? HELP or {k % 'H'} to see this tour again.",
+                page=PAGE_MAP),
+        ]
+
+    def open_tutorial(self):
+        if self.tutorial.isVisible():
+            return
+        self._page_before_tutorial = self.page
+        for s in self._shortcuts:
+            s.setEnabled(False)
+        self.tutorial.start()
+
+    def _tutorial_page(self, page: int):
+        self.select_page(page)
+        # Relabel now, not on the next refresh tick, so the step highlights
+        # this page's buttons rather than the last page's.
+        self._sync_bezels()
+
+    def _close_tutorial(self):
+        for s in self._shortcuts:
+            s.setEnabled(True)
+        self.select_page(self._page_before_tutorial)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, "tutorial"):
+            self.tutorial.reposition()
 
     # -- page plumbing -----------------------------------------------------
     def select_page(self, index: int):
@@ -1798,8 +2407,9 @@ class MainWindow(QMainWindow):
         human seen together there (e.g. on a later sweep row) still raise a
         contact, so a person the detector missed once can still be found.
 
-        The contact goes at the drone's position; the cameras look down from
-        close above, so that is within a few metres. No checks while a
+        The contact goes where the RGB detection projects onto the ground,
+        using the drone's pose when that frame was taken, and falls back to
+        the drone's position if it could not be projected. No checks while a
         contact is waiting for a ruling (the drone is already holding), or for
         dismiss_cooldown_s after a dismiss. A hit near a confirmed contact is
         the same person and is ignored, so RESUME doesn't re-trigger on them.
@@ -1836,7 +2446,12 @@ class MainWindow(QMainWindow):
             self.ir_page.frozen = (self.node.thermal_frame if heat is not None
                                    else self._check_ir_frame)
             self._check_until = None
-            self._raise_contact(x, y, rgb_conf=rgb_conf,
+            # At the person, not the drone. obj is the detection projected
+            # onto the ground from the pose at the moment the image was
+            # taken; drone_xy is where the drone is now, which after the
+            # detector's delay can be several metres further along the leg.
+            cx, cy = obj if obj else (x, y)
+            self._raise_contact(cx, cy, rgb_conf=rgb_conf,
                                 thermal_conf=thermal_conf)
             return
 
@@ -1938,6 +2553,37 @@ class MainWindow(QMainWindow):
         self._sync_bezels()
 
 
+def pump_ros(executor, budget_s: float = 0.015):
+    """Run every ROS callback that is waiting, then hand back to Qt.
+
+    rclpy.spin_once(node) runs ONE callback per call - it adds and removes the
+    node each time, which throws away the rest of the ready set. At one call
+    per 20 ms tick that is 50 callbacks a second for three camera feeds,
+    odometry and the rest, so the queues filled and everything shown was
+    seconds old. This drains the lot each tick instead. The budget keeps a
+    burst of camera frames from freezing the window; whatever is left over
+    runs on the next tick.
+
+    One empty wait is not proof the queues are empty: rclpy reports nothing
+    ready on every other wait after running a callback, so stop only after
+    two in a row.
+    """
+    deadline = time.monotonic() + budget_s
+    empty = 0
+    while time.monotonic() < deadline and empty < 2:
+        try:
+            handler, _, _ = executor.wait_for_ready_callbacks(timeout_sec=0)
+        except TimeoutException:
+            empty += 1
+            continue
+        except ShutdownException:
+            return
+        empty = 0
+        handler()
+        if handler.exception() is not None:
+            raise handler.exception()
+
+
 def main():
     rclpy.init()
     node = GroundStationNode()
@@ -1947,10 +2593,10 @@ def main():
     window = MainWindow(node)
     window.show()
 
-    # spin_once with a zero timeout drains whatever ROS messages are waiting
-    # and returns immediately, so the GUI never stalls.
+    executor = SingleThreadedExecutor()
+    executor.add_node(node)
     ros_timer = QTimer()
-    ros_timer.timeout.connect(lambda: rclpy.spin_once(node, timeout_sec=0))
+    ros_timer.timeout.connect(lambda: pump_ros(executor))
     ros_timer.start(20)
 
     try:

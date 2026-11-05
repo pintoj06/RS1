@@ -92,19 +92,12 @@ class TestFullyInFrame:
     def test_zero_margin_only_rejects_off_frame(self, detector):
         assert detector.fully_in_frame([0, 0, 720, 480], 720, 480, 0.0)
 
-    def test_thermal_view_is_inside_the_margin(self):
-        # Thermal (60 deg) and RGB (80 deg) share a mount, so the thermal
-        # view's edge sits this far in from the RGB edge. It must be more
-        # than the margin, or a person who triggered the thermal check could
-        # be stuck as "entering" for the whole hold.
-        import math
-        inset = (1 - math.tan(math.radians(30)) / math.tan(0.7)) / 2
-        assert inset > 0.05
-
 
 def node_with(ground_station, rgb_hit=None, animal_hit=None):
     node = SimpleNamespace(rgb_hit=rgb_hit, animal_hit=animal_hit, rgb_fresh_s=1.5,
-                           rgb_hit_xy=None, rgb_hit_track=None)
+                           rgb_hit_xy=None, rgb_hit_track=None,
+                           thermal_mask=None, animal_boxes=[], rgb_frame=None,
+                           person_min_pixels=600)
     cls = ground_station.GroundStationNode
     node.fresh_rgb_hit = lambda: cls.fresh_rgb_hit(node)
     node.fresh_animal_only = lambda: cls.fresh_animal_only(node)
@@ -112,6 +105,32 @@ def node_with(ground_station, rgb_hit=None, animal_hit=None):
 
 
 class TestFreshAnimalOnly:
+    def wombat_scene(self, ground_station, person_heat):
+        """A wombat boxed at (200, 200); the person, if any, 1 m away at
+        (300, 200) - as in large_demo, where they stand beside each other."""
+        import numpy as np
+        from vision_msgs.msg import BoundingBox2D
+        box = BoundingBox2D()
+        box.center.position.x, box.center.position.y = 200.0, 200.0
+        box.size_x, box.size_y = 40.0, 30.0
+        mask = np.zeros((480, 720), bool)
+        mask[190:210, 185:215] = True               # wombat's heat
+        if person_heat:
+            mask[185:215, 290:310] = True           # person's heat, 600 px
+        node = node_with(ground_station, animal_hit=('Wombat', time.monotonic()))
+        node.thermal_mask, node.animal_boxes = mask, [box]
+        return node
+
+    def test_heat_all_on_the_animal(self, ground_station):
+        node = self.wombat_scene(ground_station, person_heat=False)
+        assert node.fresh_animal_only() == 'Wombat'
+
+    def test_heat_beside_the_animal_keeps_the_check_going(self, ground_station):
+        # The run that prompted this: YOLO saw the wombat before the person
+        # beside it, and the check ended, missing them.
+        node = self.wombat_scene(ground_station, person_heat=True)
+        assert node.fresh_animal_only() is None
+
     def test_recent_animal(self, ground_station):
         node = node_with(ground_station, animal_hit=('Kangaroo', time.monotonic()))
         assert node.fresh_animal_only() == 'Kangaroo'

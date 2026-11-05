@@ -42,9 +42,10 @@ class TestPixelToGround:
         assert gy > 0                      # forward is now +y
 
     def test_matches_live_thermal_frame(self, ground_station):
-        # Measured on the running sim: scout at (-8.72, -1.90), z 9.95,
-        # yaw 0; the wombat's blob centred at pixel (437.1, 171.8). The
-        # wombat is at (-7.5, -3.1) in large_demo.sdf.
+        # Measured on the running sim, when the thermal camera was 60 deg
+        # (THERMAL_FOV): scout at (-8.72, -1.90), z 9.95, yaw 0; the wombat's
+        # blob centred at pixel (437.1, 171.8). The wombat is at (-7.5, -3.1)
+        # in large_demo.sdf.
         gx, gy = self.project(ground_station, 437.1, 171.8,
                               alt=9.95 - 0.05, x=-8.72, y=-1.90)
         assert math.hypot(gx + 7.5, gy + 3.1) < 0.3
@@ -129,6 +130,7 @@ def make_node(ground_station, project=None):
         rgb_hfov=1.4, thermal_hfov=THERMAL_FOV, person_min_k=305.0,
         person_min_pixels=600, rgb_hit=None, rgb_hit_xy=None,
         rgb_hit_track=None, _detections_time=0.0,
+        thermal_mask=np.ones((H, W), bool),     # heat everywhere by default
     )
     node.ground_point = project or (lambda u, v, w, h, fov, stamp: (u / 100, v / 100))
     return node
@@ -139,11 +141,59 @@ def detections(*boxes):
     for u, v, score in boxes:
         d = Detection2D()
         d.bbox.center.position.x, d.bbox.center.position.y = float(u), float(v)
+        d.bbox.size_x, d.bbox.size_y = 40.0, 40.0
         r = ObjectHypothesisWithPose()
         r.hypothesis.class_id, r.hypothesis.score = 'Human', float(score)
         d.results.append(r)
         msg.detections.append(d)
     return msg
+
+
+class TestHumanMustBeOnTheHeat:
+    """A contact's heat and its YOLO human must be the same object: a false
+    human on one side of the frame plus a wombat's heat on the other is not
+    a person."""
+
+    def run(self, ground_station, node, msg):
+        ground_station.GroundStationNode._on_detections(node, msg)
+
+    def heat_at(self, x1, y1, x2, y2):
+        mask = np.zeros((H, W), bool)
+        mask[y1:y2, x1:x2] = True
+        return mask
+
+    def test_human_on_heat_counts(self, ground_station):
+        node = make_node(ground_station)
+        node.thermal_mask = self.heat_at(380, 180, 420, 220)
+        self.run(ground_station, node, detections((400, 200, 0.9)))
+        assert node.rgb_hit is not None
+
+    def test_human_away_from_heat_is_not_a_hit(self, ground_station):
+        node = make_node(ground_station)
+        node.thermal_mask = self.heat_at(600, 380, 640, 420)   # wombat, far side
+        self.run(ground_station, node, detections((100, 100, 0.9)))
+        assert node.rgb_hit is None
+
+    def test_only_the_human_on_heat_counts(self, ground_station):
+        node = make_node(ground_station)
+        node.thermal_mask = self.heat_at(380, 180, 420, 220)
+        self.run(ground_station, node,
+                 detections((100, 100, 0.95), (400, 200, 0.6)))
+        assert node.rgb_hit[0] == pytest.approx(0.6)
+
+    def test_no_thermal_yet_means_no_hit(self, ground_station):
+        node = make_node(ground_station)
+        node.thermal_mask = None
+        self.run(ground_station, node, detections((400, 200, 0.9)))
+        assert node.rgb_hit is None
+
+    def test_scales_when_thermal_resolution_differs(self, ground_station):
+        node = make_node(ground_station)
+        mask = np.zeros((H // 2, W // 2), bool)      # half-size thermal image
+        mask[90:110, 190:210] = True                 # = RGB (400, 200)
+        node.thermal_mask = mask
+        self.run(ground_station, node, detections((400, 200, 0.9)))
+        assert node.rgb_hit is not None
 
 
 class TestYoloAfterDismiss:
@@ -250,3 +300,29 @@ class TestRuling:
         c.track_id = track.id
         ground_station.MainWindow._rule(win, "CONFIRMED")
         assert not track.dismissed
+
+
+class TestNightFloodlight:
+    """Night mode: the scout's floodlight follows the search hold."""
+
+    def node(self, ground_station, night):
+        sent = []
+        node = SimpleNamespace(
+            night_mode=night, holding=False, get_logger=FakeLogger,
+            hold_pub=SimpleNamespace(publish=lambda m: None),
+            light_pub=SimpleNamespace(publish=sent.append))
+        cls = ground_station.GroundStationNode
+        node._send_light = lambda on: cls._send_light(node, on)
+        return node, sent, lambda hold: cls.set_hold(node, hold)
+
+    def test_light_on_while_held_off_on_resume(self, ground_station):
+        node, sent, set_hold = self.node(ground_station, night=True)
+        set_hold(True)
+        set_hold(False)
+        assert [m.intensity > 0 for m in sent] == [True, False]
+        assert sent[0].name == 'flashlight' and sent[0].direction.z == -1.0
+
+    def test_day_mode_never_touches_the_light(self, ground_station):
+        node, sent, set_hold = self.node(ground_station, night=False)
+        set_hold(True)
+        assert sent == []

@@ -176,7 +176,7 @@ simulation above is already running, and just start one extra Python node each.
 | File | Role |
 |---|---|
 | `simple_trees.sdf` | Small, minimal world — good for quick iteration/testing. |
-| `large_demo.sdf` | Bigger world: the Blue Mountains scenery, the AeroAid ute, `person1`, and two animals (`demo_animal`, a kangaroo, and `wombat1`). |
+| `large_demo.sdf` | Bigger world: the Blue Mountains scenery, the AeroAid ute, `person1`, two animals beside `person1` (`demo_animal`, a kangaroo, and `wombat1`), and 12 more kangaroos and wombats scattered over the terrain by `scripts/place_animals.py`. |
 
 ### `models/`
 | Folder | Role |
@@ -241,3 +241,122 @@ makes multi-robot "just work" without redesigning anything.
 - Collision is currently disabled for the Parrot (commented out in
   `parrot.urdf.xacro`) — relevant if you want it to physically interact with
   anything (e.g. detect it's reached the ground, or avoid trees).
+
+---
+
+## Part 7 — Night mode
+
+A dark world where only the thermal camera can see. Body heat holds the
+search, a floodlight under the scout switches on, and the RGB (YOLO)
+detector confirms the person in the lit area. Off by default; day runs skip
+every night-only step.
+
+```bash
+LIBGL_ALWAYS_SOFTWARE=1 HEADLESS=true NIGHT=true ./run_blue_mountains.sh
+```
+
+### How it works
+
+1. `run_blue_mountains.sh` writes the world Gazebo loads to
+   `/tmp/aeroaid_large_demo.sdf` (a copy of `worlds/large_demo.sdf` with the
+   casualty moved). With `NIGHT=true` it also `sed`s that copy: `<ambient>` to
+   0.03, `<background>` black, and the sun's `<intensity>` to 0.05. It exits
+   with an error if the sun edit doesn't apply. `worlds/large_demo.sdf` is
+   never changed.
+2. The script starts the ground station with `-p night_mode:=$NIGHT`.
+3. The scout always has a spotlight named `flashlight`, pointing down from
+   `base_link`, defined off (black, intensity 0) in `parrot.gazebo.xacro`
+   inside the `cameras` block (so the courier has none).
+4. `config/gazebo_bridge_parrot1.yaml` bridges ROS `/parrot1/flashlight`
+   (`ros_gz_interfaces/msg/Light`) to Gazebo `/world/large_demo/light_config`.
+   Gazebo's UserCommands system (loaded by `config/ignition_server.config`)
+   applies each message to the light of that name.
+5. `UI/ground_station.py`, `GroundStationNode`: when `night_mode` is true,
+   `set_hold()` calls `_send_light(hold)`, so the light is on exactly while the
+   search is held (thermal check running, contact waiting, or after a confirm
+   until RESUME). A 1 s timer re-sends the current state, because a message
+   sent before the bridge connects is lost. With `night_mode` false neither
+   runs (`TestNightFloodlight` in `test/test_dismissed_objects.py`).
+
+Everything else is the normal contact workflow in
+`MainWindow._check_detections`: heat starts a check and holds the search, a
+YOLO human whose box sits on the heat raises the contact, and nothing seen
+within `rgb_check_s` resumes the search.
+
+### Rules that break it if changed
+
+- **`_send_light` must match the `<light>` in the xacro.** Gazebo replaces the
+  whole light with each message, so a field left at zero (`direction`,
+  `range`, spot angles) changes the light. Only brightness (diffuse,
+  specular, intensity) should differ between on and off.
+- **The light name is `flashlight`**, both in the xacro and in `_send_light`.
+- **`<visualize>false</visualize>` stays on the light.** Without it Gazebo
+  draws the cone's outline into the scene and the scout's own camera shows it
+  as bright green lines.
+- **The bridge topic has the world name hard-coded** (`large_demo`). A
+  different world needs its own `/world/<name>/light_config`.
+- **The thermal and RGB cameras share mount, FOV (1.4 rad) and resolution
+  (720x480).** `box_on_heat`, `box_region` and the frame-edge rule compare
+  pixels between the two images directly. If the cameras ever differ,
+  compare ground positions (`pixel_to_ground`) instead.
+
+### Related detection rules (not night-only)
+
+These run in day mode too. They were added after night-mode testing showed
+the person being missed:
+
+- `_detect_person` drops hot blobs touching the frame edge (`EDGE_MARGIN`,
+  5%, same as the detector's `edge_margin_frac`). Otherwise heat from a body
+  just entering the frame holds the search with the person at the edge,
+  where YOLO marks them "entering" and never confirms.
+- `fresh_animal_only` ends a check early for a wombat or kangaroo only if
+  the heat outside the animals' boxes is under `person_min_pixels // 4`.
+  Otherwise a person standing beside an animal is missed.
+
+### Tuning
+
+| What | Where |
+|---|---|
+| How dark | the `sed` values in `run_blue_mountains.sh` (`NIGHT` block) |
+| Light brightness, cone, range | `_send_light` and the xacro `<light>` (change both) |
+| How long the light has to confirm | `rgb_check_s` ground station parameter (6 s) |
+
+### Debugging
+
+- `[UserCommands.cc] Failed to find light with name [flashlight]` in the sim
+  window: the scout has not spawned (no scout, no light), or the light name
+  doesn't match. Check for `[spawn_parrot1]: OK creation of entity.`
+- Is the light in Gazebo, and what are its values?
+  ```bash
+  ign service -s /world/large_demo/scene/info --reqtype ignition.msgs.Empty \
+    --reptype ignition.msgs.Scene --timeout 15000 --req '' | grep -A30 'name: "flashlight"'
+  ```
+- Switch it by hand. The reply `data: true` means Gazebo accepted it. The
+  ground station re-sends its own state every second, so it will undo this
+  unless the search is held.
+  ```bash
+  ign service -s /world/large_demo/light_config --reqtype ignition.msgs.Light \
+    --reptype ignition.msgs.Boolean --timeout 5000 --req 'name: "flashlight", type: SPOT,
+    pose: {position: {z: -0.15}}, diffuse: {r: 1, g: 1, b: 1, a: 1}, specular: {r: 0.3,
+    g: 0.3, b: 0.3, a: 1}, attenuation_constant: 0.2, attenuation_linear: 0.01, range: 40,
+    direction: {z: -1}, spot_inner_angle: 1.3, spot_outer_angle: 1.6, spot_falloff: 1, intensity: 3'
+  ```
+  On the live sim, mean RGB brightness went from about 7 (light off) to about
+  100 (light on).
+
+### Reverting
+
+Remove all of these together:
+
+1. `run_blue_mountains.sh`: the `NIGHT=` setting, the `if [[ "$NIGHT" == true ]]`
+   block, and `-p night_mode:=$NIGHT` on the ground-station line.
+2. `urdf_parrot/parrot.gazebo.xacro`: the `<gazebo reference="${prefix}base_link">`
+   block holding `<light name="flashlight">`.
+3. `config/gazebo_bridge_parrot1.yaml`: the `flashlight` entry.
+4. `UI/ground_station.py`: the `night_mode` parameter, `light_pub` and timer in
+   `__init__`, the `_send_light` call in `set_hold`, `_send_light` itself, and
+   the `ros_gz_interfaces.msg.Light` import.
+5. `test/test_dismissed_objects.py`: `TestNightFloodlight`.
+
+Leave the related detection rules above unless they are what's wrong; they
+fix day-mode misses too. Rebuild with `colcon build --symlink-install`.
