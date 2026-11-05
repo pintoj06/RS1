@@ -345,7 +345,8 @@ class SearchNode(Node):
         self.unverified_at_vantage = None
         self.fruitless_vantages = 0
         self.replans = 0            # replans used on the current search area
-        self.goal_best_dist = None  # closest the drone has got to this goal
+        self.goal_best_dist = None  # least route left on this goal so far
+        self.goal_best_crow = float('inf')   # and the best straight-line
         self.goal_progress_at = None  # when it last got closer (seconds, node clock)
         self.goal_sent_at = None    # when the current goal went out
         self.last_recheck = 0.0     # when the goal was last re-validated
@@ -493,6 +494,10 @@ class SearchNode(Node):
         # Latched: a ground station started or restarted later still learns
         # what the scout is doing instead of showing nothing.
         self.status_pub = self.create_publisher(String, 'search_status', path_qos)
+        # Nav2's own route to the current goal. Progress has to be measured
+        # along THIS, not as the crow flies - see _check_stalled.
+        self.nav_plan_length = None
+        self.create_subscription(Path, 'plan', self._on_nav_plan, 1)
         # Where the drone is going to look, on its own topic rather than as
         # the last pose of search_path. It is not a sweep leg and must not be
         # drawn as one, but the ground station still needs it to show the
@@ -1449,11 +1454,29 @@ class SearchNode(Node):
         limit = float(self.get_parameter('goal_stall_timeout').value)
         if limit <= 0:
             return
-        dist = math.hypot(gx - here[0], gy - here[1])
         step = float(self.get_parameter('goal_progress_threshold').value)
+
+        # How far there is still to go. Nav2's own route when we have it,
+        # straight-line only as a fallback.
+        #
+        # This matters most exactly where it used to fail. Routing AROUND an
+        # obstacle means flying sideways, and for a long stretch away from the
+        # goal, so the straight-line distance stops shrinking - and the drone
+        # looked most stuck at the moment it was about to round the corner.
+        # Watched in flight: it tracked the bottom edge of the mountain to the
+        # eastern end, then gave up and turned back, a few metres short of
+        # being able to see round. Along the route there was steady progress
+        # the whole way.
+        crow = math.hypot(gx - here[0], gy - here[1])
+        dist = self.nav_plan_length if self.nav_plan_length is not None else crow
 
         if self.goal_best_dist is None or dist < self.goal_best_dist - step:
             self.goal_best_dist = dist
+            self.goal_progress_at = self._now()
+            return
+        # A detour that the straight line cannot see: accept either measure.
+        if crow < self.goal_best_crow - step:
+            self.goal_best_crow = crow
             self.goal_progress_at = self._now()
             return
 
@@ -1466,7 +1489,11 @@ class SearchNode(Node):
         overrun = False
         if self.goal_sent_at is not None and self.goal_leg_length:
             speed = max(0.05, float(self.get_parameter('assumed_speed').value))
-            budget = (self.goal_leg_length / speed
+            # Budget against the route Nav2 is actually flying. A leg round an
+            # obstacle is far longer than the straight line, and budgeting on
+            # the straight line cut it off part way round.
+            leg = max(self.goal_leg_length, self.nav_plan_length or 0.0)
+            budget = (leg / speed
                       * float(self.get_parameter('goal_time_factor').value))
             overrun = self._now() - self.goal_sent_at > budget
             if overrun and not stalled:
@@ -1593,6 +1620,8 @@ class SearchNode(Node):
         self.busy = True
         # Progress tracking, not a stopwatch on the whole leg.
         self.goal_best_dist = None
+        self.goal_best_crow = float('inf')
+        self.nav_plan_length = None
         self.goal_progress_at = self._now()
         self.goal_sent_at = self._now()
         self.last_recheck = self._now()
@@ -1996,6 +2025,14 @@ class SearchNode(Node):
         msg = String()
         msg.data = f'{state}|{detail}'
         self.status_pub.publish(msg)
+
+    def _on_nav_plan(self, msg):
+        """Keep the length of the route Nav2 means to fly."""
+        total = 0.0
+        for a, b in zip(msg.poses[:-1], msg.poses[1:]):
+            total += math.hypot(b.pose.position.x - a.pose.position.x,
+                                b.pose.position.y - a.pose.position.y)
+        self.nav_plan_length = total if msg.poses else None
 
     def _costmap_callback(self, msg):
         """Keep the latest costmap so the planner can ask what is blocked."""

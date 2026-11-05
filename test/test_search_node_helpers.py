@@ -2152,3 +2152,110 @@ class TestNewAreaIsJudgedAfresh:
         node.polygon = [(20.0, 20.0), (30.0, 20.0), (30.0, 30.0), (20.0, 30.0)]
         node.inside_mask = node._build_inside_mask()
         assert int(node.inside_mask.sum()) == 0
+
+
+class TestProgressAlongTheRoute:
+    """Watched in flight: the drone tracked the bottom edge of the mountain
+    east, and gave up and turned back a few metres short of rounding it.
+
+    Both abort conditions measured STRAIGHT-LINE distance to the goal. Routing
+    around an obstacle means flying sideways, and for a long stretch away from
+    the goal, so that distance stops shrinking - the drone looks most stuck at
+    exactly the moment it is about to get round. Progress is now measured
+    along Nav2's own route, with the straight line kept as a fallback and as a
+    second chance.
+    """
+
+    @pytest.fixture
+    def node(self, search_node):
+        SearchNode = search_node.SearchNode
+
+        class N:
+            _check_stalled = SearchNode._check_stalled
+            _on_nav_plan = SearchNode._on_nav_plan
+
+            def __init__(self):
+                self.holding = self.estopped = False
+                self.index = 0
+                self.points = [(40.0, 30.0)]
+                self.at = (0.0, 0.0)
+                self.goal_best_dist = None
+                self.goal_best_crow = float('inf')
+                self.nav_plan_length = None
+                self.goal_progress_at = 0.0
+                self.goal_sent_at = 0.0
+                self.goal_leg_length = 50.0
+                self.clock = 0.0
+                self.timed_out = False
+                self._replan_wanted = False
+                self.goal_handle = None
+                self.abandoned = 0
+                self.get_parameter = FakeParams(
+                    goal_stall_timeout=60.0, goal_progress_threshold=2.0,
+                    goal_time_factor=4.0, assumed_speed=0.3,
+                    avoid_obstacles=False, drop_unreachable=False)
+
+            def paused(self): return self.holding or self.estopped
+            def get_logger(self): return FakeLogger()
+            def _now(self): return self.clock
+            def _lookup_robot_xy(self): return self.at
+            def _goal_now_impossible(self, gx, gy): return False
+            def _should_replan(self): return False
+            def _after_abandoned_goal(self): self.abandoned += 1
+        return N()
+
+    def test_a_detour_is_not_mistaken_for_a_stall(self, node):
+        """Flying round an obstacle: the straight-line distance never
+        improves, but the route left shrinks steadily."""
+        node.nav_plan_length = 80.0
+        node._check_stalled()                      # take the baseline
+        for t in range(1, 10):
+            node.clock = t * 20.0                  # well past the 60 s limit
+            node.at = (t * 2.0, 0.0)               # sideways: crow distance grows
+            node.nav_plan_length = 80.0 - t * 6.0  # but the route is shrinking
+            node._check_stalled()
+        assert node.abandoned == 0, 'gave up on a drone that was making progress'
+
+    def test_a_genuine_stall_is_still_caught(self, node):
+        """Bouncing off a wall: Nav2 keeps replanning and the route left does
+        not shrink. That must still be abandoned."""
+        node.nav_plan_length = 80.0
+        node._check_stalled()
+        for t in range(1, 10):
+            node.clock = t * 20.0
+            node.at = (0.5 if t % 2 else 0.0, 0.0)   # jittering on the spot
+            node.nav_plan_length = 80.0 + (t % 2)    # no real progress
+            node._check_stalled()
+        assert node.abandoned >= 1, 'a stuck drone was not caught'
+
+    def test_the_straight_line_still_counts_as_progress(self, node):
+        """Without a Nav2 plan it must fall back to the old behaviour."""
+        node.nav_plan_length = None
+        node._check_stalled()
+        for t in range(1, 8):
+            node.clock = t * 20.0
+            node.at = (t * 4.0, t * 3.0)            # closing on (40, 30)
+            node._check_stalled()
+        assert node.abandoned == 0
+
+    def test_the_time_budget_uses_the_real_route(self, node):
+        """A leg round an obstacle is far longer than the straight line, and
+        budgeting on the straight line cut it off part way round."""
+        node.nav_plan_length = 200.0                 # a long way round
+        node.goal_leg_length = 50.0                  # as the crow flies
+        node._check_stalled()
+        node.clock = 50.0 / 0.3 * 4.0 + 10.0         # past the STRAIGHT-LINE budget
+        node.at = (1.0, 0.0)
+        node.nav_plan_length = 198.0
+        node._check_stalled()
+        assert node.abandoned == 0, 'budgeted on the straight line, not the route'
+
+    def test_plan_length_is_measured_along_the_path(self, node, search_node):
+        from nav_msgs.msg import Path
+        from geometry_msgs.msg import PoseStamped
+        msg = Path()
+        for x, y in ((0.0, 0.0), (3.0, 0.0), (3.0, 4.0)):
+            p = PoseStamped(); p.pose.position.x = x; p.pose.position.y = y
+            msg.poses.append(p)
+        node._on_nav_plan(msg)
+        assert node.nav_plan_length == pytest.approx(7.0)   # 3 + 4, not 5
