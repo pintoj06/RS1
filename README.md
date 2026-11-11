@@ -1,3 +1,229 @@
+# AeroAid: autonomous search and rescue in remote bushland
+
+**41068 Robotics Studio 1, Team 4**
+Harry Mentis · Jacob Singh · Jayden Pinto · John McGuire · William Lowing
+
+A two-drone search-and-rescue system simulated in Ignition Gazebo Fortress on ROS 2 Humble.
+An operator draws a search area on a map. A **scout** drone flies a camera-derived lawnmower
+sweep over it, finds a casualty using fused thermal and RGB detection, and holds for the
+operator to rule on the sighting. Once confirmed, a **courier** drone flies out and drops a
+first-aid package, then both drones return to base.
+
+The world is a model of the Three Sisters in the Blue Mountains, NSW, built in Blender with
+per-object thermal values.
+
+> This repository began as the subject's `41068_ignition_bringup` package. The original
+> documentation is retained at the bottom of this file under
+> **Original package documentation**. Everything above that heading describes what Team 4 built.
+
+---
+
+## Quick start
+
+Install the dependencies first (see **Installing the dependencies** below), then:
+
+```bash
+# 1. get the code into a colcon workspace
+mkdir -p ~/41068_ws/src
+git clone https://github.com/pintoj06/RS1 ~/41068_ws/src/rs1
+
+# 2. build
+source /opt/ros/humble/setup.bash
+cd ~/41068_ws
+colcon build --symlink-install
+source install/setup.bash
+
+# 3. run
+cd ~/41068_ws/src/rs1
+./run_blue_mountains.sh
+
+# to stop everything, including strays
+./run_blue_mountains.sh kill
+```
+
+Keep the repository directly inside the workspace's `src` folder. The run script finds the
+workspace two folders above itself.
+
+`run_blue_mountains.sh` is the **only** entry point you need. It opens five terminal tabs:
+
+| Tab | Starts |
+|---|---|
+| 1/5 | Simulation (Blue Mountains world) + scout + courier + Nav2 + SLAM |
+| 2/5 | Ground station (the operator GUI) |
+| 3/5 | Scout RGB person detector (YOLO) |
+| 4/5 | Scout search node |
+| 5/5 | Courier node |
+
+## What you should see
+
+- A **Gazebo** window showing the Three Sisters terrain, two drones on a ute, and scattered wildlife.
+- The **ground station** window: a map view with the aerial photo and the live SLAM map, a camera
+  feed, and soft buttons down each side.
+- In the ground station's status bar, **`AI OK`** and **`LINK OK`**.
+  If `AI ---` shows in red the YOLO detector has not started. See **Troubleshooting**.
+  **Nothing can raise a contact without it.**
+
+## Operating it
+
+1. Press **`LAUNCH`**. Both drones climb off the ute: the scout to 10 m, the courier to 9 m.
+2. Press **`SET AREA`**, then drag a box on the map to define the search area.
+   (Either order works - an area drawn before launch is held and used once the scout is airborne.)
+3. The scout plans a lawnmower sweep and begins flying it. The planned route is drawn in green,
+   and ground the camera has covered is shaded cyan behind it.
+4. Ground in the search area that the scout has not settled is shown in two other ways: **amber**
+   means it could not yet be confirmed reachable, and **grey** means obstacle or walled off with
+   no way in. Reachable ground still to be swept is shaded only faintly.
+5. When body heat and a YOLO human detection coincide, the search **holds** and a contact is
+   raised. Open the contacts page and press **`CONFIRM`** or **`DISMISS`**.
+   `DISMISS` ignores the contact and the sweep carries on.
+6. On `CONFIRM`, the courier flies to the position, drops the package and returns. The scout then
+   flies home and reports the search complete.
+7. **`ESTOP`** (or the spacebar) stops both drones immediately. **`RESUME`** releases it.
+
+## Scenario switches
+
+Set as environment variables before the run script:
+
+```bash
+PERSON_SPOT=3 ./run_blue_mountains.sh                 # fixed casualty position (0-3), not random
+NIGHT=true ./run_blue_mountains.sh                    # night search; the scout's floodlight is used
+HEADLESS=true ./run_blue_mountains.sh                 # no Gazebo window, runs faster
+LARGE_COURIER=false ./run_blue_mountains.sh           # standard-size courier
+RETURN_AFTER_DELIVERY=false ./run_blue_mountains.sh   # courier stays at the contact
+SIM_WAIT=45 ./run_blue_mountains.sh                   # longer wait for Gazebo on a slow machine
+```
+
+There are **two casualties**: one always at world (-6.36, -3.07) beside a kangaroo and a wombat,
+a deliberate false-positive test, and a second at one of four preset spots, chosen at random each
+run so the search is not always the same problem.
+
+## Installing the dependencies
+
+Tested on Ubuntu 22.04 with ROS 2 Humble and Ignition Gazebo Fortress. Other versions are
+untested. Install ROS 2 Humble and Gazebo Fortress as described in **Original package
+documentation** below, then the extra ROS and Python packages:
+
+```bash
+sudo apt install ros-dev-tools \
+    ros-humble-ros-ign ros-humble-ros-ign-interfaces ros-humble-ros-gz \
+    ros-humble-navigation2 ros-humble-nav2-bringup ros-humble-slam-toolbox \
+    ros-humble-robot-localization ros-humble-robot-state-publisher ros-humble-xacro \
+    ros-humble-cv-bridge ros-humble-vision-msgs \
+    python3-numpy python3-scipy python3-pyqt5 python3-pip
+```
+
+The YOLO detector needs some extra Python packages:
+
+```bash
+python3 -m pip install --user torch torchvision --index-url https://download.pytorch.org/whl/cpu
+python3 -m pip install --user ultralytics "opencv-python<5" "numpy<1.25"
+python3 -m pip uninstall -y opencv-python
+python3 -m pip install --user "opencv-python-headless<5" "numpy<1.25"
+```
+
+**All four commands matter.** Three traps, each of which we hit:
+
+- **`numpy` must stay below 1.25.** `ultralytics` requires 1.23 or later and pulls numpy 2 or later
+  by default, but the system SciPy supports only versions below 1.25, and SciPy is what the search
+  node's flood fills run on. **1.24.4 satisfies both.** numpy 2 or later additionally breaks
+  `cv_bridge`, which is compiled against numpy 1.x.
+- **Use the headless OpenCV build.** `opencv-python` bundles its own Qt plugins, which replace the
+  ones PyQt5 needs. The ground station then dies with
+  `Could not load the Qt platform plugin "xcb"`.
+- **Take torch and torchvision from the CPU index.** Otherwise `ultralytics` pulls a CUDA
+  torchvision against CPU torch and the first camera frame fails with
+  `operator torchvision::nms does not exist`. Check with `pip list --user | grep torch`. Both
+  should end in `+cpu`.
+
+Model weights (`weights/best.pt`) are committed, so no training is required.
+
+### Running the tests
+
+The tests need ROS sourced (`source install/setup.bash`) but no simulation:
+
+```bash
+cd ~/41068_ws/src/rs1 && python3 -m pytest test/ -q
+```
+
+440 tests, covering sweep planning, reachability, costmap settings, E-Stop, edge checks, the
+courier route and return to base.
+
+## Where the code is
+
+| Path | What it is | Status |
+|---|---|---|
+| `scripts/search_node.py` | Scout decision making: sweep planning, reachability, vantage selection, replanning | custom |
+| `UI/ground_station.py` | Operator GUI, thermal detection, contact logic, E-Stop | custom |
+| `scripts/yolo_person_detector.py` | RGB human and animal detection | custom (uses `ultralytics`) |
+| `scripts/courier_node.py` | Delivery: frame conversion, navigation, package release | custom |
+| `scripts/takeoff_node.py` | Vertical flight, since Nav2 plans only in 2D | custom |
+| `scripts/place_animals.py` | Scatters wildlife as false-positive distractors | custom |
+| `worlds/large_demo.sdf`, `models/blue_mountains/` | Three Sisters terrain with thermal values | created |
+| `blue_mountains_gazebo/` | Terrain and animal generation pipeline | created |
+| `urdf_parrot/` | Parrot model plus thermal camera, floodlight, care package | adapted |
+| `config/nav2_params_parrot*.yaml` | Nav2 planner, controller and costmaps per drone | adapted |
+| `launch/` | `41068_search.launch.py` (scout), `41068_courier_demo.launch.py` (courier) | adapted |
+| `test/` | 440 automated tests, no simulation required | custom |
+| `CODEBASE_GUIDE.md` | Internal development reference; see Part 7 for night mode | custom |
+
+## Key parameters
+
+Search behaviour, in `scripts/search_node.py`, overridable as ROS parameters:
+
+| Parameter | Default | Effect |
+|---|---|---|
+| `flight_altitude` | 10.0 m | Sets the camera footprint, and so the leg spacing |
+| `overlap` | 0.8 | Leg spacing as a fraction of footprint width (about 9 m at 10 m altitude) |
+| `obstacle_cost_threshold` | 77 | Costmap cost at which a cell blocks planning |
+| `sight_block_threshold` | 99 | Costmap cost at which a cell blocks the camera's view |
+| `map_review_period` | 2.0 s | How often reachability is re-evaluated |
+| `vantage_patience` | 5 | Fruitless look-around trips before the scout gives up |
+| `use_slam_walls` | true | Use SLAM's finer map for the walled-in test |
+
+Detection, in `UI/ground_station.py`, also adjustable live on the **SETUP** page:
+
+| Parameter | Default | Effect |
+|---|---|---|
+| `person_min_k` | 305.0 K | Temperature at which a pixel counts as body heat |
+| `person_min_pixels` | 600 | Hot pixels needed before the search holds for a check |
+| `rgb_check_s` | 6.0 s | How long the scout holds waiting for YOLO to confirm |
+
+Navigation, in `config/nav2_params_parrot1.yaml`:
+
+| Parameter | Default | Effect |
+|---|---|---|
+| `obstacle_max_range` | 39.0 m | **Must stay below the lidar's 40 m range**. See the comment in the file |
+| `use_rotate_to_heading` | true | Pivot on the spot at sweep corners, then fly straight |
+
+## Troubleshooting
+
+| Symptom | Cause and fix |
+|---|---|
+| `AI ---` in red; no contact is ever raised | The YOLO detector did not start. Check tab 3/5 for a traceback, usually a missing or wrong-versioned `ultralytics`, `numpy` or `torch`. See **Installing the dependencies**. |
+| `Could not load the Qt platform plugin "xcb"` | `opencv-python` is installed instead of `opencv-python-headless`. Rerun the last two install commands. |
+| `operator torchvision::nms does not exist` on the first camera frame | torch and torchvision are from different builds. Both must end in `+cpu`. |
+| A SciPy warning about the numpy version | numpy is 1.25 or later. Install `numpy==1.24.4`. |
+| Changed a parameter and nothing happened | Node scripts are symlinked by `--symlink-install`, so a node restart is enough, but **YAML config changes need a full relaunch**, because Nav2 reads its parameters at startup. |
+| Gazebo has not finished loading before the nodes start | `SIM_WAIT=45 ./run_blue_mountains.sh` |
+| Heavy world, low frame rate | `HEADLESS=true`, and a longer `SIM_WAIT` |
+| Leftover processes after a crash | `./run_blue_mountains.sh kill` |
+
+## Known limitations
+
+- The YOLO detector runs on the CPU at a few frames per second, which is why the scout has to hold
+  while it confirms a contact.
+- Nav2 plans in 2D at a fixed altitude, so a drone cannot fly over terrain it could in practice
+  clear.
+- See Section 5.3 of the final report for the full list.
+
+---
+
+# Original package documentation
+
+*Everything below is the documentation supplied with the original `41068_ignition_bringup`
+package (Husky, dynamic world and basic autonomy demos). It is retained because the installation
+and launch instructions for the underlying simulation still apply.*
+
 # 41068 Ignition Bringup
 
 Bringup for *41068 Robotics Studio I*. This package launches a Husky UGV and/or a simple "Parrot" drone in custom Ignition Gazebo simulation worlds with trees and grass. We use **ROS 2 Humble** and **Ignition Gazebo Fortress**.
@@ -111,12 +337,12 @@ These add-on launch files are intended to be run from a second terminal after th
 
 Important arguments:
 
-* `husky:=true/false` — launch the Husky UGV. Default: `true`.
-* `parrot:=true/false` — launch the Parrot drone. Default: `false`.
-* `slam:=true/false` — launch SLAM Toolbox for each enabled robot. Default: `false`.
-* `nav2:=true/false` — launch Nav2 for each enabled robot. Nav2 also starts SLAM. Default: `false`.
-* `rviz:=true/false` — launch RViz. If multiple robots are enabled, one RViz window is opened for each robot. Default: `false`.
-* `world:=simple_trees/large_demo` — choose the Gazebo world. Default: `simple_trees`.
+* `husky:=true/false` - launch the Husky UGV. Default: `true`.
+* `parrot:=true/false` - launch the Parrot drone. Default: `false`.
+* `slam:=true/false` - launch SLAM Toolbox for each enabled robot. Default: `false`.
+* `nav2:=true/false` - launch Nav2 for each enabled robot. Nav2 also starts SLAM. Default: `false`.
+* `rviz:=true/false` - launch RViz. If multiple robots are enabled, one RViz window is opened for each robot. Default: `false`.
+* `world:=simple_trees/large_demo` - choose the Gazebo world. Default: `simple_trees`.
 
 Robots are namespaced even in single-robot mode:
 

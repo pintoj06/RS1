@@ -1,19 +1,22 @@
-# Codebase Guide — 41068 Ignition Bringup
+# Codebase Guide - 41068 Ignition Bringup
 
-This is a plain-language reference for this package: what ROS 2 concepts you need,
-what each file type is, and what every file in this repo actually does. Come back
-to this any time you've forgotten what something does.
+Internal reference written during development, to get the team up to speed on the
+stack and to record how the trickier parts work. Parts 1-3 and 5 are introductory
+notes on ROS 2 and this package's layout; **Parts 6-7 document project-specific
+behaviour, including night mode**, and are the parts worth reading.
+
+Come back to this any time you've forgotten what something does.
 
 ---
 
-## Part 1 — ROS 2 concepts, explained simply
+## Part 1 - ROS 2 concepts, explained simply
 
-ROS 2 (Robot Operating System 2) is not an operating system — it's a framework for
+ROS 2 (Robot Operating System 2) is not an operating system - it's a framework for
 getting many separate programs to talk to each other. Everything below is a concept
 you'll see over and over in this codebase.
 
 ### Node
-A **node** is one running program — e.g. "the SLAM node," "the camera driver node,"
+A **node** is one running program - e.g. "the SLAM node," "the camera driver node,"
 "your autonomy script." A robot system is just lots of small nodes running at once
 and talking to each other. `basic_autonomy_demo.py` is an example of a node.
 
@@ -24,17 +27,17 @@ frequency. Example: `/husky1/scan` carries lidar data; any node can subscribe to
 without the publisher knowing or caring who's listening.
 
 ### Message type
-Every topic carries one specific **message type** — a fixed data structure. E.g.
+Every topic carries one specific **message type** - a fixed data structure. E.g.
 `sensor_msgs/msg/Image` is an image, `nav_msgs/msg/OccupancyGrid` is a 2D map,
 `geometry_msgs/msg/Twist` is a velocity command (linear x/y/z + angular x/y/z).
 
 ### Service
-A **service** is a request/response call — you ask a question, you get one answer
+A **service** is a request/response call - you ask a question, you get one answer
 back, like a phone call. Used for occasional one-off asks rather than streams.
 Gazebo's `set_pose` (used in `dynamic_world_demo.py`) is a service call.
 
 ### Action
-An **action** is for long-running tasks with feedback and a final result — like
+An **action** is for long-running tasks with feedback and a final result - like
 ordering food: you place an order (goal), get progress updates (feedback), and
 eventually a result (done/failed). Nav2's `NavigateToPose` is an action: you send a
 goal pose, get periodic "distance remaining" feedback, and eventually success/failure.
@@ -50,7 +53,7 @@ YAML file or from the launch file that starts the node.
 A **namespace** is a prefix applied to all of a node's topics/services/actions so
 multiple copies of the same node type don't collide. This package puts the Husky
 under `/husky1` and the Parrot under `/parrot1`, so `map` becomes `/husky1/map` and
-`/parrot1/map` respectively — same code, no clashes, and it's what makes running two
+`/parrot1/map` respectively - same code, no clashes, and it's what makes running two
 robots at once possible without rewriting anything.
 
 ### TF (transform tree)
@@ -62,13 +65,13 @@ world, continuously, as things move. Each robot has a chain of coordinate frames
 coordinates?"
 
 - `map` frame: fixed to the world, corrected by SLAM (best long-term global estimate).
-- `odom` frame: drifts slowly over time, but is smooth (no sudden jumps) — good for
+- `odom` frame: drifts slowly over time, but is smooth (no sudden jumps) - good for
   short-term motion.
 - `base_link`: the robot's own body frame.
 
 ### Launch file
 A **launch file** (`.launch.py`) is a Python script that starts a group of nodes
-together with the right parameters, remappings, and conditions — instead of you
+together with the right parameters, remappings, and conditions - instead of you
 manually running ten separate `ros2 run` commands in ten terminals.
 
 ### SLAM
@@ -89,22 +92,22 @@ odometry + IMU) into one smoother, more accurate pose estimate. The
 
 ---
 
-## Part 2 — File type glossary
+## Part 2 - File type glossary
 
 | Extension | What it is |
 |---|---|
-| `.py` (in `launch/`) | A launch file — starts and configures a group of nodes. |
-| `.py` (in `scripts/`) | An actual ROS node — a running program with logic. |
-| `.urdf.xacro` | Robot description: links (rigid parts), joints (how parts connect/move), sensor placements, visual meshes. `xacro` is a macro language that generates plain URDF — it lets you use variables/reuse (e.g. `${prefix}` so the same file works for `husky1` or a future `husky2`). |
+| `.py` (in `launch/`) | A launch file - starts and configures a group of nodes. |
+| `.py` (in `scripts/`) | An actual ROS node - a running program with logic. |
+| `.urdf.xacro` | Robot description: links (rigid parts), joints (how parts connect/move), sensor placements, visual meshes. `xacro` is a macro language that generates plain URDF - it lets you use variables/reuse (e.g. `${prefix}` so the same file works for `husky1` or a future `husky2`). |
 | `.gazebo.xacro` | Gazebo-specific additions to a robot description: physics plugins, sensor simulation parameters (noise, update rate), which aren't part of the "real robot" description. |
-| `.sdf` | Simulation Description Format — Gazebo's native format for describing worlds (`worlds/*.sdf`) or standalone models (`models/*/model.sdf`). Different from URDF; URDF describes *robots* for ROS generally, SDF describes *everything* for Gazebo specifically. |
+| `.sdf` | Simulation Description Format - Gazebo's native format for describing worlds (`worlds/*.sdf`) or standalone models (`models/*/model.sdf`). Different from URDF; URDF describes *robots* for ROS generally, SDF describes *everything* for Gazebo specifically. |
 | `.yaml` | Plain structured config data (key: value), used here for: Nav2/SLAM/EKF tuning parameters, and topic-bridge definitions (which Gazebo topics map to which ROS topics). |
-| `.rviz` | A saved layout/config for RViz (the 3D visualisation tool) — which displays are shown, their settings, camera view. |
-| `model.config` | Metadata for a Gazebo model folder (name, version, path to the `.sdf`) — lets Gazebo find and load a model by name. |
+| `.rviz` | A saved layout/config for RViz (the 3D visualisation tool) - which displays are shown, their settings, camera view. |
+| `model.config` | Metadata for a Gazebo model folder (name, version, path to the `.sdf`) - lets Gazebo find and load a model by name. |
 
 ---
 
-## Part 3 — How a simulation actually boots up
+## Part 3 - How a simulation actually boots up
 
 Running, e.g.:
 ```
@@ -112,7 +115,7 @@ ros2 launch 41068_ignition_bringup 41068_ignition_husky.launch.py slam:=true nav
 ```
 triggers this chain:
 
-1. **`41068_ignition_husky.launch.py`** — a thin wrapper. It just calls the file
+1. **`41068_ignition_husky.launch.py`** - a thin wrapper. It just calls the file
    below with `husky:=True, parrot:=False` baked in.
 2. **`41068_ignition.launch.py`** (the canonical launch file) does the real work:
    - Starts Gazebo itself, loading the chosen world file.
@@ -132,7 +135,7 @@ triggers this chain:
      robot's saved `.rviz` layout.
 
 Everything after step 1 is namespaced (`husky1` or `parrot1`), which is why the same
-launch code supports Husky-only, Parrot-only, or both at once — it's just whether
+launch code supports Husky-only, Parrot-only, or both at once - it's just whether
 each robot's block of actions is enabled.
 
 The two "add-on" launch files (`41068_autonomy_demo.launch.py`,
@@ -141,12 +144,12 @@ simulation above is already running, and just start one extra Python node each.
 
 ---
 
-## Part 4 — File-by-file reference
+## Part 4 - File-by-file reference
 
 ### `launch/`
 | File | Role |
 |---|---|
-| `41068_ignition.launch.py` | Canonical launch file — starts Gazebo + robots + (optionally) SLAM/Nav2/RViz. Everything else calls into this. |
+| `41068_ignition.launch.py` | Canonical launch file - starts Gazebo + robots + (optionally) SLAM/Nav2/RViz. Everything else calls into this. |
 | `41068_ignition_husky.launch.py` | Convenience wrapper: canonical launch file with Husky on, Parrot off. |
 | `41068_ignition_parrot.launch.py` | Convenience wrapper: canonical launch file with Parrot on, Husky off. |
 | `41068_navigation.launch.py` | Starts SLAM Toolbox and/or Nav2 for one robot, namespaced correctly. Included by the canonical launch file, once per enabled robot. |
@@ -156,7 +159,7 @@ simulation above is already running, and just start one extra Python node each.
 ### `urdf_husky/`
 | File | Role |
 |---|---|
-| `husky.urdf.xacro` | Full Husky robot description — real Clearpath Husky geometry, wheels, physics-enabled collision. |
+| `husky.urdf.xacro` | Full Husky robot description - real Clearpath Husky geometry, wheels, physics-enabled collision. |
 | `husky.gazebo.xacro` | Gazebo plugins/sensors for the Husky (drive control, odometry, sensors). |
 | `wheel.urdf.xacro` | Reusable wheel definition, included once per wheel. |
 | `common_properties.urdf.xacro` | Shared material/colour definitions. |
@@ -165,17 +168,17 @@ simulation above is already running, and just start one extra Python node each.
 ### `urdf_parrot/`
 | File | Role |
 |---|---|
-| `parrot.urdf.xacro` | "Drone" body description — visual meshes, IMU link, lidar link (`base_scan`), camera link tilted 45° down. Collision geometry is present but commented out. |
+| `parrot.urdf.xacro` | "Drone" body description - visual meshes, IMU link, lidar link (`base_scan`), camera link tilted 45° down. Collision geometry is present but commented out. |
 | `parrot.gazebo.xacro` | The Parrot's actual simulated behaviour: `VelocityControl` plugin (moves the body directly from `cmd_vel`, which is why it "floats" rather than falling), `OdometryPublisher`, `JointStatePublisher`, plus the lidar and RGB-D camera sensor definitions. |
 | `common_properties.urdf.xacro` | Shared material/colour definitions (same pattern as Husky). |
-| `model.sdf` / `model.config` | A separate standalone Gazebo-model description of the Parrot (used for Fuel/thumbnail-style purposes) — **not** what's actually spawned; the live sim uses the xacro via the `robot_description` topic instead. |
+| `model.sdf` / `model.config` | A separate standalone Gazebo-model description of the Parrot (used for Fuel/thumbnail-style purposes) - **not** what's actually spawned; the live sim uses the xacro via the `robot_description` topic instead. |
 | `meshes/*.dae` | 3D visual models (hull, 4 propellers). |
 | `thumbnails/*.png` | Preview images, cosmetic only. |
 
 ### `worlds/`
 | File | Role |
 |---|---|
-| `simple_trees.sdf` | Small, minimal world — good for quick iteration/testing. |
+| `simple_trees.sdf` | Small, minimal world - good for quick iteration/testing. |
 | `large_demo.sdf` | Bigger world: the Blue Mountains scenery, the AeroAid ute, `person1`, two animals beside `person1` (`demo_animal`, a kangaroo, and `wombat1`), and 12 more kangaroos and wombats scattered over the terrain by `scripts/place_animals.py`. |
 
 ### `models/`
@@ -198,19 +201,19 @@ simulation above is already running, and just start one extra Python node each.
 ### `scripts/`
 | File | Role |
 |---|---|
-| `basic_autonomy_demo.py` | Example autonomy node: reads the SLAM map + a crude camera-brightness signal, picks a random reachable point, sends it to Nav2, repeats. Meant to be replaced/extended, not used as-is — this is your template for "read sensors → decide → send a Nav2 goal." |
+| `basic_autonomy_demo.py` | Example autonomy node: reads the SLAM map + a crude camera-brightness signal, picks a random reachable point, sends it to Nav2, repeats. Meant to be replaced/extended, not used as-is - this is your template for "read sensors → decide → send a Nav2 goal." |
 | `dynamic_world_demo.py` | Example world-manipulation node: moves the `large_demo.sdf` demo props around by calling Gazebo's `set_pose` service via the `gz`/`ign` command line tool. Template for "move/place things in the world from code." |
 
 ### Root files
 | File | Role |
 |---|---|
-| `package.xml` | ROS package manifest — name, version, and dependencies (other ROS packages this one needs installed). |
-| `CMakeLists.txt` | Build/install instructions — tells `colcon build` which folders and scripts to install so `ros2 launch`/`ros2 run` can find them. |
+| `package.xml` | ROS package manifest - name, version, and dependencies (other ROS packages this one needs installed). |
+| `CMakeLists.txt` | Build/install instructions - tells `colcon build` which folders and scripts to install so `ros2 launch`/`ros2 run` can find them. |
 | `README.md` | Official setup/usage instructions from the teaching team. |
 
 ---
 
-## Part 5 — Naming convention cheat sheet
+## Part 5 - Naming convention cheat sheet
 
 For a robot in namespace `<robot>` (`husky1` or `parrot1`):
 
@@ -225,26 +228,26 @@ makes multi-robot "just work" without redesigning anything.
 
 ---
 
-## Part 6 — Notes for the search-and-rescue drone project
+## Part 6 - Notes for the search-and-rescue drone project
 
 - The perception/mapping/navigation pipeline (lidar, camera, SLAM, Nav2) already
-  works for the Parrot out of the box — no changes needed to get it mapping.
-- Person-detection and search-pattern logic don't exist yet — you'll write new
+  works for the Parrot out of the box - no changes needed to get it mapping.
+- Person-detection and search-pattern logic don't exist yet - you'll write new
   nodes, using `basic_autonomy_demo.py` as a structural template (map + camera +
   TF + Nav2 action client).
 - Vertical motion: the `VelocityControl` Gazebo plugin (in `parrot.gazebo.xacro`)
   sets the drone's velocity directly from `cmd_vel`, and nothing currently sends a
-  nonzero `linear.z` — but the plugin itself isn't limited to 2D. Worth testing
+  nonzero `linear.z` - but the plugin itself isn't limited to 2D. Worth testing
   early by publishing a `Twist` with nonzero `z` to `/parrot1/cmd_vel`.
 - "Dropping" the first aid kit can reuse the same Gazebo `set_pose` service pattern
   already demonstrated in `dynamic_world_demo.py`.
 - Collision is currently disabled for the Parrot (commented out in
-  `parrot.urdf.xacro`) — relevant if you want it to physically interact with
+  `parrot.urdf.xacro`) - relevant if you want it to physically interact with
   anything (e.g. detect it's reached the ground, or avoid trees).
 
 ---
 
-## Part 7 — Night mode
+## Part 7 - Night mode
 
 A dark world where only the thermal camera can see. Body heat holds the
 search, a floodlight under the scout switches on, and the RGB (YOLO)
@@ -329,13 +332,13 @@ the person being missed:
 ### Operator settings (SETUP page)
 
 Page 5 of the ground station (`SETUP`, key `5`). The values change with the
-right column (F1–F5) and apply at once. Each also has a ground station
+right column (F1-F5) and apply at once. Each also has a ground station
 parameter for where it starts.
 
 | Setting | Buttons | Parameter (default) | Effect |
 |---|---|---|---|
 | Flashlight | LIGHT cycles OFF → ON → THERMAL | `flashlight_mode` (empty: THERMAL at night, OFF by day) | THERMAL = on while the search holds |
-| Minimum body heat | HEAT+ / HEAT- (0.5 K) | `person_min_k` (305 K) | thermal pixels this warm count as body heat; kept inside `thermal_min_k`–`thermal_max_k` |
+| Minimum body heat | HEAT+ / HEAT- (0.5 K) | `person_min_k` (305 K) | thermal pixels this warm count as body heat; kept inside `thermal_min_k`-`thermal_max_k` |
 | Thermal detection | IR DET | `thermal_detection` (true) | off: a YOLO human raises a contact without heat |
 | YOLO detection | AI DET | `rgb_detection` (true) | off: body heat raises a contact on its own, at the heat's ground position (`thermal_hit_xy`); animals too |
 

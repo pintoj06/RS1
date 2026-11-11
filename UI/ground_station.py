@@ -80,20 +80,20 @@ from PyQt5.QtWidgets import (QApplication, QFrame, QGridLayout, QHBoxLayout,
 # nobody has ruled on yet. Nothing else is allowed to compete with it.
 # ---------------------------------------------------------------------------
 BASE  = "#2B001E"   # display background, behind the map
-PANEL = "#160010"   # status strip, selected rows — recessed below the display
+PANEL = "#160010"   # status strip, selected rows - recessed below the display
 BEZEL = "#220F1C"   # window surround and button faces
 LINE  = "#4A2A3C"   # borders and dividers, plum-tinted
 TEXT  = "#EDE6EA"   # primary text, warmed a touch so it sits on plum
 MUTED = "#9B8793"   # labels, secondary text, disabled
 
-ALERT = "#D6FF00"   # unruled contact — the one thing demanding a decision
+ALERT = "#D6FF00"   # unruled contact - the one thing demanding a decision
 CONFIRM = "#5AE1E6"   # confirmed, committed area, LINK OK
 RED   = "#FF4136"   # dismissed
 DRONE  = "#FFFFFF"   # drone marker and flight trail
 
 MAP_UNKNOWN = (62, 38, 54)      # unscanned, plum-dark
-MAP_FREE    = (188, 188, 188)   # swept and clear — #BCBCBC
-MAP_WALL    = (18, 18, 18)      # obstacle — #121212
+MAP_FREE    = (188, 188, 188)   # swept and clear - #BCBCBC
+MAP_WALL    = (18, 18, 18)      # obstacle - #121212
 # Ground the scout's camera has already swept. Deliberately low-contrast:
 # it is reassurance, not a thing demanding a decision, and must not compete
 # with a contact marker.
@@ -104,14 +104,14 @@ COVERED     = (90, 225, 230, 70)   # RGBA, drawn over the map
 # decision from the operator, so it is the one drawn boldly. Collapsing all
 # three into "no colour" drew unknown ground exactly like empty space off the
 # edge of the map - on one flight that hid 478 of 619 unpainted cells.
-TO_DO       = (90, 225, 230, 22)   # reachable, not swept yet — barely there
-UNVERIFIED  = (235, 165, 40, 90)   # never confirmed reachable — AMBER, loud
-BLOCKED_GND = (120, 120, 120, 70)  # obstacle or walled off — grey, inert
-PLANNED     = "#00FF88"            # planned sweep route — bright green.
+TO_DO       = (90, 225, 230, 22)   # reachable, not swept yet - barely there
+UNVERIFIED  = (235, 165, 40, 90)   # never confirmed reachable - AMBER, loud
+BLOCKED_GND = (120, 120, 120, 70)  # obstacle or walled off - grey, inert
+PLANNED     = "#00FF88"            # planned sweep route - bright green.
                                    # Kept clear of ALERT's yellow-green so
                                    # an unruled contact still reads as the
                                    # one thing wanting a decision.
-COURIER     = "#FFD23F"            # courier and its route to the contact —
+COURIER     = "#FFD23F"            # courier and its route to the contact -
                                    # warm yellow, kept off ALERT's
                                    # yellow-green so it never reads as a
                                    # contact wanting a decision.

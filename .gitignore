@@ -22,3 +22,10 @@ __pycache__/
 # Captured YOLO training images - generated output, not source; large
 # binary files bloat git history rather than diffing/compressing cleanly.
 YoloTraining/
+report_drafts/
+*.docx
+*.pdf
+*.pptx
+srv_fin_lg.log
+xy_fin_lg.json
+UI/basemap/
